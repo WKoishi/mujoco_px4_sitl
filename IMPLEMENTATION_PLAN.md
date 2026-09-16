@@ -31,7 +31,9 @@ for each phase. Update it when a decision changes; it is not a historical log.
 
 **Rationale for Python**: PX4 SITL runs in lockstep, so the physics loop has no
 real-time deadline — falling behind wall clock slows the simulation but cannot
-corrupt it. That removes the main argument for C++. If a contact-rich
+corrupt it. (The hazard runs the other way: getting *ahead* of PX4 does corrupt
+it. See §3.2 — this is a property of the loop design, not of the language.) That
+removes the main argument for C++. If a contact-rich
 manipulation scenario later needs more throughput, the physics loop can be
 moved to C++ behind the same socket boundary without protocol changes.
 
@@ -101,6 +103,12 @@ not choke on:
   MAVLINK_MSG_ID_HIL_STATE_QUATERNION`, `param2 = 5000` µs
   (`SimulatorMavlink.cpp:1073-1082`, called from `run()` at `:1212`).
 
+Their **order is not guaranteed**: the `HEARTBEAT` is sent by the sender thread
+(`sending_trampoline` → `send_heartbeat()`), the `COMMAND_LONG` by the `run()`
+thread *after* `pthread_create` has already launched that sender
+(`SimulatorMavlink.cpp:1206-1212`). Do not write a parser that expects one
+before the other, and do not gate anything on either arriving.
+
 Neither needs a reply — PX4 ignores whether we honour the interval. But the
 `param2 = 5000` is PX4 telling us it wants ground truth at **200 Hz**, so treat
 that as the target rate rather than picking one ourselves. Our parser must
@@ -120,11 +128,35 @@ The contract (`SimulatorMavlink.cpp:503-548`, `:1028-1070`):
 4. PX4's sender thread waits on `actuator_outputs_sim`, then calls
    `px4_lockstep_wait_for_components()` and emits `HIL_ACTUATOR_CONTROLS`.
 
-**What actually enforces lockstep is step 2, not step 4.** PX4's entire notion of
-time comes from our IMU timestamps, and `px4_clock_settime` blocks inside
-`lockstep_scheduler` until every timed wait scheduled before the new time has
-been serviced. PX4 therefore cannot run ahead of us no matter what we do. We do
-not have to block on anything to stay in step.
+**Lockstep here is one-directional, and that asymmetry drives the loop design.**
+
+*PX4 cannot run ahead of us.* Its entire notion of time comes from our IMU
+timestamps, so with no `HIL_SENSOR` there is no time and nothing in PX4
+progresses. This half is solid.
+
+*But we can run ahead of PX4, arbitrarily far.* `px4_clock_settime` does **not**
+block. `LockstepScheduler::set_absolute_time()` writes `_time_us`, broadcasts the
+condition variables of every timed wait that has now expired, and returns
+immediately — it never waits for the woken threads to finish
+(`lockstep_scheduler.cpp:51-98`). `px4_lockstep_progress()` likewise only sets a
+bit and posts a semaphore (`lockstep_components.cpp:99-125`). The one call that
+blocks, `px4_lockstep_wait_for_components()`, runs on PX4's **sender** thread
+(`SimulatorMavlink.cpp:1064`) and gates only the outgoing
+`HIL_ACTUATOR_CONTROLS`. **Nothing on PX4's receive path applies back-pressure to
+us.**
+
+So if we never wait, simulated time advances as fast as our CPU allows and the
+only back-pressure is the TCP socket buffer filling — hundreds of messages later.
+That is not harmless. `update_sensors()` publishes accel/gyro through the
+simulated FIFO path, and `_last_gyro_fifo.dt` is computed straight from the delta
+between our timestamps (`SimulatorMavlink.cpp:263-268`). If ekf2 falls behind,
+samples are overwritten and dropped, which presents exactly as the estimator
+divergence §7 is written to diagnose.
+
+**Conclusion: we must not block *unconditionally*, and we must not free-run
+*unconditionally* either.** The two failure modes are distinct and both real:
+blocking from the first frame deadlocks at startup (below); never blocking
+decouples us from PX4's pipeline during flight.
 
 **`HIL_ACTUATOR_CONTROLS` is not an acknowledgement of `HIL_SENSOR`.** It is
 published only when the control chain produces new outputs:
@@ -143,37 +175,63 @@ the IMU rate, but it is a consequence of the control cascade, not a guarantee,
 and it does not hold during the first moments after boot.
 
 **Therefore: do not build the loop as "send `HIL_SENSOR`, block until
-`HIL_ACTUATOR_CONTROLS` arrives".** That deadlocks at startup. Before Commander
-has published `vehicle_control_mode`, the chain above is silent, so no actuator
-message is produced. If we are blocked waiting for one, we send no `HIL_SENSOR`,
-so simulated time does not advance — and PX4's two escape hatches, the sender
-thread's `px4_poll(..., 100)` timeout (`SimulatorMavlink.cpp:1044`) and
-`ControlAllocator`'s `ScheduleDelayed(50_ms)` backup (`ControlAllocator.cpp:99`,
-`:315`), are both measured in *simulated* time and will never fire. Circular
-wait, permanent hang.
+`HIL_ACTUATOR_CONTROLS` arrives" *from the first frame*.** That deadlocks at
+startup. Before Commander has published `vehicle_control_mode`, the chain above is
+silent, so no actuator message is produced. If we are blocked waiting for one, we
+send no `HIL_SENSOR`, so simulated time does not advance — and PX4's escape
+hatches cannot save us:
 
-The loop is:
+- the sender thread's `px4_poll(..., 100)` timeout
+  (`SimulatorMavlink.cpp:1044`) is measured in *simulated* time and never fires;
+- `ControlAllocator`'s `ScheduleDelayed(50_ms)` backup is not merely inert, it is
+  **compiled out entirely** in a lockstep build — both call sites sit under
+  `#ifndef ENABLE_LOCKSTEP_SCHEDULER` with the comment "Backup schedule would
+  interfere with lockstep" (`ControlAllocator.cpp:98-100`, `:312-316`).
+
+Circular wait, permanent hang.
+
+The loop has two regimes, and the switch between them is one latch:
 
 ```
+handshake_done = False      # latched True on the first HIL_ACTUATOR_CONTROLS ever seen
+                            # never cleared again, not even on disarm
+
 loop:
   mj_step until the next IMU boundary
   send HIL_SENSOR (id 0)           # this advances PX4's clock
   send HIL_STATE_QUATERNION at 200 Hz
-  drain the socket without blocking; if a HIL_ACTUATOR_CONTROLS is present,
-      latch its controls, replacing the previous ones
+
+  if not handshake_done:
+      # bootstrap: PX4's control chain is still silent. Free-run.
+      drain the socket non-blocking; if a HIL_ACTUATOR_CONTROLS arrives,
+          latch its controls and set handshake_done = True
+  else:
+      # steady state: throttle against PX4 so we cannot outrun its pipeline.
+      wait for a fresh HIL_ACTUATOR_CONTROLS, with a WALL-CLOCK timeout
+      on arrival: latch its controls, replacing the previous ones
+      on timeout:  log once per N, keep the previous controls, continue
+                   # never fatal, never expressed in simulated time
+
   apply the latched controls to MuJoCo   # last-known-good on a quiet frame
 ```
 
-Reusing the previous frame's controls is correct: they are a held setpoint, and
-PX4 is by construction not behind us. Optionally wait for a fresh actuator
-message with a **wall-clock** timeout to keep the two processes tight during
-normal flight, but the timeout must never be expressed in simulated time and
-expiry must not be fatal.
+Reusing the previous frame's controls on a quiet frame is correct: they are a held
+setpoint. The wall-clock timeout is what keeps a mid-flight stall in PX4 (a
+disarm, a mode transition that briefly silences the chain) from turning into a
+hang; it must never be expressed in simulated time, and expiry must never be
+fatal. Set it generously — hundreds of milliseconds of wall clock — since its job
+is to break a deadlock, not to pace the loop.
 
-This is what the reference implementations do. jMAVSim advances time whenever it
-has not yet received actuator controls rather than blocking on them
-(`jMAVSim/src/me/drton/jmavsim/Simulator.java:516-521`, the
-`gotHilActuatorControls()` / `checkFactor` polling scheme).
+This two-regime shape is what the reference implementation actually does, and the
+distinction matters. In jMAVSim, `gotHilActuatorControls` is a **one-way latch**,
+set on the first `HIL_ACTUATOR_CONTROLS` and cleared only in `reset()`
+(`jMAVSim/src/me/drton/jmavsim/MAVLinkHILSystem.java:26,54,292`). The
+`if (!hilSystem.gotHilActuatorControls()) advanceTime()` in the run loop
+(`Simulator.java:515-524`) is therefore a **startup-only** escape hatch. Once the
+handshake completes, jMAVSim advances time exclusively from inside
+`handleMessage()`, on receipt of each actuator message
+(`MAVLinkHILSystem.java:73`) — i.e. it is actuator-driven in steady state, which
+is the `else` branch above.
 
 Beyond the two unsolicited startup messages in §3.1, there is no handshake and no
 `SYSTEM_TIME` exchange to implement.
@@ -210,12 +268,14 @@ baro/mag/GPS ourselves.
   closest model.
 - Each module is gated by a `param compare -s SENS_EN_*SIM 1` test **in the
   startup script**, not inside the module. `SENS_EN_BAROSIM`, `SENS_EN_MAGSIM`,
-  `SENS_EN_GPSSIM` all default to `0` (`.../sensor_*_sim/parameters.c`), and
-  grepping `SensorBaroSim.{cpp,hpp}` confirms the module itself never reads the
-  parameter. Consequence: because our `.post` issues `start` unconditionally
-  (§5), setting these parameters is *not* required for the modules to run. We set
-  them anyway so that `param show SENS_EN_*` reflects reality and so the airframe
-  stays consistent with how sihsim and gzsim express the same intent.
+  `SENS_EN_GPSSIM` all default to `0` (`.../sensor_*_sim/parameters.c`). None of
+  the three modules reads its own `SENS_EN_*SIM`: their `DEFINE_PARAMETERS` blocks
+  list only `SIM_BARO_OFF_P/T`, `SIM_MAG_OFFSET_X/Y/Z` and `SIM_GPS_USED`
+  respectively (`SensorBaroSim.hpp:88-91`, `SensorMagSim.hpp:89-93`,
+  `SensorGpsSim.hpp:85-87`). Consequence: because our `.post` issues `start`
+  unconditionally (§5), setting these parameters is *not* required for the modules
+  to run. We set them anyway so that `param show SENS_EN_*` reflects reality and so
+  the airframe stays consistent with how sihsim and gzsim express the same intent.
 
 ### 3.4 `HIL_SENSOR.fields_updated` bitmask
 
@@ -231,8 +291,20 @@ BARO       = 0b1101000000000  = 0x1A00
 
 Strategy A sends `ACCEL | GYRO` = `0x003F` only. Unset groups are skipped
 entirely, so leaving mag/baro fields at zero is safe and supported. Note
-`temperature` is only consumed when the `BARO` bit is set — under strategy A the
-IMU temperature stays at PX4's default, which is fine.
+`temperature` is only consumed when the `BARO` bit is set
+(`SimulatorMavlink.cpp:191-196`) — under strategy A the IMU temperature stays at
+PX4's default of `0`, which is fine: thermal calibration is off by default and no
+consumer in this path reads it.
+
+`id` is a MAVLink v2 **extension** field. v2 zero-trimming means a truncated
+message decodes to `id == 0`, which is what we want anyway, so this is safe either
+way — but be explicit about it rather than relying on the accident.
+
+**Sensor id 0 goes through PX4's simulated FIFO path**, not the plain update path
+(`SimulatorMavlink.cpp:246-270`). Values are quantised: gyro by
+`radians(2000/32768)` ≈ 0.001 °/s per LSB, accel similarly. Irrelevant for flight,
+but any test that compares a PX4-side `listener sensor_gyro` reading against the
+exact value we sent needs a tolerance, not equality.
 
 This bitmask is the migration seam toward strategy B: to take over one sensor
 later, set its bit and stop starting the corresponding `sensor_*_sim` module.
@@ -265,18 +337,27 @@ Verified empirically with MuJoCo 3.13.0 in this workspace:
 - `freejoint` layout is `qpos = [x, y, z, qw, qx, qy, qz]` (world frame, z-up),
   `qvel = [vx, vy, vz, wx, wy, wz]`.
 
-**Model-authoring constraint.** MuJoCo fixes only the world convention (z-up).
-Body axis orientation is entirely the model author's choice, so "the body frame
-is FLU" is a rule `models/*.xml` must obey, not a property we can rely on. Every
-airframe in `models/` must place the body frame as x forward, y left, z up, with
-the IMU site aligned to it. Violating this silently invalidates every conversion
-below; re-check it whenever a model is added or edited.
+**Model-authoring constraints.** MuJoCo fixes only that the world is z-up.
+Everything else below is a rule `models/*.xml` must obey, not a property we can
+rely on. Two rules, both load-bearing:
+
+1. **Body frame is FLU** — x forward, y left, z up, with the IMU site aligned to
+   it. Body axis orientation is entirely the model author's choice.
+2. **World frame is ENU** — world **+x is east**, +y is north, +z is up. MuJoCo
+   has no opinion here beyond z-up; "ENU" is our choice. It is what makes
+   `q_ned_enu` below correct, and it is where the +90° yaw offset in the attitude
+   table comes from. A model authored as x-north (NWU-style, which some bridges
+   use) needs a *different* `q_ned_enu` and would silently produce a 90° heading
+   error with the conversion below.
+
+Violating either silently invalidates every conversion below; re-check both
+whenever a model is added or edited.
 
 Required conversions, all in one module with one test file (§6, phase 2):
 
 | Quantity | MuJoCo | PX4 |
 |---|---|---|
-| World frame | ENU-like, z-up | NED |
+| World frame | ENU (x east, y north, z up — our model convention, see above) | NED |
 | Body frame | FLU (x fwd, y left, z up) | FRD (x fwd, y right, z down) |
 | Attitude | quaternion body→world (FLU→ENU), `[w,x,y,z]` | quaternion body→world (FRD→NED), `[w,x,y,z]` |
 | Position | metres, local | lat/lon/alt (deg×1e7, mm) in `HIL_STATE_QUATERNION` |
@@ -298,12 +379,81 @@ q_px4 = q_ned_enu ⊗ q_mujoco ⊗ q_flu_frd⁻¹
 Body FLU→FRD is a 180° rotation about x: negate the y and z components of every
 body-frame vector. World ENU→NED: `(x_n, y_e, z_d) = (y, x, -z)`; note this
 matrix has determinant `+1`, so it is a proper rotation and composes cleanly with
-the quaternion above. Geodetic conversion needs a fixed home reference
-(`PX4_HOME_LAT` / `PX4_HOME_LON` / `PX4_HOME_ALT` semantics) and a local-tangent
-projection matching PX4's `MapProjection`.
+the quaternion above.
+
+**The geodetic origin is ours alone to choose.** In the mavlinksim path PX4 does
+*not* read `PX4_HOME_LAT` / `PX4_HOME_LON` / `PX4_HOME_ALT` — those are consumed
+only by the gazebo-classic plugins, `px4-rc.gzsim` and `px4-rc.sihsim`. PX4 takes
+its local-tangent reference from the **first `HIL_STATE_QUATERNION` we send**:
+`_global_local_proj_ref.initReference(lat, lon, timestamp)` runs once, on first
+receipt, and `_global_local_alt0` is latched from the same message
+(`SimulatorMavlink.cpp:604-609`). So neither the airframe file nor the `.post`
+script can influence it; our config owns it outright. We should still accept
+`PX4_HOME_*`-shaped env vars for familiarity, but that is our convention, not
+PX4's. Match PX4's `MapProjection` maths so our local frame and PX4's agree.
+
+#### Verified attitude mapping
+
+Computed numerically from the formula above (MuJoCo 3.13.0 conventions, PX4 321
+Euler order). **This table is the specification; Phase 2's tests must reproduce
+it.**
+
+| MuJoCo body rotation (FLU) | PX4 roll | PX4 pitch | PX4 yaw |
+|---|---|---|---|
+| identity | 0° | 0° | **+90°** |
+| +30° about body x | **+30°** | 0° | +90° |
+| −30° about body x | **−30°** | 0° | +90° |
+| +30° about body y | 0° | **−30°** | +90° |
+| +30° about body z | 0° | 0° | **+60°** |
+
+Three consequences that are easy to get backwards:
+
+1. **Roll keeps its sign.** FLU→FRD is a rotation *about x*, so x is the rotation
+   axis and the similarity transform leaves it fixed: `C·Rx(θ)·C⁻¹ = Rx(θ)`. Only
+   pitch and yaw flip sign.
+2. **A MuJoCo identity attitude is PX4 yaw +90°, not 0°.** Under ENU, body x at
+   identity points along world +x, which is **east**; east is heading 90° in NED.
+   Zero PX4 yaw corresponds to the MuJoCo body pointing along world +y.
+3. Yaw therefore carries both a sign flip and a +90° offset:
+   `yaw_px4 = 90° − yaw_mujoco`.
 
 Getting this wrong is the most likely cause of EKF2 divergence, ahead of any
 noise-model detail. Phase 2 exists to isolate it.
+
+### 3.7 `HIL_STATE_QUATERNION` encoding traps
+
+Two unit issues at the encode boundary, both verified against
+`common.xml` and PX4's decode:
+
+- `vx` / `vy` / `vz` are **`int16`, cm/s**. Range ±327.67 m/s. Saturate rather
+  than letting the cast wrap — a wrapped velocity is a sign flip in ground truth.
+- `xacc` / `yacc` / `zacc` are documented in `common.xml` as **mG**, but PX4
+  divides by `1000.f` and uses the result directly as **m/s²**
+  (`SimulatorMavlink.cpp:618-621`). Encoding literal milli-g therefore produces a
+  9.81× error. Send milli-m/s² and comment the discrepancy at the call site. This
+  only feeds `vehicle_local_position_groundtruth.ax/ay/az`, which no module in this
+  path consumes, so it is a logging-fidelity issue rather than a flight one — but
+  §8 says scaling is correct at the boundary, so make it correct.
+
+`lat` / `lon` are `degE7`, `alt` is `mm`. Attitude is `[w,x,y,z]`, copied into
+`vehicle_attitude_groundtruth` unchanged.
+
+### 3.8 Parameters `px4-rc.mavlinksim` sets for us
+
+`px4-rc.mavlinksim:5-7` sets `EKF2_GPS_DELAY 10`, `EKF2_MULTI_IMU 3`,
+`SENS_IMU_MODE 0`. The last two put ekf2 into **multi-EKF mode**
+(`EKF2.cpp:2790-2793`: `sens_imu_mode == 0` ⇒ `multi_mode = true`). Two
+consequences for bring-up:
+
+- Strategy A publishes only IMU 0, so only instance 0 is ever allocated. The
+  allocation loop is bounded (30 s of simulated time, or until arming) and exits
+  cleanly (`EKF2.cpp:2856-2925`). This is expected, not a fault.
+- **In multi mode ekf2 publishes `estimator_attitude` / `estimator_local_position`,
+  not `vehicle_attitude` / `vehicle_local_position`** (`EKF2.cpp:58-61`);
+  `ekf2_selector` republishes to the `vehicle_*` topics. When checking with
+  `listener`, use the `vehicle_*` topics for the final estimate and the
+  `estimator_*` ones to inspect a specific instance. Confusing the two wastes time
+  in phases 1, 3 and 5.
 
 ---
 
@@ -338,7 +488,7 @@ mujoco_px4_sitl/
 │   └── install_px4_files.sh    copies px4/ into the PX4 tree AND registers
 │                               both files in the ROMFS CMakeLists (§5)
 └── tests/
-    ├── test_frames.py          conversion round-trips, analytic cases
+    ├── test_frames.py          the §3.6 attitude table, round-trips, geodetic
     ├── test_hil.py             message encode/decode against pymavlink
     └── test_vehicle.py         rotor model: hover thrust, torque balance
 ```
@@ -372,7 +522,11 @@ tree will show; keep it that way and do not let it grow.
 `ROMFS/px4fmu_common/init.d-posix/airframes/10016_none_iris`. Because the
 selector in `px4-rc.simulator` falls through to `px4-rc.mavlinksim` for anything
 that is not sihsim / gz / jmavsim, a plain airframe id gets us the right
-simulator with no script edit. Contents:
+simulator with no script edit. Verified: with `PX4_SIMULATOR` unset,
+`SYS_AUTOSTART = 22001` (non-zero, and not 10017), and `SIM_GZ_EN` at its default
+of `0` (`gz_bridge/parameters.c:41`), every branch of the `if` chain fails and the
+`else` is taken (`px4-rc.simulator:10-25`). Do **not** set `SIM_GZ_EN` in the
+airframe file. Contents:
 
 - `. ${R}etc/init.d/rc.mc_defaults`
 - `CA_*` rotor geometry matching `models/quad_x.xml` exactly — same arm length,
@@ -384,7 +538,8 @@ simulator with no script edit. Contents:
   (declarative only — see §3.3; the `.post` starts the modules unconditionally)
 - `IMU_INTEG_RATE` needs no entry: `px4-rc.simulator:5` already does
   `param set-default IMU_INTEG_RATE 250` for every posix simulator, overriding
-  the firmware default of 200 (`imu_parameters.c:50`). Setting it again in the
+  the firmware default of 200
+  (`src/modules/sensors/vehicle_imu/imu_parameters.c:50`). Setting it again in the
   airframe file would be harmless but redundant; the value the simulator must
   match is 250 Hz.
 
@@ -447,18 +602,30 @@ below are already expressed in PX4 frames.
 - Send `HIL_SENSOR` (`fields_updated = 0x3F`) at 250 Hz of *simulated* time with
   a synthetic monotonic clock, `id = 0`, accel `[0, 0, -9.81]` in FRD (level and
   stationary — see §3.6), gyro zero.
-- Send `HIL_STATE_QUATERNION` at **200 Hz** (the rate PX4 asks for in §3.1),
-  identity attitude, fixed home position. Populate the velocity fields too, not
-  just position: `sensor_gps_sim` needs `lpos.vx/vy/vz`, which
-  `simulator_mavlink` fills from this message's `vx/vy/vz`
+- Send `HIL_STATE_QUATERNION` at **200 Hz** (the rate PX4 asks for in §3.1), with
+  **`attitude_quaternion = [1,0,0,0]`, i.e. identity in PX4's own FRD→NED sense**
+  (heading north, level) — not the conversion of a MuJoCo identity, which would be
+  yaw +90° (§3.6). Phase 1 has no `frames.py`, so state the PX4-frame constant
+  directly and do not reason through MuJoCo at all here. Fixed home position.
+  Populate the velocity fields too, not just position: `sensor_gps_sim` needs
+  `lpos.vx/vy/vz`, which `simulator_mavlink` fills from this message's `vx/vy/vz`
   (`SimulatorMavlink.cpp:610-620`). Zero is a valid stationary value, but the
-  fields must be present and the message must keep arriving.
-- **Never block waiting for `HIL_ACTUATOR_CONTROLS`** (§3.2). Drain the socket
-  non-blocking, latch the newest controls, and keep sending `HIL_SENSOR`
-  regardless. Log the first actuator message and assert `flags & 1` (lockstep)
-  when it arrives — but treat its absence during the first seconds as normal,
-  not as an error.
+  fields must be present and the message must keep arriving. The lat/lon sent here
+  becomes PX4's local-frame origin for the whole session (§3.6).
+- Implement **both regimes** of the §3.2 loop, not just the free-running one.
+  Before the first `HIL_ACTUATOR_CONTROLS` ever seen: drain non-blocking and keep
+  sending `HIL_SENSOR` regardless. After it: wait for a fresh actuator message
+  with a wall-clock timeout, non-fatal on expiry. Getting only the first half
+  working looks fine in phase 1 and silently decouples the two processes in
+  phase 5.
+- Log the first actuator message and assert `flags & 1` (lockstep) when it
+  arrives — but treat its absence during the first seconds as normal, not as an
+  error.
 - Assert IMU timestamp monotonicity in code.
+- Instrument the ratio of simulated time to wall-clock time and log it
+  periodically. In the steady-state regime it should sit near a stable value; a
+  ratio that climbs without bound is the "we are outrunning PX4" failure from
+  §3.2, and it is invisible without this counter.
 
 **Exit**: `commander status` shows no sensor timeouts; `listener sensor_baro`,
 `listener sensor_mag`, `listener sensor_gps` all produce data — this is the
@@ -466,7 +633,7 @@ single most important check in the plan, because it is the runtime confirmation
 of §3.3, which so far is established only by source reading. `ekf2 status`
 reports the attitude filter running. Simulated time advances in step with PX4,
 and `HIL_ACTUATOR_CONTROLS` is observed arriving at roughly the IMU rate once
-Commander is up.
+Commander is up. The sim-to-wall time ratio is bounded and stable.
 
 ### Phase 2 — Frames, isolated and tested
 
@@ -475,19 +642,37 @@ integration: this is where the expensive bugs live, and every check here runs as
 a plain unit test with no PX4 build and no simulator running.
 
 - ENU↔NED, FLU↔FRD, quaternion conversion, geodetic projection.
-- Property tests: round-trip identity; a 90° yaw in MuJoCo is a 90° yaw of the
-  correct sign in PX4; a level stationary vehicle yields accelerometer
-  `[0, 0, -9.81]` in FRD (MuJoCo reads `[0, 0, +9.81]` in its z-up site frame;
-  the FLU→FRD y/z negation flips the sign, and specific force at rest is the
-  negative of the gravity vector — PX4's convention is accel z ≈ -9.8 when
-  level, while the *gravity vector itself* in FRD is `+z`. Keep the two
-  distinct; conflating them is exactly the bug this test catches).
-- Assert the quaternion is **not** conjugated: feed a known body→world MuJoCo
-  quaternion and check the result equals `q_ned_enu ⊗ q_mujoco ⊗ q_flu_frd⁻¹`
-  (§3.6), then verify a 30° roll left in MuJoCo comes out as a 30° roll *right*
-  in FRD, which distinguishes the correct conversion from its conjugate.
+- **Assert the §3.6 attitude table row by row.** It is the specification; do not
+  re-derive the expected values while writing the test, or the test will encode
+  whatever the implementation happens to do. In particular:
+  - identity MuJoCo attitude ⇒ PX4 yaw **+90°**, roll 0, pitch 0;
+  - `±30°` about body x ⇒ PX4 roll `±30°`, **same sign** (roll is the FLU→FRD
+    rotation axis, so it is invariant — a test asserting `roll_px4 == -roll_muj`
+    passes only for a *broken* conversion);
+  - `+30°` about body y ⇒ PX4 pitch `−30°` (sign flips);
+  - `+30°` about body z ⇒ PX4 yaw `+60°`, i.e. `yaw_px4 = 90° − yaw_muj`.
+- Round-trip identity: `px4_to_mujoco(mujoco_to_px4(q)) == q` for a set of random
+  quaternions. **Compare up to sign** — `q` and `−q` are the same rotation, and a
+  naive `allclose(back, q)` fails spuriously on roughly half the inputs. Assert
+  `allclose(back, q) or allclose(back, -q)`, or compare rotation matrices.
+- A level stationary vehicle yields accelerometer `[0, 0, -9.81]` in FRD. MuJoCo
+  reads `[0, 0, +9.81]` in its z-up site frame (verified empirically, §3.6); the
+  FLU→FRD y/z negation flips the sign. Specific force at rest is the negative of
+  the gravity vector — PX4's convention is accel z ≈ −9.8 when level, while the
+  *gravity vector itself* in FRD is `+z`. Keep the two distinct; conflating them
+  is exactly the bug this test catches.
+- **Use pitch or yaw, not roll, to discriminate against a conjugated
+  conversion.** Roll is invariant under FLU→FRD, so it carries no information
+  about conjugation. A conjugate inserted "to match conventions" swaps roll and
+  pitch wholesale — feeding `+30°` about body x yields `roll 0, pitch −30°,
+  yaw −90°` instead of `roll +30°, pitch 0, yaw +90°`. Assert the full triple
+  against the table, which catches this and any other basis error at once.
 - Cross-check the geodetic projection against PX4's `MapProjection` behaviour
-  using a handful of hardcoded reference points.
+  using a handful of hardcoded reference points, with the origin taken from our
+  own config (§3.6: PX4 adopts whatever origin our first `HIL_STATE_QUATERNION`
+  carries, so the test owns both sides).
+- Test the §3.7 encode boundary here too: `int16` cm/s velocity saturation, and
+  the milli-m/s² acceleration scaling.
 
 **Exit**: `pytest tests/test_frames.py` green, with no PX4 process involved.
 
@@ -499,16 +684,22 @@ gets confirmed end to end against PX4. Actuator inputs still ignored; hold the
 vehicle in place with a weld or by resetting state each step, so ground truth
 moves in a known way.
 
-- Verify `models/quad_x.xml` obeys the FLU body-frame constraint in §3.6 before
-  trusting any output.
+- Verify `models/quad_x.xml` obeys **both** §3.6 model-authoring constraints — FLU
+  body frame *and* ENU world frame (world +x = east) — before trusting any output.
+  The second one has no local symptom; it shows up only as a 90° heading error
+  later.
 - IMU from MuJoCo `accelerometer` + `gyro` sensors on a body-fixed site.
 - Simulation clock derived from `mj_data.time`, not wall clock.
 - IMU at `IMU_INTEG_RATE` (250 Hz); physics `dt` an integer divisor of it
   (e.g. 1 kHz physics, IMU every 4th step). Record the ratio in `config.py`.
 
-**Exit**: injecting a known attitude in MuJoCo produces the matching attitude in
-`vehicle_attitude_groundtruth` (compare via `listener`), for roll, pitch, and yaw
-taken one at a time plus one combined 45°/45° case.
+**Exit**: injecting a known attitude in MuJoCo produces the attitude predicted by
+the §3.6 table in `vehicle_attitude_groundtruth` (compare via `listener`), for
+roll, pitch, and yaw taken one at a time plus one combined 45°/45° case. Write the
+expected numbers down before running it. **The values will not "match" naively** —
+identity MuJoCo attitude reads as yaw +90°, and pitch/yaw are sign-flipped. That
+is correct behaviour, not a bug to chase, and it is the single most common way to
+waste a day in this phase.
 
 ### Phase 4 — Rotor model and actuator mapping
 
@@ -582,6 +773,15 @@ checking whether we stopped sending `HIL_SENSOR`, and fix the loop rather than
 any parameter. A watchdog on *wall clock* should detect and report this
 automatically.
 
+**Second, check whether we outran PX4.** The opposite failure: everything keeps
+moving, but the sim-to-wall time ratio climbs without bound and the flight
+degrades. Under lockstep PX4 cannot get ahead of us, but nothing stops us getting
+ahead of PX4 (§3.2), and when we do, IMU FIFO samples are dropped before ekf2
+consumes them. This looks exactly like estimator divergence and none of the frame
+checks below will find it. Symptom: the phase-1 time-ratio counter is unstable or
+growing, and the steady-state regime of the §3.2 loop is missing or its wall-clock
+timeout is firing constantly. Fix the loop before reading further.
+
 ### EKF2 divergence checklist
 
 In observed likelihood order. Work top to bottom; do not start tuning EKF2
@@ -591,7 +791,9 @@ parameters until every item above the one you suspect has been excluded.
    or control that fights itself. Check that a level stationary vehicle sends
    accel `[0, 0, -9.81]` (FRD), and that `listener sensor_accel` in PX4 agrees.
 2. **World frame swap** — ENU vs NED. Symptom: north/east transposed, or
-   altitude inverted; position control drives the wrong way.
+   altitude inverted; position control drives the wrong way. Also check the model
+   itself obeys world +x = east (§3.6): a model authored x-north produces a clean
+   90° heading offset that looks like a conversion bug but is not.
 3. **Non-monotonic or jittery IMU timestamps** — this *is* PX4's clock under
    lockstep. Symptom: erratic filter behaviour, lockstep stalls, log gaps.
    Assert monotonicity in code, not just in review.
@@ -600,18 +802,25 @@ parameters until every item above the one you suspect has been excluded.
    both sides** (§3.6). MuJoCo's `freejoint` quaternion and PX4's
    `vehicle_attitude.q` (FRD→NED) are the same direction, so the conversion is a
    change of basis with **no conjugation**. Inserting a conjugate "to match
-   conventions" is the classic error here and looks like inverted attitude.
+   conventions" is the classic error here; it presents as roll and pitch having
+   swapped places, not as a plain sign flip. Diagnose by checking a pure body-x
+   rotation: correct gives `roll ±30°, pitch 0`, conjugated gives
+   `roll 0, pitch ∓30°`. Do not "fix" a correct conversion because yaw reads +90°
+   at MuJoCo identity — that is expected (§3.6).
 6. **`HIL_STATE_QUATERNION` rate too low or missing fields** — baro/mag/GPS all
    derive from it, and PX4 asks for 200 Hz. If `sensor_gps` is stale, check that
    local-position ground truth carries velocity, since `sensor_gps_sim` reads
-   `vx/vy/vz` from it.
+   `vx/vy/vz` from it. Also check the §3.7 encoding: an `int16` cm/s overflow
+   turns a fast climb into a sign-flipped descent.
 7. **Rotor geometry mismatch** between `CA_ROTOR*` and the MuJoCo model.
    Symptom: slow yaw drift, or roll/pitch coupling. Frequently misdiagnosed as
    an estimator fault.
 8. Only now: EKF2 parameters.
 
 Useful during bring-up: `listener <topic>`, `ekf2 status`, `commander status`,
-`uorb top`. For a suspected sensor-synthesis problem, run the same airframe under
+`uorb top`. Remember that under multi-EKF (§3.8) the fused estimate is on
+`vehicle_attitude` / `vehicle_local_position`, while `estimator_*` shows a single
+instance. For a suspected sensor-synthesis problem, run the same airframe under
 gz and diff the topic behaviour — keeping that comparison available is a
 deliberate benefit of strategy A.
 
@@ -625,7 +834,9 @@ deliberate benefit of strategy A.
 - Type hints on public functions; `numpy` for all vector math; no `ros`, no
   `rclpy`, no `ament` imports anywhere in `src/`.
 - Units: SI internally. Convert to MAVLink's scaled integers only at the encode
-  boundary in `hil.py`.
+  boundary in `hil.py` — and there, follow **PX4's actual decode**, not the
+  `common.xml` prose, where the two disagree (§3.7). Document each such case
+  inline.
 - One module owns each concern. Frame conversion happens only in `frames.py`;
   if a rotation appears elsewhere, that is a bug.
 - Tests run headless and without PX4 where possible. Protocol and frame tests
