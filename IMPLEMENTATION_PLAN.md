@@ -94,6 +94,13 @@ every 500 µs until we accept, so we may start before or after PX4.
 `TCP_NODELAY` is set on the PX4 side; set it on ours too. MAVLink v2 framing;
 PX4 sends with `MAV_SYS_ID` / `MAV_COMP_ID` (default 1/1).
 
+PX4's receive thread polls the socket with a **wall-clock** 1000 ms timeout and
+logs `PX4_ERR("poll timeout ...")` on expiry (`SimulatorMavlink.cpp:1217-1221`).
+This is a different call from the sender thread's simulated-time
+`px4_poll(..., 100)` discussed in §3.2 — do not conflate them. If we stall the
+wall clock for a second (a breakpoint, a blocking write), PX4 spams this error;
+it is benign and clears on its own, but it looks like a fault during bring-up.
+
 Immediately after connecting, PX4 sends two messages we did not ask for and must
 not choke on:
 
@@ -110,10 +117,13 @@ thread *after* `pthread_create` has already launched that sender
 before the other, and do not gate anything on either arriving.
 
 Neither needs a reply — PX4 ignores whether we honour the interval. But the
-`param2 = 5000` is PX4 telling us it wants ground truth at **200 Hz**, so treat
-that as the target rate rather than picking one ourselves. Our parser must
-accept and discard any other inbound message id without desynchronising the
-MAVLink framing.
+`param2 = 5000` is PX4 telling us it wants ground truth at **200 Hz**. Note 200 Hz
+is **not** an integer divisor of the 250 Hz IMU rate (§5), so it cannot be
+expressed as "every Nth IMU frame". Since nothing in PX4 checks the interval,
+**send `HIL_STATE_QUATERNION` on every IMU frame, i.e. at 250 Hz**, and treat 200 Hz
+as a floor rather than a target. Faster is free and keeps one cadence in the loop.
+Our parser must accept and discard any other inbound message id without
+desynchronising the MAVLink framing.
 
 ### 3.2 Lockstep timing
 
@@ -127,6 +137,17 @@ The contract (`SimulatorMavlink.cpp:503-548`, `:1028-1070`):
    pipeline, then calls `px4_lockstep_progress()`.
 4. PX4's sender thread waits on `actuator_outputs_sim`, then calls
    `px4_lockstep_wait_for_components()` and emits `HIL_ACTUATOR_CONTROLS`.
+
+**PX4's boot blocks on our first `HIL_SENSOR`.** Under lockstep,
+`simulator_mavlink start` does not return until `_has_initialized` is set, and
+that happens in `handle_message_hil_sensor()` on the first `id == 0` message
+(`SimulatorMavlink.cpp:1669-1681`, `:538-548`). `rcS` therefore stops inside
+`px4-rc.simulator` until we connect *and* send. Everything after that line —
+`commander`, `ekf2`, `navigator`, and the `.post` script that starts the
+`sensor_*_sim` modules (§5) — boots while our loop is already running and already
+advancing PX4's clock. That window is the least supervised part of the whole
+design: nothing in PX4 is yet in a position to push back on us. The pacing rules
+below apply to it first, not last.
 
 **Lockstep here is one-directional, and that asymmetry drives the loop design.**
 
@@ -153,10 +174,12 @@ between our timestamps (`SimulatorMavlink.cpp:263-268`). If ekf2 falls behind,
 samples are overwritten and dropped, which presents exactly as the estimator
 divergence §7 is written to diagnose.
 
-**Conclusion: we must not block *unconditionally*, and we must not free-run
-*unconditionally* either.** The two failure modes are distinct and both real:
-blocking from the first frame deadlocks at startup (below); never blocking
-decouples us from PX4's pipeline during flight.
+**Conclusion: the loop needs a pacer that does not depend on PX4 at all, plus a
+brake that does.** The two failure modes are distinct and both real: blocking from
+the first frame deadlocks at startup (below); never blocking decouples us from
+PX4's pipeline — during flight *and* during the boot window above. Wall clock is
+the pacer, because it works before PX4 has booted; the actuator stream is only the
+brake.
 
 **`HIL_ACTUATOR_CONTROLS` is not an acknowledgement of `HIL_SENSOR`.** It is
 published only when the control chain produces new outputs:
@@ -190,48 +213,81 @@ hatches cannot save us:
 
 Circular wait, permanent hang.
 
-The loop has two regimes, and the switch between them is one latch:
+The loop has one regime, not two. Wall clock paces it; the actuator stream bounds
+how far ahead of PX4 it may get:
 
 ```
-handshake_done = False      # latched True on the first HIL_ACTUATOR_CONTROLS ever seen
-                            # never cleared again, not even on disarm
+MAX_LEAD_FRAMES = 8          # IMU frames we may have outstanding before blocking
+frames_since_ack = 0
+controls = zeros             # last-known-good
+t_wall_next = now()
 
 loop:
   mj_step until the next IMU boundary
   send HIL_SENSOR (id 0)           # this advances PX4's clock
-  send HIL_STATE_QUATERNION at 200 Hz
+  send HIL_STATE_QUATERNION        # same cadence, see below
+  frames_since_ack += 1
 
-  if not handshake_done:
-      # bootstrap: PX4's control chain is still silent. Free-run.
-      drain the socket non-blocking; if a HIL_ACTUATOR_CONTROLS arrives,
-          latch its controls and set handshake_done = True
-  else:
-      # steady state: throttle against PX4 so we cannot outrun its pipeline.
-      wait for a fresh HIL_ACTUATOR_CONTROLS, with a WALL-CLOCK timeout
-      on arrival: latch its controls, replacing the previous ones
-      on timeout:  log once per N, keep the previous controls, continue
+  drain the socket non-blocking
+  on each HIL_ACTUATOR_CONTROLS: latch controls, frames_since_ack = 0
+
+  if frames_since_ack >= MAX_LEAD_FRAMES:
+      # brake: PX4's pipeline is behind, or silent. Wait, but never forever.
+      block for a fresh HIL_ACTUATOR_CONTROLS with a WALL-CLOCK timeout
+      on arrival: latch controls, frames_since_ack = 0
+      on timeout:  log once per N, keep previous controls,
+                   frames_since_ack = 0 and continue
                    # never fatal, never expressed in simulated time
 
   apply the latched controls to MuJoCo   # last-known-good on a quiet frame
+
+  # pacer: independent of PX4, so it also governs the boot window above
+  t_wall_next += imu_dt / speed_factor
+  sleep until t_wall_next        # skip if already past: we are CPU-bound, not ahead
 ```
 
-Reusing the previous frame's controls on a quiet frame is correct: they are a held
-setpoint. The wall-clock timeout is what keeps a mid-flight stall in PX4 (a
-disarm, a mode transition that briefly silences the chain) from turning into a
-hang; it must never be expressed in simulated time, and expiry must never be
-fatal. Set it generously — hundreds of milliseconds of wall clock — since its job
-is to break a deadlock, not to pace the loop.
+Why this shape rather than a startup/steady-state latch:
 
-This two-regime shape is what the reference implementation actually does, and the
-distinction matters. In jMAVSim, `gotHilActuatorControls` is a **one-way latch**,
-set on the first `HIL_ACTUATOR_CONTROLS` and cleared only in `reset()`
-(`jMAVSim/src/me/drton/jmavsim/MAVLinkHILSystem.java:26,54,292`). The
-`if (!hilSystem.gotHilActuatorControls()) advanceTime()` in the run loop
-(`Simulator.java:515-524`) is therefore a **startup-only** escape hatch. Once the
-handshake completes, jMAVSim advances time exclusively from inside
-`handleMessage()`, on receipt of each actuator message
-(`MAVLinkHILSystem.java:73`) — i.e. it is actuator-driven in steady state, which
-is the `else` branch above.
+- **The pacer works before PX4 exists.** During the boot window it is the *only*
+  thing bounding us, and a latch that free-runs until the first actuator message
+  leaves exactly that window unbounded (§3.2 above).
+- **The brake does not depend on a 1:1 actuator/sensor ratio.** As established
+  above, `HIL_ACTUATOR_CONTROLS` is not an acknowledgement, so "wait for a fresh
+  one every frame" degrades to one frame per timeout whenever the ratio slips.
+  With a hundreds-of-ms timeout on a 250 Hz loop that is a ~100× slowdown that
+  logs as "non-fatal" — a silent failure, and the worst kind. Allowing a few
+  outstanding frames decouples back-pressure from PX4's publish rate.
+- **Resetting `frames_since_ack` on timeout is deliberate.** It hands pacing back
+  to the wall clock during a genuine PX4 silence (disarm, mode transition). We
+  cannot outrun PX4 while real-time paced, so the FIFO-drop hazard does not apply
+  there; the brake exists for when PX4 is *slow*, not when it is *quiet*.
+
+`MAX_LEAD_FRAMES` and the timeout are both tunables, not contract. Set the timeout
+generously — hundreds of milliseconds of wall clock — since its only job is to
+break a deadlock. If physics is slower than real time (contact-rich manipulation),
+the `sleep` never fires and the bounded lead becomes the binding constraint, which
+is the correct degradation.
+
+Reusing the previous frame's controls on a quiet frame is correct: they are a held
+setpoint.
+
+**What jMAVSim actually does**, since it is the reference implementation and the
+detail is easy to misread: its main loop runs on a **wall-clock** fixed-rate
+executor, `scheduleAtFixedRate(this, 0, sleepInterval / speedFactor / checkFactor)`
+with `sleepInterval = 1e6 / 250` (`jMAVSim/src/me/drton/jmavsim/Simulator.java:114,390-391`).
+That timer is present in both phases. `gotHilActuatorControls` is a one-way latch
+set on the first actuator message and cleared only in `reset()`
+(`MAVLinkHILSystem.java:26,54,292`), and the
+`if (!hilSystem.gotHilActuatorControls()) advanceTime()` in `run()`
+(`Simulator.java:515-524`) removes the *need to wait* for an actuator message
+during startup — it does not remove the timer. So bootstrap is 250 Hz real-time
+paced, not free-running. In steady state time advances on actuator receipt inside
+`handleMessage()` (`MAVLinkHILSystem.java:73`), but physics and sending still
+happen on the timer tick, skipped via `needsToPause = (lastTimeRan == now)` when
+time has not moved. Neither phase is "free-run", and neither is "block until
+actuator": wall-clock pacing is the constant, and the actuator stream only gates
+whether time advances. The loop above keeps that constant and makes the gate a
+bounded lead instead of a per-frame wait.
 
 Beyond the two unsolicited startup messages in §3.1, there is no handshake and no
 `SYSTEM_TIME` exchange to implement.
@@ -361,6 +417,18 @@ Required conversions, all in one module with one test file (§6, phase 2):
 | Body frame | FLU (x fwd, y left, z up) | FRD (x fwd, y right, z down) |
 | Attitude | quaternion body→world (FLU→ENU), `[w,x,y,z]` | quaternion body→world (FRD→NED), `[w,x,y,z]` |
 | Position | metres, local | lat/lon/alt (deg×1e7, mm) in `HIL_STATE_QUATERNION` |
+| Angular velocity | body rates in FLU, rad/s | body rates in FRD, rad/s — **negate y and z** |
+
+**Angular velocity is the one quantity that crosses both messages**, and PX4 does
+no conversion on it: `handle_message_hil_state_quaternion` copies
+`rollspeed`/`pitchspeed`/`yawspeed` straight into
+`vehicle_angular_velocity_groundtruth.xyz` (`SimulatorMavlink.cpp:563-565`). So the
+FLU→FRD y/z negation is entirely ours, and it applies identically to `HIL_SENSOR`'s
+`xgyro/ygyro/zgyro` and to `HIL_STATE_QUATERNION`'s body rates. Getting it right in
+one and not the other gives a ground truth that disagrees with the IMU — which
+reads as an estimator fault. Note the negation is the same as for a true vector
+even though angular velocity is a pseudovector, because FLU→FRD is a *proper*
+rotation (det `+1`).
 
 **Both quaternions are body→world; do not conjugate.** MuJoCo's `qpos[3:7]`
 rotates body-frame vectors into world. PX4's is the same direction:
@@ -430,7 +498,10 @@ Two unit issues at the encode boundary, both verified against
 - `xacc` / `yacc` / `zacc` are documented in `common.xml` as **mG**, but PX4
   divides by `1000.f` and uses the result directly as **m/s²**
   (`SimulatorMavlink.cpp:618-621`). Encoding literal milli-g therefore produces a
-  9.81× error. Send milli-m/s² and comment the discrepancy at the call site. This
+  9.81× error. Send milli-m/s² and comment the discrepancy at the call site.
+  These three are **also `int16`**, so at milli-m/s² the full scale is only
+  **±32.767 m/s² (≈ ±3.3 g)** — saturate them exactly as for velocity. Irrelevant
+  in hover, reachable in a phase-7 contact impact. This
   only feeds `vehicle_local_position_groundtruth.ax/ay/az`, which no module in this
   path consumes, so it is a logging-fidelity issue rather than a flight one — but
   §8 says scaling is correct at the boundary, so make it correct.
@@ -553,9 +624,12 @@ sensor_mag_sim start
 sensor_gps_sim start
 ```
 
-Ordering is not critical under lockstep (PX4's clock does not advance until our
-first `HIL_SENSOR` arrives), but `.post` is the documented hook and keeps the
-airframe file itself unmodified.
+Ordering is not critical, but not for the reason it first appears: under lockstep
+`simulator_mavlink start` **blocks `rcS` until our first `HIL_SENSOR` arrives**
+(§3.2), so by the time `.post` runs the clock is already advancing. What makes the
+ordering safe is that `sensor_*_sim` only need ground truth to be arriving *while
+they run*, which it is. `.post` is also the documented hook and keeps the airframe
+file itself unmodified.
 
 Launch shape: `PX4_SYS_AUTOSTART=22001 ./build/px4_sitl_default/bin/px4`.
 Airframe id 22001 sits inside the range the CMakeLists reserves with
@@ -602,7 +676,8 @@ below are already expressed in PX4 frames.
 - Send `HIL_SENSOR` (`fields_updated = 0x3F`) at 250 Hz of *simulated* time with
   a synthetic monotonic clock, `id = 0`, accel `[0, 0, -9.81]` in FRD (level and
   stationary — see §3.6), gyro zero.
-- Send `HIL_STATE_QUATERNION` at **200 Hz** (the rate PX4 asks for in §3.1), with
+- Send `HIL_STATE_QUATERNION` on **every IMU frame (250 Hz)** — above PX4's 200 Hz
+  request, which is not an integer divisor of the IMU rate (§3.1) — with
   **`attitude_quaternion = [1,0,0,0]`, i.e. identity in PX4's own FRD→NED sense**
   (heading north, level) — not the conversion of a MuJoCo identity, which would be
   yaw +90° (§3.6). Phase 1 has no `frames.py`, so state the PX4-frame constant
@@ -612,20 +687,21 @@ below are already expressed in PX4 frames.
   (`SimulatorMavlink.cpp:610-620`). Zero is a valid stationary value, but the
   fields must be present and the message must keep arriving. The lat/lon sent here
   becomes PX4's local-frame origin for the whole session (§3.6).
-- Implement **both regimes** of the §3.2 loop, not just the free-running one.
-  Before the first `HIL_ACTUATOR_CONTROLS` ever seen: drain non-blocking and keep
-  sending `HIL_SENSOR` regardless. After it: wait for a fresh actuator message
-  with a wall-clock timeout, non-fatal on expiry. Getting only the first half
-  working looks fine in phase 1 and silently decouples the two processes in
-  phase 5.
+- Implement the §3.2 loop **complete**: the wall-clock pacer *and* the bounded-lead
+  brake. The pacer is what governs PX4's own boot, which happens entirely inside
+  this loop's first frames (§3.2) — omitting it looks fine in phase 1 and leaves
+  the boot window unbounded. The brake is what keeps us from outrunning PX4 in
+  phase 5. Neither half is optional, and neither is a "steady state only" concern.
 - Log the first actuator message and assert `flags & 1` (lockstep) when it
   arrives — but treat its absence during the first seconds as normal, not as an
   error.
 - Assert IMU timestamp monotonicity in code.
 - Instrument the ratio of simulated time to wall-clock time and log it
-  periodically. In the steady-state regime it should sit near a stable value; a
-  ratio that climbs without bound is the "we are outrunning PX4" failure from
-  §3.2, and it is invisible without this counter.
+  periodically. It should sit near `speed_factor`. A ratio that climbs without
+  bound is the "we are outrunning PX4" failure from §3.2; a ratio that *collapses*
+  toward zero while the brake's timeout logs means the brake is pacing the loop
+  instead of the pacer — the ~100× silent slowdown described in §3.2. Both are
+  invisible without this counter.
 
 **Exit**: `commander status` shows no sensor timeouts; `listener sensor_baro`,
 `listener sensor_mag`, `listener sensor_gps` all produce data — this is the
@@ -633,7 +709,8 @@ single most important check in the plan, because it is the runtime confirmation
 of §3.3, which so far is established only by source reading. `ekf2 status`
 reports the attitude filter running. Simulated time advances in step with PX4,
 and `HIL_ACTUATOR_CONTROLS` is observed arriving at roughly the IMU rate once
-Commander is up. The sim-to-wall time ratio is bounded and stable.
+Commander is up. The sim-to-wall time ratio settles near `speed_factor` and stays
+there — neither growing nor collapsing (§7).
 
 ### Phase 2 — Frames, isolated and tested
 
@@ -671,8 +748,13 @@ a plain unit test with no PX4 build and no simulator running.
   using a handful of hardcoded reference points, with the origin taken from our
   own config (§3.6: PX4 adopts whatever origin our first `HIL_STATE_QUATERNION`
   carries, so the test owns both sides).
-- Test the §3.7 encode boundary here too: `int16` cm/s velocity saturation, and
-  the milli-m/s² acceleration scaling.
+- Angular velocity: assert the y/z negation is applied, and that `HIL_SENSOR`'s
+  gyro and `HIL_STATE_QUATERNION`'s body rates go through the *same* conversion
+  (§3.6). A test that only covers one of the two misses the case where ground
+  truth and IMU disagree.
+- Test the §3.7 encode boundary here too: `int16` cm/s velocity saturation,
+  `int16` milli-m/s² acceleration saturation at ≈ ±32.767 m/s², and the
+  milli-m/s² scaling itself.
 
 **Exit**: `pytest tests/test_frames.py` green, with no PX4 process involved.
 
@@ -770,17 +852,30 @@ processes idle — that is not an estimator problem and nothing below applies. I
 is almost always the §3.2 deadlock: we are waiting for `HIL_ACTUATOR_CONTROLS`
 while PX4 waits for the `HIL_SENSOR` that would advance its clock. Confirm by
 checking whether we stopped sending `HIL_SENSOR`, and fix the loop rather than
-any parameter. A watchdog on *wall clock* should detect and report this
-automatically.
+any parameter. With the §3.2 loop this can only happen if the brake's timeout is
+missing or accidentally expressed in *simulated* time; that is the first thing to
+check. If PX4 never finished booting at all — no `commander` output, `rcS` stopped
+inside `px4-rc.simulator` — the cause is the same but earlier: PX4's boot itself
+blocks on our first `HIL_SENSOR` (§3.2). A watchdog on *wall clock* should detect
+and report both automatically.
 
-**Second, check whether we outran PX4.** The opposite failure: everything keeps
-moving, but the sim-to-wall time ratio climbs without bound and the flight
-degrades. Under lockstep PX4 cannot get ahead of us, but nothing stops us getting
-ahead of PX4 (§3.2), and when we do, IMU FIFO samples are dropped before ekf2
-consumes them. This looks exactly like estimator divergence and none of the frame
-checks below will find it. Symptom: the phase-1 time-ratio counter is unstable or
-growing, and the steady-state regime of the §3.2 loop is missing or its wall-clock
-timeout is firing constantly. Fix the loop before reading further.
+**Second, check the sim-to-wall time ratio in both directions.** Two distinct loop
+faults, neither of which any frame check below will find:
+
+- *Ratio grows without bound* — we outran PX4. Under lockstep PX4 cannot get ahead
+  of us, but nothing stops us getting ahead of PX4 (§3.2), and when we do, IMU FIFO
+  samples are dropped before ekf2 consumes them. This looks exactly like estimator
+  divergence. Cause: the wall-clock pacer is missing, or `MAX_LEAD_FRAMES` is far
+  too large. Most likely during PX4's boot window, where the pacer is the only
+  bound that exists.
+- *Ratio collapses toward zero, brake timeout logging steadily* — the bounded-lead
+  brake is pacing the loop instead of the pacer. Everything is correct but ~100×
+  slow, and because expiry is non-fatal by design it presents as a working
+  simulation rather than an error (§3.2). Cause: `MAX_LEAD_FRAMES` too small for
+  PX4's actual actuator publish rate, or a brake that waits per-frame.
+
+Fix the loop before reading further. Also note PX4's benign wall-clock
+`poll timeout` error (§3.1) is not evidence of either.
 
 ### EKF2 divergence checklist
 
@@ -808,7 +903,8 @@ parameters until every item above the one you suspect has been excluded.
    `roll 0, pitch ∓30°`. Do not "fix" a correct conversion because yaw reads +90°
    at MuJoCo identity — that is expected (§3.6).
 6. **`HIL_STATE_QUATERNION` rate too low or missing fields** — baro/mag/GPS all
-   derive from it, and PX4 asks for 200 Hz. If `sensor_gps` is stale, check that
+   derive from it. PX4 asks for 200 Hz; we send it on every IMU frame instead
+   (§3.1). If `sensor_gps` is stale, check that
    local-position ground truth carries velocity, since `sensor_gps_sim` reads
    `vx/vy/vz` from it. Also check the §3.7 encoding: an `int16` cm/s overflow
    turns a fast climb into a sign-flipped descent.
