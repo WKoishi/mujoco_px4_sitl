@@ -635,8 +635,9 @@ Launch shape: `PX4_SYS_AUTOSTART=22001 ./build/px4_sitl_default/bin/px4`.
 Airframe id 22001 sits inside the range the CMakeLists reserves with
 `# [22000, 22999] Reserve for custom models`, which is the correct home for an
 out-of-tree airframe. (An id like 4600 is also free today but sits next to the gz
-block and risks colliding with a future upstream model.) Confirm 22001 is still
-unused with a glob over `init.d-posix/airframes/` before committing.
+block and risks colliding with a future upstream model.) 22001 is confirmed
+unused across `ROMFS/` at v1.17.0 (`d6f12ad1c4`); re-check with a glob over
+`init.d-posix/airframes/` after any PX4 version bump.
 
 ---
 
@@ -649,21 +650,61 @@ tuning problem.
 
 ### Phase 0 — Environment and skeleton
 
-- `pyproject.toml` with pinned deps. `pymavlink` is **not yet installed** in the
-  workspace venv; add it (pin the exact version).
-- Install the two PX4 files from §5 *before* building: copy them and register
-  both in `init.d-posix/airframes/CMakeLists.txt`. Skipping the registration is
-  the most likely way to lose an hour in this phase.
-- Build PX4 once: `make px4_sitl_default`. Confirm
-  `build/px4_sitl_default/bin/px4` exists, that `22001_mujoco_quad` and
-  `22001_mujoco_quad.post` are present under
-  `build/px4_sitl_default/etc/init.d-posix/airframes/`, and that
-  `sensor_baro_sim`/`sensor_mag_sim`/`sensor_gps_sim` appear in the built
-  command list.
+**The PX4 build requires the workspace venv on `PATH`.** PX4's build-time Python
+dependencies (`PX4-Autopilot/Tools/setup/requirements.txt`) are installed in
+`../.venv`, not system-wide, and that venv has
+`include-system-site-packages = false`. PX4's cmake resolves its interpreter with
+`find_package(PythonInterp 3)`, which follows `PATH`: without the venv it picks
+`/usr/bin/python3`, which has no `kconfiglib`, and configure aborts at
+`cmake/kconfig.cmake:4`. `genmsg` is absent there too and would fail later, in
+uORB generation (`Tools/msg/px_generate_uorb_topic_helper.py:46`). PX4's own
+`make install_python_requirements` cannot bootstrap this: it is a cmake target,
+so configure must already have succeeded.
+
+```sh
+source .venv/bin/activate            # before every PX4 build
+make -C PX4-Autopilot px4_sitl_default
+```
+
+Repeat this in `README.md`. It is the one environment fact that neither
+repository records.
+
+Verified present: venv Python 3.12.3 with `mujoco 3.13.0`, `numpy 2.5.3`,
+`pymavlink 2.4.49`, `pytest 9.1.1` and PX4's requirements (`kconfiglib 14.1.0`,
+`pyros-genmsg 0.5.8`); gcc 13.3.0, cmake 3.28.3, ninja 1.11.1, ccache 4.9.1;
+Gazebo Harmonic dev packages, which matter only because `default.px4board`
+enables `GZ_BRIDGE` / `GZ_MSGS` / `GZ_PLUGINS` — dead weight for the mavlinksim
+path, but they must still compile. `symforce` is deliberately absent:
+`EKF2_SYMFORCE_GEN` is `OFF` unless `EKF2_MAGNETOMETER` or `EKF2_WIND` is off
+(`src/modules/ekf2/CMakeLists.txt:34,45-47`), so SITL uses the checked-in
+derivations. Do not "fix" its absence.
+
+Already confirmed with a stock-airframe build, so do not re-derive it:
+`build/px4_sitl_default/bin/px4` builds clean; `simulator_mavlink`,
+`sensor_baro_sim`, `sensor_mag_sim`, `sensor_gps_sim` and `pwm_out_sim` are
+registered in the generated command list
+(`build/px4_sitl_default/platforms/posix/apps.cpp`) — §3.3's
+`CONFIG_COMMON_SIMULATION` claim, confirmed at build level rather than by source
+reading; `ENABLE_LOCKSTEP_SCHEDULER` is in the compile flags, so §3.2's clock
+contract holds; booting `PX4_SYS_AUTOSTART=10016` stops at `Waiting for simulator
+to accept connection on TCP port 4560` and blocks there, which is §3.2's boot
+behaviour observed directly.
+
+Remaining:
+
+- `pyproject.toml` with pinned deps (`mujoco==3.13.0`, `pymavlink==2.4.49`).
+- Install the two PX4 files from §5: copy them and register both in
+  `init.d-posix/airframes/CMakeLists.txt`. Skipping the registration is the most
+  likely way to lose an hour in this phase. `PX4-Autopilot/` is otherwise
+  unmodified at v1.17.0 (`d6f12ad1c4`), so `git diff` there should show exactly
+  that one file.
+- Rebuild — only ROMFS is repackaged, so it is seconds, not minutes — and confirm
+  `22001_mujoco_quad` and `22001_mujoco_quad.post` are present under
+  `build/px4_sitl_default/etc/init.d-posix/airframes/`.
 
 **Exit**: `python -m mujoco_px4_sitl --help` runs; PX4 boots with
-`PX4_SYS_AUTOSTART=22001` and logs `Waiting for simulator to accept connection on
-TCP port 4560`.
+`PX4_SYS_AUTOSTART=22001` — the id under test, not the stock airframe used above —
+and logs `Waiting for simulator to accept connection on TCP port 4560`.
 
 ### Phase 1 — Minimal closed loop, physics stubbed out
 
@@ -926,7 +967,9 @@ deliberate benefit of strategy A.
 
 - All repository text in English, including code comments.
 - Python ≥ 3.12 (workspace venv is 3.12.3, matching ROS 2 Jazzy, so a future
-  in-process `rclpy` bridge stays possible without a rebuild).
+  in-process `rclpy` bridge stays possible without a rebuild). The same venv also
+  carries PX4's build-time dependencies and must be active for any PX4 build —
+  see Phase 0.
 - Type hints on public functions; `numpy` for all vector math; no `ros`, no
   `rclpy`, no `ament` imports anywhere in `src/`.
 - Units: SI internally. Convert to MAVLink's scaled integers only at the encode
