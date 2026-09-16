@@ -246,6 +246,28 @@ loop:
   sleep until t_wall_next        # skip if already past: we are CPU-bound, not ahead
 ```
 
+**Invariant, and the reason this section states one at all.** The steps above are
+a description; this is the property that must hold however they are factored:
+
+> `frames_since_ack` equals the number of IMU frames sent since the last
+> `HIL_ACTUATOR_CONTROLS` was *received*. **Every** path that receives one must
+> zero it — the non-blocking drain and the brake alike.
+
+Write the invariant into the implementation, not just the step sequence. A step
+sequence does not survive refactoring: the reset above appears in two branches,
+and pulling the shared "latch controls" part into one helper is the obvious
+tidy-up, at which point the reset can travel with only one of the two callers.
+That leaves a brake that fires every `MAX_LEAD_FRAMES` frames on a fixed cadence
+regardless of how promptly PX4 replies, which is §7's "brake is pacing the loop"
+fault — and it is invisible at `speed_factor = 1.0`, because the pacer's own sleep
+absorbs the wasted wall clock and the ratio still reads 1.000. This is not
+hypothetical; it is what the first implementation of this loop did, and the
+measured table below was taken against it.
+
+The check that discriminates it, and the one a test should assert: **against a PX4
+that answers every frame, the brake must never fire at all.** If `brake` instead
+tracks `frames / MAX_LEAD_FRAMES`, the invariant is broken somewhere.
+
 Why this shape rather than a startup/steady-state latch:
 
 - **The pacer works before PX4 exists.** During the boot window it is the *only*
@@ -283,16 +305,42 @@ exactly as §7 predicts. Measured with the phase-1 stub against a live PX4 (250 
 | 32 | 50 ms | 1.000 |
 | 64 | 100 ms | 1.000 |
 
-Two independent causes, both present in the first row. The lead must be well above
-the actuator/sensor ratio's jitter — PX4 publishes at ~86 % of the IMU rate while
-disarmed and ~98 % once warm, and its sender thread batches, so a lead of 8 brakes
-constantly. And the timeout must be *short*, because a deadlock is diagnosed by
-*repeated* cheap timeouts, not by one expensive one: nothing is lost by retrying,
-since the pacer absorbs the slack and the held setpoint is still correct.
+**These four rows are observations and stand. The explanation below them was a
+hypothesis, and it was wrong — read the two apart.** The distinction is the point:
+everything in §3 up to here is either cited to a PX4 source line or measured, and a
+causal story about *why* a number came out that way is neither. Written in the same
+voice as the rest, it gets inherited as established fact, and then it decides where
+the next person looks.
 
-**Defaults: `MAX_LEAD_FRAMES = 32`, brake timeout 50 ms.** Re-measure after any
-change to the IMU rate or to PX4's publish behaviour; the ratio counter is what
-makes this visible, which is why §7 leads with it.
+> **Superseded hypothesis.** *"Two independent causes, both present in the first
+> row. The lead must be well above the actuator/sensor ratio's jitter — PX4
+> publishes at ~86 % of the IMU rate while disarmed and ~98 % once warm, and its
+> sender thread batches, so a lead of 8 brakes constantly."*
+>
+> The publish rates are real. The conclusion drawn from them was not: the table was
+> measured against an implementation that violated the invariant above, so the lead
+> sensitivity it shows is that defect, not PX4's jitter. With the invariant held, a
+> PX4 answering every frame does not brake at *any* lead — measured `brake=0` at
+> leads of 8, 32 and 64, and `brake=0 timeouts=0` against a live PX4.
+>
+> This hypothesis survived because raising `MAX_LEAD_FRAMES` did improve the ratio,
+> which is consistent with it — and also consistent with the defect. **A tunable
+> that relieves a symptom shows interaction, not mechanism.** The check that would
+> have separated them is one line and costs nothing: does braking happen when PX4
+> answers every frame? Do not write a causal claim here without stating the
+> observation that would refute it.
+
+What still holds from that paragraph, on its own merits: the timeout must be
+*short*, because a deadlock is diagnosed by *repeated* cheap timeouts, not by one
+expensive one. Nothing is lost by retrying, since the pacer absorbs the slack and
+the held setpoint is still correct.
+
+**Defaults: `MAX_LEAD_FRAMES = 32`, brake timeout 50 ms.** The lead is now known to
+be more conservative than needed, since the sensitivity that motivated 32 was the
+defect; it is kept because a generous lead costs nothing and still bounds the
+FIFO-drop hazard. Re-measure the whole table after any change to the IMU rate or to
+PX4's publish behaviour; the ratio counter is what makes this visible, which is why
+§7 leads with it.
 
 Reusing the previous frame's controls on a quiet frame is correct: they are a held
 setpoint.
@@ -769,6 +817,11 @@ below are already expressed in PX4 frames.
   toward zero while the brake's timeout logs means the brake is pacing the loop
   instead of the pacer — the ~100× silent slowdown described in §3.2. Both are
   invisible without this counter.
+- **Log the brake counters too, and assert them.** The ratio alone is not
+  sufficient: at `speed_factor = 1.0` the pacer's sleep absorbs a misfiring brake,
+  so the ratio reads 1.000 while the brake fires on every `MAX_LEAD_FRAMES`th frame.
+  `brake` and `timeouts` are what expose §3.2's invariant being broken, and §7's
+  conformance list is the set of checks to write here rather than later.
 
 **Exit**: `commander status` shows no sensor timeouts; `listener sensor_baro`,
 `listener sensor_mag`, `listener sensor_gps` all produce data — this is the
@@ -1011,13 +1064,47 @@ faults, neither of which any frame check below will find:
 - *Ratio collapses toward zero, brake timeout logging steadily* — the bounded-lead
   brake is pacing the loop instead of the pacer. Everything is correct but slow, and
   because expiry is non-fatal by design it presents as a working simulation rather
-  than an error (§3.2). Cause: `MAX_LEAD_FRAMES` too small for PX4's actual actuator
-  publish rate, or the brake timeout set too long — under lockstep a blocked brake
-  freezes PX4's clock, so a long timeout is wall clock burned for nothing. §3.2 has
-  the measured table; observed at 0.40 with the old `8` / 500 ms defaults.
+  than an error (§3.2). **Suspect the loop code before the tunables**: the first
+  implementation of this loop produced exactly this signature with well-chosen
+  values, because the lead counter was not reset on the drain path (§3.2's
+  invariant). Only then consider `MAX_LEAD_FRAMES` too small for PX4's actual
+  actuator publish rate, or the brake timeout set too long — under lockstep a
+  blocked brake freezes PX4's clock, so a long timeout is wall clock burned for
+  nothing. §3.2 has the measured table.
 
 Fix the loop before reading further. Also note PX4's benign wall-clock
 `poll timeout` error (§3.1) is not evidence of either.
+
+**Third — and before the estimator checklist — verify the loop implements §3.2,
+rather than assuming it.** Everything below diagnoses a *misbehaving system*; this
+step asks a different question, which nothing else here asks: does the code do what
+§3.2 says? Three of the defects found in review were in this gap. They are cheap to
+exclude and each has a mechanical check:
+
+- **The lead counter is reset on every receive path**, drain and brake alike (§3.2's
+  invariant). Check: with a PX4 answering every frame, `brake` must be 0. If it
+  tracks `frames / MAX_LEAD_FRAMES`, one path is missing its reset — and note the
+  ratio still reads 1.000 at `speed_factor = 1.0`, so this counter is the only
+  witness.
+- **The brake's timeout is wall clock**, never simulated time (§3.2). A timeout in
+  simulated time never fires, which is the deadlock above.
+- **Socket back-pressure is not mistaken for a disconnect.** A full send buffer is a
+  PX4 that stopped reading, not a PX4 that went away; on a non-blocking socket it
+  arrives as `BlockingIOError`, which is an `OSError`, so a broad `except OSError`
+  around the send will tear down a live link. A partial write abandoned mid-frame
+  desynchronises PX4's parser silently, which then presents as §3.1's framing
+  problem with no apparent cause. Check: a peer that stops reading must stall the
+  send, not drop the connection.
+- **`stop()` is honoured in every state the loop can be in**, including waiting for
+  PX4 to connect — PX4 may never connect at all, a wrong airframe id is enough. A
+  wait that ignores SIGINT/SIGTERM hangs `run_sitl.sh`'s cleanup, which signals and
+  then waits.
+
+These are conformance checks, not tuning. Assert them in `tests/test_loop.py`
+against a fake PX4 that is *uncooperative* — one that never replies, never reads,
+or never connects. A cooperative fake exercises none of them, and a successful
+Phase 5 flight does not either: the loop is deliberately fault-tolerant, so a
+mechanism can misfire continuously while the vehicle still flies.
 
 ### EKF2 divergence checklist
 
