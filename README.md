@@ -69,10 +69,11 @@ python -m mujoco_px4_sitl --instance 0 --model models/quad_x.xml
 
 ## Health check
 
-Every status line reports the ratio of simulated to wall-clock time:
+Every status line reports the ratio of simulated to wall-clock time, plus the
+counters that make the loop's own faults visible:
 
 ```
-t_sim=   60.02s ratio=1.000 frames=15005 act=14979 brake=468 timeouts=161
+t_sim=    3.00s ratio=1.001 frames=751 act=726 brake=0 timeouts=0
 ```
 
 `ratio` should sit near `--speed-factor`. A ratio that climbs without bound means
@@ -81,6 +82,15 @@ that collapses toward zero with `timeouts` climbing steadily means the brake is
 pacing the loop instead of the wall clock. Both present as estimator divergence
 and neither is visible without this counter. See `IMPLEMENTATION_PLAN.md` §3.2
 and §7.
+
+**`brake` and `timeouts` should both be 0 in healthy flight, and `ratio` alone
+will not tell you otherwise.** `act` sitting a little below `frames` is normal —
+PX4 publishes actuators at ~97 % of the IMU rate, since `HIL_ACTUATOR_CONTROLS`
+is not an acknowledgement of `HIL_SENSOR` (§3.2) — and that shortfall on its own
+must not cause any braking. If `brake` instead tracks `frames` divided by
+`--max-lead-frames`, the loop is braking on a cadence rather than in response to
+PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
+`ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
 
 ## Frames
 
@@ -122,10 +132,17 @@ the simulator. Nothing in `src/` may import `rclpy` or `ament`.
 ## Tests
 
 ```sh
-python -m pytest            # 62 tests, no PX4 build and no GL needed
+python -m pytest            # 84 tests, no PX4 build and no GL needed
 ```
 
+No install step: `pyproject.toml` puts `src` on pytest's path, so a fresh
+checkout runs the suite as-is. To use the simulator itself from outside this
+directory, install it — `pip install -e ".[dev]"` — or set
+`PYTHONPATH=src`, which is what `scripts/run_sitl.sh` does.
+
 `test_frames.py` covers the attitude table and the geodetic projection,
-`test_hil.py` the MAVLink encode boundary, `test_vehicle.py` the rotor model, and
-`test_loop.py` runs the lockstep loop against a fake PX4 — including the
-deadlock and runaway cases that a live smoke test cannot distinguish.
+`test_hil.py` the MAVLink encode boundary, `test_vehicle.py` the rotor model and
+the model-authoring preconditions, `test_config.py` the flag combinations that
+would otherwise fail silently, and `test_loop.py` runs the lockstep loop against a
+fake PX4 — including the deadlock, runaway, back-pressure and shutdown cases that
+a live smoke test cannot distinguish.

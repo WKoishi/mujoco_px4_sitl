@@ -87,7 +87,13 @@ class Vehicle:
                 f"{self.num_rotors} rotors"
             )
 
-        self.total_mass = float(model.body_mass[self.body_id])
+        # Subtree, not this body alone: phase 7 hangs an arm off the base as
+        # child bodies, and their mass is just as much what the rotors must
+        # lift. Identical for a single-body model, so this changes nothing
+        # today -- which is exactly why it belongs here rather than mid-phase-7,
+        # where it would present as a hover thrust deficit and read as a rotor
+        # model that needs tuning.
+        self.total_mass = float(model.body_subtreemass[self.body_id])
         gravity = float(abs(model.opt.gravity[2]))
         self.weight = self.total_mass * gravity
 
@@ -153,8 +159,15 @@ class Vehicle:
         torque_body[2] += float(-np.sum(spin * self.params.km * thrust))
 
         rot = np.asarray(data.xmat[self.body_id], dtype=np.float64).reshape(3, 3)
-        data.xfrc_applied[self.body_id, :3] = rot @ force_body
-        data.xfrc_applied[self.body_id, 3:] = rot @ torque_body
+        # Accumulate rather than assign: xfrc_applied is a shared field, and
+        # phase 7 will have other writers on this same body. The caller owns
+        # clearing it once per step -- see clear().
+        data.xfrc_applied[self.body_id, :3] += rot @ force_body
+        data.xfrc_applied[self.body_id, 3:] += rot @ torque_body
+
+    def clear(self, data: mujoco.MjData) -> None:
+        """Zero this body's applied wrench. Call once before the writers."""
+        data.xfrc_applied[self.body_id, :] = 0.0
 
     def wrench_body(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Current ``(force, torque)`` in the body frame. For tests."""

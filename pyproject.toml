@@ -29,3 +29,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# So `python -m pytest` works in a fresh checkout without installing the package
+# first. Tests must not require a PX4 build (plan section 8); requiring an install
+# step is the same kind of friction.
+pythonpath = ["src"]

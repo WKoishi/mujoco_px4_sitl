@@ -161,6 +161,99 @@ def test_zero_command_produces_no_wrench(vehicle: Vehicle):
     assert torque == pytest.approx(np.zeros(3))
 
 
+# --- applied wrench bookkeeping -------------------------------------------
+
+def test_mass_is_the_whole_subtree(vehicle: Vehicle):
+    """Thrust must be calibrated against everything the rotors lift, not just
+    the base body's own mass. Identical here (single body), which is why the
+    distinction has to be asserted rather than observed: phase 7 hangs an arm
+    off the base and the two diverge silently.
+    """
+    model = vehicle.model
+    assert vehicle.total_mass == pytest.approx(
+        float(model.body_subtreemass[vehicle.body_id])
+    )
+
+
+def test_apply_accumulates_and_clear_resets(physics: MujocoPhysics):
+    """``apply`` adds to ``xfrc_applied`` so phase 7 can have other writers on
+    the same body, which makes clearing the caller's job. Both halves matter: a
+    missing clear sums the rotor wrench over every step of the frame.
+    """
+    vehicle, data = physics.vehicle, physics.data
+    settle(vehicle, np.full(4, 0.5))
+    body = vehicle.body_id
+
+    vehicle.clear(data)
+    vehicle.apply(data)
+    once = np.array(data.xfrc_applied[body])
+    vehicle.apply(data)
+    twice = np.array(data.xfrc_applied[body])
+    assert twice == pytest.approx(2.0 * once), "apply() overwrote instead of adding"
+    assert np.any(once != 0.0)
+
+    vehicle.clear(data)
+    assert data.xfrc_applied[body] == pytest.approx(np.zeros(6))
+
+
+def test_stepping_a_frame_does_not_accumulate_thrust(physics: MujocoPhysics):
+    """The end-to-end guard on the above: a frame is many physics steps, so a
+    missing clear would multiply the wrench by steps_per_frame."""
+    vehicle = physics.vehicle
+    command = np.full(4, vehicle.hover_command())
+    settle(vehicle, command)
+    physics.step_frame(command)
+    applied = np.array(physics.data.xfrc_applied[vehicle.body_id, :3])
+    # One frame's worth: the world-frame thrust magnitude is one vehicle weight
+    # at hover command, not steps_per_frame times it.
+    assert np.linalg.norm(applied) == pytest.approx(vehicle.weight, rel=1e-6)
+
+
+# --- model preconditions --------------------------------------------------
+
+# Minimal model with the right names but a hinge where the freejoint must be.
+_HINGE_BASE_XML = """
+<mujoco>
+  <worldbody>
+    <body name="base_link">
+      <joint name="h" type="hinge" axis="0 0 1"/>
+      <geom name="core" type="box" size="0.1 0.1 0.02" mass="1"/>
+      <site name="imu"/>
+      <site name="rotor0" pos="0.1 -0.1 0"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <accelerometer name="imu_accel" site="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+  </sensor>
+</mujoco>
+"""
+
+_NO_JOINT_XML = _HINGE_BASE_XML.replace(
+    '<joint name="h" type="hinge" axis="0 0 1"/>', ""
+)
+
+
+def _physics_from_xml(tmp_path, xml: str) -> MujocoPhysics:
+    path = tmp_path / "model.xml"
+    path.write_text(xml)
+    return MujocoPhysics(Config(model_path=path))
+
+
+def test_a_base_without_a_joint_is_rejected(tmp_path):
+    """``body_jntadr`` is -1 for a jointless body, which would index the *last*
+    joint rather than fail, and then read garbage as the vehicle pose."""
+    with pytest.raises(ValueError, match="no joint"):
+        _physics_from_xml(tmp_path, _NO_JOINT_XML)
+
+
+def test_a_base_whose_joint_is_not_free_is_rejected(tmp_path):
+    """The qpos/qvel slicing assumes the freejoint layout, so anything else is a
+    silent misread rather than an error (plan 3.6)."""
+    with pytest.raises(ValueError, match="not a freejoint"):
+        _physics_from_xml(tmp_path, _HINGE_BASE_XML)
+
+
 # --- closed-loop sanity in MuJoCo itself ----------------------------------
 
 def test_hover_command_holds_altitude_in_mujoco(physics: MujocoPhysics):

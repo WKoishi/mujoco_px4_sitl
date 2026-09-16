@@ -19,6 +19,7 @@ from .sim import MujocoPhysics, build_physics
 from .transport import HilServer
 
 _log = logging.getLogger("mujoco_px4_sitl")
+_PROG = "mujoco_px4_sitl"
 
 
 def _configure_logging(level: str) -> None:
@@ -36,14 +37,22 @@ def run(cfg: Config) -> int:
         " (stub physics)" if cfg.stub_physics else f", model {cfg.model_path}",
     )
 
-    physics = build_physics(cfg)
-    # Bind before PX4 needs us: it retries connect() every 500 us, so either
-    # start order works (plan 3.1).
+    # Bind before loading the model: PX4 retries connect() every 500 us so
+    # either start order works (plan 3.1), but binding first also means a port
+    # collision is reported immediately rather than after MuJoCo has loaded.
     server = HilServer(cfg.hil_bind_host, cfg.hil_port)
-    sidechannel = (
-        SideChannel(cfg.sidechannel_bind_host, cfg.sidechannel_port)
-        if cfg.sidechannel_enabled else None
-    )
+    sidechannel = None
+    try:
+        physics = build_physics(cfg)
+        if cfg.sidechannel_enabled:
+            sidechannel = SideChannel(cfg.sidechannel_bind_host, cfg.sidechannel_port)
+    except BaseException:
+        # Nothing is running yet, but the listening socket is already bound and
+        # would outlive us as a leaked fd, holding the port against a retry.
+        if sidechannel is not None:
+            sidechannel.close()
+        server.close()
+        raise
 
     view = None
     frame_hook = None
@@ -79,7 +88,13 @@ def run(cfg: Config) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    cfg = config_from_args(argv)
+    try:
+        cfg = config_from_args(argv)
+    except (ValueError, FileNotFoundError) as exc:
+        # A rejected flag combination or a missing model is user error, not a
+        # crash: report it the way argparse reports a bad argument.
+        print(f"{_PROG}: error: {exc}", file=sys.stderr)
+        return 2
     _configure_logging(cfg.log_level)
     return run(cfg)
 

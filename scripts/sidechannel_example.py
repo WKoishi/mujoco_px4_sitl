@@ -33,6 +33,9 @@ def _fmt(values: list[float]) -> str:
 def drain_to_latest(sock: socket.socket) -> dict | None:
     """Discard the backlog and return the newest ground_truth, or None."""
     newest = None
+    # Save and restore the timeout explicitly: setblocking(True) would clear it
+    # to None, leaving the caller's socket permanently blocking.
+    timeout = sock.gettimeout()
     sock.setblocking(False)
     try:
         while True:
@@ -43,7 +46,7 @@ def drain_to_latest(sock: socket.socket) -> dict | None:
             if msg.get("type") == "ground_truth":
                 newest = msg
     finally:
-        sock.setblocking(True)
+        sock.settimeout(timeout)
 
 
 def main() -> int:

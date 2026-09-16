@@ -111,6 +111,14 @@ class Config:
             raise ValueError("max_lead_frames must be >= 1")
         if self.brake_timeout_s <= 0.0:
             raise ValueError("brake_timeout_s must be > 0 (wall clock)")
+        if self.inject_attitude is not None and not self.hold_pose:
+            # Without the pin, physics integrates the injected attitude away
+            # immediately, so the flag would silently do nothing (plan phase 3
+            # uses the two together).
+            raise ValueError(
+                "--inject-attitude requires --hold-pose: an unpinned vehicle "
+                "integrates the injected attitude away on the first step"
+            )
         if not self.stub_physics and not Path(self.model_path).is_file():
             raise FileNotFoundError(f"model not found: {self.model_path}")
 
@@ -149,6 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--hil-bind-host", default=os.environ.get("MUJOCO_SITL_BIND", "127.0.0.1"))
     p.add_argument(
+        "--hil-port-base", type=int, default=_env_int("MUJOCO_SITL_HIL_PORT", 4560),
+        help="HIL port is this plus --instance (default: %(default)s)",
+    )
+    p.add_argument(
         "-m", "--model", dest="model_path", type=Path, default=DEFAULT_MODEL,
         help="MuJoCo MJCF model (default: %(default)s)",
     )
@@ -179,7 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--home-lon", type=float, default=_env_float("PX4_HOME_LON", DEFAULT_HOME_LON))
     p.add_argument("--home-alt", type=float, default=_env_float("PX4_HOME_ALT", DEFAULT_HOME_ALT))
     p.add_argument("--no-sidechannel", dest="sidechannel_enabled", action="store_false")
-    p.add_argument("--sidechannel-port-base", type=int, default=14650)
+    p.add_argument(
+        "--sidechannel-port-base", type=int,
+        default=_env_int("MUJOCO_SITL_SIDECHANNEL_PORT", 14650),
+        help="side-channel port is this plus --instance (default: %(default)s)",
+    )
     p.add_argument("--viewer", action="store_true", help="open the MuJoCo viewer (needs GL)")
     p.add_argument("--max-sim-time", type=float, default=None,
                    help="stop after N simulated seconds (testing)")

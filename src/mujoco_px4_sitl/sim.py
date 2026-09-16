@@ -71,8 +71,23 @@ class MujocoPhysics:
         self._gyro_adr, self._gyro_dim = self._sensor("imu_gyro")
         if self._accel_dim != 3 or self._gyro_dim != 3:
             raise ValueError("imu_accel / imu_gyro must be 3-axis sensors")
-        self.qpos_adr = self.model.jnt_qposadr[self.model.body_jntadr[self._body_id]]
-        self.qvel_adr = self.model.jnt_dofadr[self.model.body_jntadr[self._body_id]]
+        # A body with no joint has body_jntadr == -1, which would index the last
+        # joint instead of failing, and then read garbage as the vehicle pose.
+        jnt_adr = int(self.model.body_jntadr[self._body_id])
+        if jnt_adr < 0:
+            raise ValueError(
+                f"body {self.vehicle.params.body_name!r} has no joint; the base "
+                f"must carry a freejoint (plan 3.6)"
+            )
+        jnt_type = int(self.model.jnt_type[jnt_adr])
+        if jnt_type != mujoco.mjtJoint.mjJNT_FREE:
+            raise ValueError(
+                f"body {self.vehicle.params.body_name!r} joint 0 is type "
+                f"{jnt_type}, not a freejoint; qpos/qvel layout assumes "
+                f"[x y z qw qx qy qz] / [vx vy vz wx wy wz] (plan 3.6)"
+            )
+        self.qpos_adr = int(self.model.jnt_qposadr[jnt_adr])
+        self.qvel_adr = int(self.model.jnt_dofadr[jnt_adr])
 
         self._hold_pos = np.zeros(3)
         self._hold_quat: NDArray[np.float64] | None = None
@@ -114,6 +129,9 @@ class MujocoPhysics:
         dt = self.model.opt.timestep
         for _ in range(self.steps_per_frame):
             self.vehicle.update_commands(controls, dt)
+            # Clear before the writers, because apply() accumulates. Without
+            # this the rotor wrench would sum over every step of the frame.
+            self.vehicle.clear(self.data)
             self.vehicle.apply(self.data)
             mujoco.mj_step(self.model, self.data)
         if self.cfg.hold_pose:

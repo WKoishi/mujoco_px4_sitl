@@ -146,6 +146,12 @@ class HilServer:
                 )
         if stalled:
             self.send_stalls += 1
+        # Advance the sequence counter, as pymavlink's own MAVLink.send() does
+        # after packing. `msg.pack(link)` alone does not, and we pack and write
+        # ourselves, so without this every frame we emit carries seq == 0. PX4
+        # only feeds seq into its packet-loss statistics -- nothing misbehaves --
+        # but a counter that never advances makes those statistics meaningless.
+        self._mav.seq = (self._mav.seq + 1) % 256
         return True
 
     def _recv_once(self) -> list[mavlink.MAVLink_message]:
