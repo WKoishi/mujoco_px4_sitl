@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Quad-X airframe for PX4 SITL via MuJoCo.
+
+  Two model-authoring rules from IMPLEMENTATION_PLAN.md section 3.6, both
+  load-bearing. Violating either silently invalidates every frame conversion:
+
+    1. Body frame is FLU: +x forward, +y left, +z up. The `imu` site is aligned
+       to the body frame with no rotation.
+    2. World frame is ENU: +x EAST, +y NORTH, +z up.
+
+  Rotor order and geometry must match CA_ROTOR* in px4/22001_mujoco_quad
+  exactly. PX4 numbers rotors from 0; PWM_MAIN_FUNC1..4 = 101..104 maps
+  actuator_motors 0..3 to HIL_ACTUATOR_CONTROLS.controls[0..3].
+
+  Positions below are FLU (y left). The airframe file states the same points in
+  FRD (y right), so every PY there is the negation of the py here.
+
+    rotor 0  front right  (+0.17678, -0.17678)  CCW  KM = +0.05
+    rotor 1  rear  left   (-0.17678, +0.17678)  CCW  KM = +0.05
+    rotor 2  front left   (+0.17678, +0.17678)  CW   KM = -0.05
+    rotor 3  rear  right  (-0.17678, -0.17678)  CW   KM = -0.05
+
+  KM sign is PX4's convention: positive for CCW (control_allocator/module.yaml
+  :211-218). A rotor spinning CCW about body +z (FLU) exerts a reaction torque
+  on the airframe about body -z; vehicle.py applies that sign.
+-->
+<mujoco model="quad_x">
+  <compiler angle="radian" coordinate="local" inertiafromgeom="auto" balanceinertia="true"/>
+
+  <option timestep="0.001" gravity="0 0 -9.80665" integrator="RK4" density="1.2" viscosity="0"/>
+
+  <default>
+    <geom contype="1" conaffinity="1" condim="3" friction="1.0 0.05 0.05"/>
+    <site type="sphere" size="0.008" rgba="1 0 0 1"/>
+  </default>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4"/>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.25 0.28 0.30"
+             rgb2="0.32 0.35 0.38" width="512" height="512"/>
+    <material name="grid" texture="grid" texrepeat="12 12" reflectance="0.05"/>
+  </asset>
+
+  <worldbody>
+    <!-- World is ENU: +x east, +y north. The marker axes make that visible. -->
+    <light pos="0 0 6" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="60 60 0.1" material="grid" pos="0 0 0"/>
+    <site name="east_marker" pos="3 0 0.02" size="0.05" rgba="1 0.2 0.2 1"/>
+    <site name="north_marker" pos="0 3 0.02" size="0.05" rgba="0.2 1 0.2 1"/>
+
+    <body name="base_link" pos="0 0 0.12">
+      <freejoint name="base_free"/>
+      <!-- qpos = [x y z qw qx qy qz] (ENU), qvel = [vx vy vz wx wy wz] -->
+
+      <!-- Core: battery + electronics. Dominates the mass budget. -->
+      <geom name="core" type="box" size="0.075 0.075 0.025" mass="1.10"
+            rgba="0.15 0.15 0.18 1"/>
+      <!-- A nose marker so +x forward is unambiguous in the viewer. Massless
+           and non-colliding: an offset CoM would show up as a hover pitch bias
+           that is easy to misread as a frame error. -->
+      <geom name="nose" type="box" size="0.045 0.012 0.006" pos="0.11 0 0.026"
+            density="0" contype="0" conaffinity="0" rgba="0.9 0.35 0.1 1"/>
+
+      <site name="imu" pos="0 0 0" quat="1 0 0 0"/>
+
+      <!-- Arms, FLU. Each carries a rotor hub at 0.25 m from the centre. -->
+      <geom name="arm0" type="capsule" fromto="0 0 0  0.17678 -0.17678 0"
+            size="0.008" mass="0.03" rgba="0.4 0.4 0.45 1"/>
+      <geom name="arm1" type="capsule" fromto="0 0 0 -0.17678  0.17678 0"
+            size="0.008" mass="0.03" rgba="0.4 0.4 0.45 1"/>
+      <geom name="arm2" type="capsule" fromto="0 0 0  0.17678  0.17678 0"
+            size="0.008" mass="0.03" rgba="0.4 0.4 0.45 1"/>
+      <geom name="arm3" type="capsule" fromto="0 0 0 -0.17678 -0.17678 0"
+            size="0.008" mass="0.03" rgba="0.4 0.4 0.45 1"/>
+
+      <!-- Rotor hubs. Order is PX4 rotor index; do not reorder. -->
+      <geom name="rotor0_hub" type="cylinder" pos="0.17678 -0.17678 0.02"
+            size="0.02 0.008" mass="0.06" rgba="0.8 0.2 0.2 1"/>
+      <geom name="rotor1_hub" type="cylinder" pos="-0.17678 0.17678 0.02"
+            size="0.02 0.008" mass="0.06" rgba="0.2 0.2 0.8 1"/>
+      <geom name="rotor2_hub" type="cylinder" pos="0.17678 0.17678 0.02"
+            size="0.02 0.008" mass="0.06" rgba="0.8 0.2 0.2 1"/>
+      <geom name="rotor3_hub" type="cylinder" pos="-0.17678 -0.17678 0.02"
+            size="0.02 0.008" mass="0.06" rgba="0.2 0.2 0.8 1"/>
+
+      <!-- Thrust application points, one per rotor, in rotor index order. -->
+      <site name="rotor0" pos="0.17678 -0.17678 0.032" rgba="0.9 0.3 0.3 1"/>
+      <site name="rotor1" pos="-0.17678 0.17678 0.032" rgba="0.3 0.3 0.9 1"/>
+      <site name="rotor2" pos="0.17678 0.17678 0.032" rgba="0.9 0.3 0.3 1"/>
+      <site name="rotor3" pos="-0.17678 -0.17678 0.032" rgba="0.3 0.3 0.9 1"/>
+
+      <!-- Landing legs: keep the body off the floor and give it a stable rest. -->
+      <geom name="leg0" type="capsule" fromto="0.09 -0.09 -0.02  0.11 -0.11 -0.11"
+            size="0.006" mass="0.015" rgba="0.3 0.3 0.3 1"/>
+      <geom name="leg1" type="capsule" fromto="-0.09 0.09 -0.02 -0.11 0.11 -0.11"
+            size="0.006" mass="0.015" rgba="0.3 0.3 0.3 1"/>
+      <geom name="leg2" type="capsule" fromto="0.09 0.09 -0.02  0.11 0.11 -0.11"
+            size="0.006" mass="0.015" rgba="0.3 0.3 0.3 1"/>
+      <geom name="leg3" type="capsule" fromto="-0.09 -0.09 -0.02 -0.11 -0.11 -0.11"
+            size="0.006" mass="0.015" rgba="0.3 0.3 0.3 1"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <!-- Specific force in the site frame: [0,0,+9.81] at rest, [0,0,0] in free
+         fall. Exactly what PX4's accel expects, after the FLU->FRD negation. -->
+    <accelerometer name="imu_accel" site="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+  </sensor>
+</mujoco>

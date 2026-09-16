@@ -1,0 +1,63 @@
+#!/bin/sh
+#
+# @name MuJoCo Quadrotor X (SITL, MAVLink HIL)
+#
+# @type Quadrotor X
+#
+# Airframe for mujoco_px4_sitl. Modelled on 10016_none_iris.
+#
+# With PX4_SIMULATOR unset, SYS_AUTOSTART non-zero and not 10017, and SIM_GZ_EN
+# at its default of 0, every branch of px4-rc.simulator's if-chain fails and the
+# else is taken, which sources px4-rc.mavlinksim. So do NOT set SIM_GZ_EN here.
+#
+# IMU_INTEG_RATE needs no entry: px4-rc.simulator already pins it to 250 for
+# every posix simulator. 250 Hz is the rate the simulator must match.
+#
+# The CA_ROTOR* geometry below must match models/quad_x.xml exactly. Positions
+# here are FRD (y right); the model states the same points in FLU (y left), so
+# every PY here is the negation of the model's py. KM is positive for CCW.
+#
+#   rotor 0  front right  CCW
+#   rotor 1  rear  left   CCW
+#   rotor 2  front left   CW
+#   rotor 3  rear  right  CW
+
+. ${R}etc/init.d/rc.mc_defaults
+
+param set-default CA_AIRFRAME 0
+
+param set-default CA_ROTOR_COUNT 4
+
+param set-default CA_ROTOR0_PX 0.17678
+param set-default CA_ROTOR0_PY 0.17678
+param set-default CA_ROTOR0_KM 0.05
+
+param set-default CA_ROTOR1_PX -0.17678
+param set-default CA_ROTOR1_PY -0.17678
+param set-default CA_ROTOR1_KM 0.05
+
+param set-default CA_ROTOR2_PX 0.17678
+param set-default CA_ROTOR2_PY -0.17678
+param set-default CA_ROTOR2_KM -0.05
+
+param set-default CA_ROTOR3_PX -0.17678
+param set-default CA_ROTOR3_PY 0.17678
+param set-default CA_ROTOR3_KM -0.05
+
+param set-default PWM_MAIN_FUNC1 101
+param set-default PWM_MAIN_FUNC2 102
+param set-default PWM_MAIN_FUNC3 103
+param set-default PWM_MAIN_FUNC4 104
+
+# Declarative only: none of the sensor_*_sim modules reads its own SENS_EN_*SIM,
+# and our .post starts all three unconditionally. Set so that `param show
+# SENS_EN_*` reflects reality and the airframe matches how sihsim/gzsim express
+# the same intent.
+param set-default SENS_EN_BAROSIM 1
+param set-default SENS_EN_MAGSIM 1
+param set-default SENS_EN_GPSSIM 1
+
+# The MuJoCo model's quadratic thrust curve has the same slope at mid-stick as
+# PX4's linear allocator assumption, so the default THR_MDL_FAC of 0 is correct.
+# Hover is calibrated to sit at command 0.5 (thrust/weight 4.0 at full command).
+param set-default MPC_THR_HOVER 0.50

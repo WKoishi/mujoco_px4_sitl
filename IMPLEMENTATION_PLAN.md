@@ -217,7 +217,7 @@ The loop has one regime, not two. Wall clock paces it; the actuator stream bound
 how far ahead of PX4 it may get:
 
 ```
-MAX_LEAD_FRAMES = 8          # IMU frames we may have outstanding before blocking
+MAX_LEAD_FRAMES = 32         # IMU frames we may have outstanding before blocking
 frames_since_ack = 0
 controls = zeros             # last-known-good
 t_wall_next = now()
@@ -262,11 +262,37 @@ Why this shape rather than a startup/steady-state latch:
   cannot outrun PX4 while real-time paced, so the FIFO-drop hazard does not apply
   there; the brake exists for when PX4 is *slow*, not when it is *quiet*.
 
-`MAX_LEAD_FRAMES` and the timeout are both tunables, not contract. Set the timeout
-generously — hundreds of milliseconds of wall clock — since its only job is to
-break a deadlock. If physics is slower than real time (contact-rich manipulation),
-the `sleep` never fires and the bounded lead becomes the binding constraint, which
-is the correct degradation.
+`MAX_LEAD_FRAMES` and the timeout are both tunables, not contract. If physics is
+slower than real time (contact-rich manipulation), the `sleep` never fires and the
+bounded lead becomes the binding constraint, which is the correct degradation.
+
+**Measured values, and why a generous timeout is wrong.** An earlier revision of
+this plan said to set the timeout generously — hundreds of milliseconds — on the
+grounds that its only job is to break a deadlock. That reasoning is incorrect, and
+measuring it makes the mechanism plain. **While we are blocked in the brake, PX4's
+clock is frozen, because only our `HIL_SENSOR` advances it. So the brake can only
+ever be satisfied by an actuator message PX4 had already produced.** When that bet
+fails, the entire timeout is wall clock burned for nothing, and the ratio collapses
+exactly as §7 predicts. Measured with the phase-1 stub against a live PX4 (250 Hz,
+`speed_factor = 1.0`):
+
+| `MAX_LEAD_FRAMES` | brake timeout | sim/wall ratio |
+|---|---|---|
+| 8 | 500 ms | 0.40 |
+| 32 | 500 ms | 0.86 |
+| 32 | 50 ms | 1.000 |
+| 64 | 100 ms | 1.000 |
+
+Two independent causes, both present in the first row. The lead must be well above
+the actuator/sensor ratio's jitter — PX4 publishes at ~86 % of the IMU rate while
+disarmed and ~98 % once warm, and its sender thread batches, so a lead of 8 brakes
+constantly. And the timeout must be *short*, because a deadlock is diagnosed by
+*repeated* cheap timeouts, not by one expensive one: nothing is lost by retrying,
+since the pacer absorbs the slack and the held setpoint is still correct.
+
+**Defaults: `MAX_LEAD_FRAMES = 32`, brake timeout 50 ms.** Re-measure after any
+change to the IMU rate or to PX4's publish behaviour; the ratio counter is what
+makes this visible, which is why §7 leads with it.
 
 Reusing the previous frame's controls on a quiet frame is correct: they are a held
 setpoint.
@@ -819,7 +845,27 @@ moves in a known way.
 **Exit**: injecting a known attitude in MuJoCo produces the attitude predicted by
 the §3.6 table in `vehicle_attitude_groundtruth` (compare via `listener`), for
 roll, pitch, and yaw taken one at a time plus one combined 45°/45° case. Write the
-expected numbers down before running it. **The values will not "match" naively** —
+expected numbers down before running it.
+
+**Measured, all five cases exact to five decimals** (`--hold-pose
+--inject-attitude ROLL,PITCH,YAW`, MuJoCo 321 Euler degrees in, PX4
+`vehicle_attitude_groundtruth` out):
+
+| MuJoCo attitude | PX4 `q` `[w,x,y,z]` | PX4 roll/pitch/yaw |
+|---|---|---|
+| identity | `0.70711, 0, 0, 0.70711` | 0°, 0°, **+90°** |
+| roll +30° | `0.68301, 0.18301, 0.18301, 0.68301` | **+30°**, 0°, +90° |
+| pitch +30° | `0.68301, 0.18301, −0.18301, 0.68301` | 0°, **−30°**, +90° |
+| yaw +30° | `0.86603, 0, 0, 0.5` | 0°, 0°, **+60°** |
+| roll+pitch 45° | `0.5, 0.5, 0, 0.70711` | +45°, −45°, +90° |
+
+One trap in building the `--hold-pose` rig: an unsupported airborne body has
+`qacc = g`, so its accelerometer reads **free fall**, which is wrong for something
+being presented to PX4 as stationary. Zero `qacc` and recompute the
+acceleration-stage sensors (`mj_rnePostConstraint` + `mj_sensorAcc`) to get
+`Rᵀ·[0,0,g]` — what a real IMU on a stationary tilted vehicle reads. Skipping this
+feeds EKF2 a zero accel vector and the attitude check drowns in estimator
+complaints that have nothing to do with the frames. **The values will not "match" naively** —
 identity MuJoCo attitude reads as yaw +90°, and pitch/yaw are sign-flipped. That
 is correct behaviour, not a bug to chase, and it is the single most common way to
 waste a day in this phase.
@@ -851,6 +897,42 @@ First phase where PX4 is genuinely flying the MuJoCo vehicle.
 tens of centimetres in hover; a full takeoff → square → land completes with no
 failsafe. Keep the resulting ulog as the regression baseline.
 
+**Measured, arm → takeoff → hover → 5 m square in Offboard → land,
+`models/quad_x.xml`**: passes. EKF2 reports `attitude: 1, local position: 1,
+global position: 1` within ~20 s of boot, preflight is clean, the square's corner
+errors are 0.14–0.66 m measured 20 s into each 5 m leg (settling, not converged),
+and the vehicle lands disarmed with no failsafe at `ratio=1.000` throughout.
+
+The square was flown by streaming `SET_POSITION_TARGET_LOCAL_NED` at 20 Hz and
+switching to Offboard with `MAV_CMD_DO_SET_MODE` (custom main mode 6) — the stream
+must be live *before* the mode switch and must keep running. `MAV_CMD_DO_REPOSITION`
+is not a shortcut worth taking: it returns `MAV_RESULT_ACCEPTED` and then does
+nothing useful here.
+
+Steady-state hover error, sampled over 48 s against the ground-truth topics:
+
+| | max error |
+|---|---|
+| altitude (absolute geodetic, datum-free) | 0.13 m, mostly under 0.07 m |
+| horizontal | 0.17 m |
+
+**Judge this against what PX4's synthetic GPS can deliver, not against zero.**
+`sensor_gps_sim` adds Gaussian noise of σ = 0.2 m horizontally and **σ = 0.5 m
+vertically** (`SensorGpsSim.cpp:117-119`), and `EKF2_HGT_REF` defaults to `1`
+(GNSS), so vertical accuracy is bounded by that 0.5 m — the filtered result above
+is well inside it. Two consequences worth knowing before chasing a phantom:
+
+- The vertical axis is inherently ~2.5× noisier than the horizontal here. A
+  vertical error around 0.5 m is one sigma of PX4's own model, not a bridge fault.
+- Sampled *during* the climb's settling transient rather than in steady state, the
+  same setup reads ~0.44 m of altitude error. That is a transient, not a bias; let
+  the hover settle before measuring, or it looks like a systematic offset.
+
+Note also that `vehicle_local_position.ref_alt` and its ground-truth counterpart
+differ slightly (EKF2 latches its own datum), so compare **absolute** geodetic
+altitude between the two topics. Differencing the local `z` fields folds that
+datum offset into the result.
+
 If EKF2 misbehaves here, work down §7 in order before touching EKF2 parameters.
 
 ### Phase 6 — External API and launch story
@@ -867,6 +949,23 @@ If EKF2 misbehaves here, work down §7 in order before touching EKF2 parameters.
 
 **Exit**: a plain shell script brings up a flying vehicle; an external process
 reads ground truth over the side channel without touching this repo's internals.
+
+**Met.** `scripts/run_sitl.sh` brings up both processes and stops both on Ctrl-C;
+`scripts/sidechannel_example.py` reads ground truth at 50 Hz under the *system*
+Python, with no `PYTHONPATH` and no imports from this repository.
+
+Two things found while getting there, both worth keeping:
+
+- **A consumer slower than the publish rate reads stale state.** 50 Hz into a
+  socket buffer means a client that polls after an 18 s wait receives a datagram
+  from the *start* of that wait, not the newest one. This cost an hour of chasing
+  a phantom "the vehicle will not translate" bug: PX4 was flying the square
+  correctly and the harness was reporting the pre-takeoff position. Any consumer
+  that samples on its own timer must drain to the newest message; the example
+  client's `--latest` mode is the reference pattern. Consider it before believing
+  any disagreement between the side channel and PX4's own topics.
+- `run_sitl.sh` must pass PX4 `-d` when stdout is not a TTY, or the `pxh` shell
+  redraws its prompt into the log without bound.
 
 ### Phase 7 — Aerial manipulator
 
@@ -910,10 +1009,12 @@ faults, neither of which any frame check below will find:
   too large. Most likely during PX4's boot window, where the pacer is the only
   bound that exists.
 - *Ratio collapses toward zero, brake timeout logging steadily* — the bounded-lead
-  brake is pacing the loop instead of the pacer. Everything is correct but ~100×
-  slow, and because expiry is non-fatal by design it presents as a working
-  simulation rather than an error (§3.2). Cause: `MAX_LEAD_FRAMES` too small for
-  PX4's actual actuator publish rate, or a brake that waits per-frame.
+  brake is pacing the loop instead of the pacer. Everything is correct but slow, and
+  because expiry is non-fatal by design it presents as a working simulation rather
+  than an error (§3.2). Cause: `MAX_LEAD_FRAMES` too small for PX4's actual actuator
+  publish rate, or the brake timeout set too long — under lockstep a blocked brake
+  freezes PX4's clock, so a long timeout is wall clock burned for nothing. §3.2 has
+  the measured table; observed at 0.40 with the old `8` / 500 ms defaults.
 
 Fix the loop before reading further. Also note PX4's benign wall-clock
 `poll timeout` error (§3.1) is not evidence of either.

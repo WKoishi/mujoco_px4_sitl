@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujoco_px4_sitl"
+version = "0.1.0"
+description = "MuJoCo physics backend for PX4 SITL over the MAVLink HIL interface"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+
+# Pinned to the versions verified in the workspace venv (IMPLEMENTATION_PLAN.md
+# phase 0). numpy is left as a lower bound because mujoco already constrains it.
+dependencies = [
+    "mujoco==3.13.0",
+    "pymavlink==2.4.49",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mujoco-px4-sitl = "mujoco_px4_sitl.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

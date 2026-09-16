@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# Sourced by rcS after px4-rc.simulator has started simulator_mavlink
+# (rcS: `[ -e "$autostart_file".post ] && . "$autostart_file".post`).
+#
+# Sensor strategy A: the simulator supplies IMU + ground truth, and these three
+# modules synthesize baro / mag / GPS from the ground-truth uORB topics that
+# simulator_mavlink publishes out of HIL_STATE_QUATERNION.
+#
+# px4-rc.mavlinksim does not start them -- only px4-rc.sihsim starts all three --
+# so this file is what closes the sensor chain.
+#
+# Started unconditionally, unlike sihsim's `param compare -s SENS_EN_*SIM 1`
+# guards: none of the modules reads its own SENS_EN_*SIM parameter, and the
+# airframe file sets them declaratively anyway.
+#
+# Ordering is not critical. Under lockstep `simulator_mavlink start` blocks rcS
+# until the simulator's first HIL_SENSOR arrives, so by the time this runs the
+# clock is already advancing and ground truth is already flowing.
+
+sensor_baro_sim start
+sensor_mag_sim start
+sensor_gps_sim start
