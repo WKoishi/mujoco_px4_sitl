@@ -23,6 +23,12 @@ _log = logging.getLogger(__name__)
 OUR_SYSTEM_ID = 1
 OUR_COMPONENT_ID = mavlink.MAV_COMP_ID_AUTOPILOT1
 
+# How long one message may sit unwritten before we start complaining. This is a
+# warning threshold, not a deadline: see :meth:`HilServer.send`.
+SEND_STALL_WARN_S = 1.0
+# Poll granularity while waiting for writability.
+_SEND_POLL_S = 0.1
+
 
 class HilServer:
     """One PX4 connection at a time, MAVLink v2 framed."""
@@ -39,6 +45,9 @@ class HilServer:
         # Never raise on a partial or corrupt frame; PX4 also sends messages we
         # do not care about and must not desynchronise our parser (plan 3.1).
         self._mav.robust_parsing = True
+        # Number of send() calls that had to wait for socket writability. A
+        # non-zero value means PX4 stopped draining its receive buffer.
+        self.send_stalls = 0
         _log.info("listening for PX4 on tcp://%s:%d", host, port)
 
     # -- lifecycle ----------------------------------------------------------
@@ -86,16 +95,58 @@ class HilServer:
     # -- io -----------------------------------------------------------------
 
     def send(self, payload: bytes) -> bool:
-        """Send a packed message. Returns False if the peer went away."""
+        """Send one packed message in full. Returns False if the peer went away.
+
+        The socket is non-blocking, so a full send buffer surfaces as
+        ``BlockingIOError`` rather than a wait. Two reasons this must be looped
+        rather than passed to ``sendall``:
+
+        * ``BlockingIOError`` is an ``OSError``, so catching it alongside the
+          real disconnects would tear down a *live* PX4 link the moment it
+          stopped draining its receive buffer for a moment.
+        * ``sendall`` on a non-blocking socket may write part of the payload
+          before raising, and abandoning a half-written MAVLink frame
+          desynchronises PX4's parser silently -- exactly the failure plan 3.1
+          warns about, and one that presents as a fault with no obvious cause.
+
+        Once any byte of a message is out, the rest must follow, so this blocks
+        until the whole payload is written. That is deliberate: it is real
+        back-pressure from a PX4 that has stopped reading, and under lockstep a
+        PX4 that never reads again is dead anyway -- its clock only advances on
+        what we send here. A wall-clock watchdog is the right place to catch
+        that (plan 7), not a partial write. We log every
+        ``SEND_STALL_WARN_S`` so the stall is never silent.
+        """
         if self._conn is None:
             return False
-        try:
-            self._conn.sendall(payload)
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-            _log.warning("send failed: %s", exc)
-            self.drop_client()
-            return False
+        view = memoryview(payload)
+        sent = 0
+        t_start = time.monotonic()
+        t_warn_next = t_start + SEND_STALL_WARN_S
+        stalled = False
+        while sent < len(view):
+            try:
+                sent += self._conn.send(view[sent:])
+                continue
+            except (BlockingIOError, InterruptedError):
+                stalled = True
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                _log.warning("send failed after %d/%d bytes: %s", sent, len(view), exc)
+                self.drop_client()
+                return False
+            # Buffer full: wait for writability rather than dropping the client.
+            select.select([], [self._conn], [], _SEND_POLL_S)
+            now = time.monotonic()
+            if now >= t_warn_next:
+                t_warn_next = now + SEND_STALL_WARN_S
+                _log.warning(
+                    "PX4 has not drained its receive buffer for %.1f s "
+                    "(%d/%d bytes of this message written); still waiting",
+                    now - t_start, sent, len(view),
+                )
+        if stalled:
+            self.send_stalls += 1
+        return True
 
     def _recv_once(self) -> list[mavlink.MAVLink_message]:
         assert self._conn is not None

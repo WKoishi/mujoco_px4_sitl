@@ -122,8 +122,20 @@ class LockstepLoop:
         return False
 
     def _drain(self) -> None:
+        """Take everything readable and, on a fresh actuator message, clear the
+        lead.
+
+        Resetting here is what makes the brake a *brake*. Without it the counter
+        only ever falls in :meth:`_brake`, so braking fires every
+        ``max_lead_frames`` frames on a fixed cadence no matter how promptly PX4
+        replies -- the "brake is pacing the loop" fault of plan 7, and invisible
+        at ``speed_factor = 1.0`` because the pacer's own sleep absorbs the cost.
+        """
+        got = False
         for msg in self.server.drain():
-            self._handle(msg)
+            got = self._handle(msg) or got
+        if got:
+            self._frames_since_ack = 0
 
     def _brake(self) -> None:
         """Bounded lead exceeded: wait for PX4, but never forever."""
@@ -179,13 +191,19 @@ class LockstepLoop:
 
     def run(self) -> None:
         cfg = self.cfg
+        self.running = True
         if not self.server.connected:
             _log.info("waiting for PX4 to connect (it retries until we accept)")
-            while not self.server.accept(timeout=1.0):
-                if not self.running and self.stats.frames == 0:
-                    pass  # keep waiting; PX4 may not have booted yet
+            # Poll rather than block indefinitely, so stop() is honoured here
+            # too. PX4 may never boot at all -- a bad airframe id is enough --
+            # and a wait that ignores SIGINT/SIGTERM hangs run_sitl.sh's
+            # cleanup, which signals and then waits on us.
+            while self.running and not self.server.accept(timeout=0.5):
+                pass
+            if not self.running:
+                _log.info("stopped before PX4 connected")
+                return
 
-        self.running = True
         frame_wall_dt = cfg.imu_dt / cfg.speed_factor
         t_wall_start = time.monotonic()
         t_sim_start = self.physics.time

@@ -97,6 +97,41 @@ class FakePX4:
             sock.close()
 
 
+class ScriptedServer:
+    """A :class:`HilServer` stand-in whose inbound messages we control exactly.
+
+    Timing-free, so the lead-counter invariant can be asserted directly rather
+    than inferred from how often the brake happened to fire.
+    """
+
+    connected = True
+
+    def __init__(self, queued: list[mavlink.MAVLink_message] | None = None) -> None:
+        self.mav = mavlink.MAVLink(None, srcSystem=1, srcComponent=1)
+        self.queued = list(queued or [])
+        self.sent: list[bytes] = []
+
+    def send(self, payload: bytes) -> bool:
+        self.sent.append(payload)
+        return True
+
+    def drain(self):
+        pending, self.queued = self.queued, []
+        yield from pending
+
+    def wait(self, timeout: float):  # noqa: ARG002 - never reached in these tests
+        yield from self.drain()
+
+
+def an_actuator_message(*, armed: bool = True) -> mavlink.MAVLink_message:
+    """A HIL_ACTUATOR_CONTROLS as the loop's inbound path sees it (unpacked)."""
+    controls = [0.5] * 4 + [0.0] * (hil.NUM_ACTUATOR_OUTPUTS - 4)
+    mode = hil.MODE_FLAG_CUSTOM | (hil.MODE_FLAG_ARMED if armed else 0)
+    return mavlink.MAVLink_hil_actuator_controls_message(
+        time_usec=1, controls=controls, mode=mode, flags=hil.FLAG_LOCKSTEP,
+    )
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -176,6 +211,62 @@ def test_lockstep_flag_absence_is_survivable():
     assert not loop.controls.lockstep
 
 
+# --- the lead counter, which is what makes the brake a brake ---------------
+
+def test_draining_a_fresh_actuator_message_clears_the_lead():
+    """The non-blocking drain path must reset ``frames_since_ack``.
+
+    If only the brake resets it, braking degenerates into a timer that fires
+    every ``max_lead_frames`` frames however promptly PX4 replies -- plan 7's
+    "the brake is pacing the loop" fault. At ``speed_factor = 1.0`` the pacer's
+    own sleep hides the cost, so nothing else catches this.
+    """
+    cfg = make_config()
+    loop = LockstepLoop(cfg, StubPhysics(cfg), ScriptedServer([an_actuator_message()]))
+    loop._frames_since_ack = 7
+
+    loop._drain()
+
+    assert loop.stats.actuator_messages == 1
+    assert loop._frames_since_ack == 0
+
+
+def test_draining_other_messages_leaves_the_lead_alone():
+    """Only HIL_ACTUATOR_CONTROLS clears it. PX4's unsolicited HEARTBEAT and
+    COMMAND_LONG say nothing about whether its control chain has caught up."""
+    cfg = make_config()
+    heartbeat = mavlink.MAVLink_heartbeat_message(
+        type=mavlink.MAV_TYPE_QUADROTOR, autopilot=mavlink.MAV_AUTOPILOT_PX4,
+        base_mode=0, custom_mode=0, system_status=mavlink.MAV_STATE_UNINIT,
+        mavlink_version=3,
+    )
+    loop = LockstepLoop(cfg, StubPhysics(cfg), ScriptedServer([heartbeat]))
+    loop._frames_since_ack = 7
+
+    loop._drain()
+
+    assert loop.stats.discarded_messages == 1
+    assert loop._frames_since_ack == 7
+
+
+def test_a_responsive_px4_is_never_braked():
+    """End to end: PX4 replying to every frame must not brake at all.
+
+    The bug this pins down reported ``brake == frames / max_lead_frames`` with a
+    PX4 that answered every single frame. ``max_lead_frames`` is small and the
+    speed factor modest so the fake has room to keep up; the bound still leaves a
+    wide margin against the ~30 brake waits the fault produced here.
+    """
+    cfg = make_config(max_sim_time=0.3, speed_factor=5.0, max_lead_frames=8)
+    loop, fake = run_loop(cfg, reply=True)
+    assert loop.stats.actuator_messages > 0
+    assert loop.stats.brake_waits <= 2, (
+        f"braked {loop.stats.brake_waits} times against a PX4 that answered "
+        f"{loop.stats.actuator_messages} of {loop.stats.frames} frames"
+    )
+    assert loop.stats.brake_timeouts == 0
+
+
 # --- the section 3.2 failure modes ---------------------------------------
 
 def test_silent_px4_does_not_deadlock_the_loop():
@@ -252,3 +343,100 @@ def test_disarmed_px4_yields_zero_controls():
     assert loop.stats.actuator_messages > 0
     assert not loop.controls.armed
     assert loop.controls.effective(4) == pytest.approx(np.zeros(4))
+
+
+# --- send back-pressure ---------------------------------------------------
+
+def test_a_full_send_buffer_does_not_drop_a_live_px4():
+    """A PX4 that stops draining its receive buffer is slow, not gone.
+
+    The socket is non-blocking, so a full buffer raises ``BlockingIOError``,
+    which is an ``OSError`` -- catching it alongside the real disconnects tears
+    down a live link, and ``sendall`` may write part of a frame before raising,
+    silently desynchronising PX4's parser (plan 3.1). Neither may happen.
+
+    Buffers are pinned on both ends so the stall is deterministic: an explicit
+    ``SO_RCVBUF`` also disables Linux's receive-window autotuning, which could
+    otherwise absorb the whole payload.
+    """
+    port = free_port()
+    server = HilServer("127.0.0.1", port)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    try:
+        assert server.accept(timeout=2.0)
+        server._conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+        # Larger than both buffers together, sent as one message. The byte
+        # pattern makes a partial or reordered write visible.
+        payload = bytes(range(256)) * 4096  # 1 MiB
+        result: list[bool] = []
+        writer = threading.Thread(target=lambda: result.append(server.send(payload)))
+        writer.start()
+
+        # While the client refuses to read, the write must be pending -- not
+        # failed, and the link must still be up. This is the assertion the old
+        # code failed: it dropped the client here.
+        time.sleep(0.4)
+        assert writer.is_alive(), "send() returned without the payload draining"
+        assert server.connected, "a slow reader was treated as a disconnect"
+
+        received = bytearray()
+        client.settimeout(20.0)
+        while len(received) < len(payload):
+            chunk = client.recv(1 << 20)
+            if not chunk:
+                break
+            received.extend(chunk)
+        writer.join(timeout=20.0)
+
+        assert not writer.is_alive(), "send() never returned"
+        assert result == [True]
+        assert server.connected
+        # The whole frame arrived in order: no partial write was abandoned.
+        assert bytes(received) == payload
+        assert server.send_stalls == 1
+    finally:
+        client.close()
+        server.close()
+
+
+def test_send_still_reports_a_real_disconnect():
+    """The back-pressure path must not swallow an actual peer loss."""
+    port = free_port()
+    server = HilServer("127.0.0.1", port)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    try:
+        assert server.accept(timeout=2.0)
+        client.close()
+        # The first write may land in the buffer before RST arrives; the loop
+        # treats any False as a lost link, so a bounded retry is faithful to it.
+        for _ in range(200):
+            if not server.send(b"x" * 4096):
+                break
+            time.sleep(0.005)
+        assert not server.connected
+    finally:
+        client.close()
+        server.close()
+
+
+# --- shutdown -------------------------------------------------------------
+
+def test_stop_interrupts_the_wait_for_px4():
+    """PX4 may never connect -- a wrong airframe id is enough. A wait that
+    ignores stop() hangs run_sitl.sh's cleanup, which signals and then waits.
+    """
+    cfg = make_config()
+    server = HilServer(cfg.hil_bind_host, cfg.hil_port)
+    loop = LockstepLoop(cfg, StubPhysics(cfg), server, None)
+    try:
+        runner = threading.Thread(target=loop.run)
+        runner.start()
+        time.sleep(0.3)  # let it reach the accept loop
+        loop.stop()
+        runner.join(timeout=5.0)
+        assert not runner.is_alive(), "stop() did not interrupt the accept loop"
+        assert loop.stats.frames == 0
+    finally:
+        server.close()
