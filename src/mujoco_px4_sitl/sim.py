@@ -109,6 +109,16 @@ class MujocoPhysics:
             cfg.model_path, self.vehicle.num_rotors, self.vehicle.total_mass,
             cfg.physics_rate_hz, self.steps_per_frame,
         )
+        # Hover command is what MPC_THR_HOVER in the airframe file must match;
+        # logging it makes a mismatch visible at boot instead of as altitude
+        # oscillation in flight.
+        _log.info(
+            "rotors: hover command %.3f, thrust/weight %.2f at full command\n%s",
+            self.vehicle.hover_command(),
+            float(np.sum(self.vehicle.c_t * self.vehicle.omega_max ** 2))
+            / self.vehicle.weight,
+            self.vehicle.describe_rotors(),
+        )
 
     def _sensor(self, name: str) -> tuple[int, int]:
         sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
@@ -234,5 +244,14 @@ class StubPhysics:
         )
 
 
-def build_physics(cfg: Config) -> Physics:
-    return StubPhysics(cfg) if cfg.stub_physics else MujocoPhysics(cfg)
+def build_physics(cfg: Config, rotors: RotorModel | None = None) -> Physics:
+    """Build the physics backend. ``rotors`` is ignored by the stub.
+
+    The X8's per-rotor arrays arrive through here: an 8-rotor model needs an
+    8-entry ``spin``, and the default quad tuple would be rejected. Once the
+    conversion script's sidecar config exists (MODELING_CONVENTIONS.md section
+    6) it is what builds the ``RotorModel`` passed in.
+    """
+    if cfg.stub_physics:
+        return StubPhysics(cfg)
+    return MujocoPhysics(cfg, rotors)

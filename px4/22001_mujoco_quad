@@ -57,7 +57,27 @@ param set-default SENS_EN_BAROSIM 1
 param set-default SENS_EN_MAGSIM 1
 param set-default SENS_EN_GPSSIM 1
 
-# The MuJoCo model's quadratic thrust curve has the same slope at mid-stick as
-# PX4's linear allocator assumption, so the default THR_MDL_FAC of 0 is correct.
-# Hover is calibrated to sit at command 0.5 (thrust/weight 4.0 at full command).
-param set-default MPC_THR_HOVER 0.50
+# Rotor speed is an explicit state in the model (MODELING_CONVENTIONS.md 2.5):
+# omega = omega_idle + (omega_max - omega_idle) * u, T = c_t * omega^2, with a
+# non-zero idle speed because an armed motor does not stop at zero command.
+# With omega_idle / omega_max = 1/11 and thrust/weight 4.0 at full command,
+# total thrust equals weight at u = 0.450, not 0.500. Hence the value below.
+#
+# THR_MDL_FAC stays 0, but no longer because the curves agree. The old argument
+# was that T = k*u^2 has slope exactly 1 against PX4's linear allocator at
+# u = 0.5. The idle offset breaks that: at u = 0.450 the plant's normalized gain
+# d(T/W)/du is 3.636 against the linear model's 4.000, i.e. 0.909x. Three
+# reasons that is still the right setting:
+#
+#   1. No THR_MDL_FAC can reproduce this plant. PX4 inverts
+#      rel_thrust = a*x^2 + (1-a)*x (mixer_module/functions/FunctionMotors.hpp
+#      :81-107), which is zero at zero command. Ours is 3.3 % of weight there.
+#   2. A 9 % gain deficit is inside the altitude loop's margin, and MPC_USE_HTE
+#      defaults to 1, so the hover thrust estimator absorbs the residual in
+#      flight. MPC_THR_HOVER is then only the estimator's initial value.
+#   3. THR_MDL_FAC 1 would flatten the gain further (~1.01 at hover) but needs
+#      MPC_THR_HOVER 0.2025, and the phase 5 flight baseline was measured at
+#      fac = 0. Changing both at once would leave nothing to compare against.
+#
+# If altitude oscillates in hover, this block is the first thing to revisit.
+param set-default MPC_THR_HOVER 0.45

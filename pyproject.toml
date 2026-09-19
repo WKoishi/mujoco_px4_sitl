@@ -19,7 +19,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# pyulog is only needed by scripts/hover_error.py, which reads a PX4 flight log.
+# Not imported anywhere in src/, so `python -m pytest` does not need it.
+dev = ["pytest>=8.0", "pyulog==1.2.4"]
 
 [project.scripts]
 mujoco-px4-sitl = "mujoco_px4_sitl.main:main"

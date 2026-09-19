@@ -98,6 +98,34 @@ must not cause any braking. If `brake` instead tracks `frames` divided by
 PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
 `ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
 
+## Regression flight
+
+Two scripts fly the Phase 5 profile and measure it. They are separate on purpose:
+the flight reports only what it can see live, and hover accuracy is measured from
+the log, where the datum correction can be done properly.
+
+```sh
+./scripts/run_sitl.sh &                          # wait for "Ready for takeoff!"
+python scripts/fly_regression.py                 # arm, takeoff, 5 m square, land
+python scripts/hover_error.py ../PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*.ulg
+```
+
+`hover_error.py` needs `pyulog` (`pip install -e '.[dev]'`). It prints the datum
+offset it removed, then the settled hover error:
+
+```
+  datum offset    N -0.371  E -0.195  U -0.655 m -- removed
+  steady-state hover, 151.3 s of samples:
+    horizontal   max 0.115 m   median 0.056 m
+    vertical     max 0.158 m   median 0.035 m
+```
+
+**Judge those against `sensor_gps_sim`'s own noise** — σ = 0.2 m horizontal,
+0.5 m vertical — not against zero. `IMPLEMENTATION_PLAN.md` phase 5 holds the
+baseline to compare against, and documents the two ways this measurement goes
+wrong silently: `MAV_CMD_NAV_TAKEOFF` param7 is AMSL rather than relative, and
+the estimate and ground-truth topics latch separate datums.
+
 ## Frames
 
 Two model-authoring rules, both load-bearing for every conversion:

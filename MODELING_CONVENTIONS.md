@@ -43,9 +43,9 @@ Thrust and reaction torque are computed in Python and written straight into
   index that is missing**. A gap (`rotor0,rotor1,rotor3`) is read as a 2-rotor
   vehicle, with no error.
 - `HIL_ACTUATOR_CONTROLS.controls[i]` drives `rotor{i}`; PX4 numbers from 0.
-- Thrust model `T(u) = k_thrust · u²`, first-order motor lag
-  `time_constant = 0.02 s`. **Being replaced by an ω-based parametrization — see
-  §2.5.**
+- Thrust model `T_i = c_t_i · ω_i²`, with ω an explicit state and a first-order
+  motor lag of `time_constant = 0.02 s` on the command. §2.5 is the
+  parametrization.
 - Reaction torque `= km · T`, signed by `spin[i]` (+1 = CCW about body +z).
 
 **Rotors are not mechanical degrees of freedom.** No body, no joint, no
@@ -60,12 +60,12 @@ geometry belongs to `base_link` as fixed geoms.
 **whichever body owns the site**. A site on a child body raises no error, gets the
 wrong lever arm, and presents as attitude cross-coupling. **No test covers this.**
 
-**`spin` is a hardcoded 4-tuple**
-([vehicle.py:45](src/mujoco_px4_sitl/vehicle.py#L45)), and `build_physics` never
-passes a custom `RotorModel` ([sim.py:238](src/mujoco_px4_sitl/sim.py#L238)). An
-octorotor raises `ValueError` at
-[vehicle.py:84-88](src/mujoco_px4_sitl/vehicle.py#L84-L88) — a hard error, not a
-silent one. **X8 requires fixing this first.**
+**`spin` must have exactly one entry per rotor.** A mismatch is a hard error at
+[vehicle.py:130-136](src/mujoco_px4_sitl/vehicle.py#L130-L136) — it is not
+truncated, because flying an X8 on the default 4-entry quad tuple would present
+as yaw drift. `spin` is geometry and cannot be inferred, so its length is what
+declares the expected rotor count; `build_physics` takes the `RotorModel` that
+carries it.
 
 ### 2.3 The arm: commands never reach the physics
 
@@ -74,24 +74,27 @@ The side channel parses `arm_cmd` into `ArmCommand(mode, values)`
 **nothing in `src/` writes `data.ctrl`** — the command is received and dropped.
 Phase 7 work.
 
-### 2.4 The side effect of auto-calibrated `k_thrust`
+### 2.4 Auto-calibrated `c_t` is the fallback when motors are unchosen
 
-By default it is calibrated from `body_subtreemass` so that hover sits at command
-0.5 ([vehicle.py:100-109](src/mujoco_px4_sitl/vehicle.py#L100-L109)), fixing
-thrust-to-weight at 4.0. Upside: any arm mass still flies. Downside: **the motors
-quietly get stronger**, hiding a real platform that would be underpowered.
+`c_t = None` calibrates from `body_subtreemass` so that full command gives
+`thrust_to_weight` (default 4.0), and **warns every time**
+([vehicle.py:186-210](src/mujoco_px4_sitl/vehicle.py#L186-L210)), with a second
+warning if the result is more than 3× off `CT_PLACEHOLDER`. Upside: any arm mass
+still flies, and hover stays at the same command whatever the vehicle weighs — one
+`MPC_THR_HOVER` covers quad, X8 and arm. Downside: **the motors quietly get
+stronger**, hiding a real platform that would be underpowered. That is what the
+warning is for.
 
-Under §2.5 this becomes an opt-in fallback rather than the default, and it should
-warn when the resulting thrust-to-weight is implausible. Dropping it outright would
-turn "heavy arm" into "will not take off", which is correct physics but presents as
-a broken model.
+Dropping it outright would turn "heavy arm" into "will not take off", which is
+correct physics but presents as a broken model. Once the motors are chosen, pass a
+measured `c_t` and the calibration is bypassed.
 
-### 2.5 Planned: ω as an explicit state
+### 2.5 ω as an explicit state
 
-The current model folds `C_T` and `ω_max²` into the single scalar `k_thrust`, which
-cannot be taken apart again. **Rotor speed is what every aerodynamic effect in §5
+**Implemented.** `k_thrust` folded `C_T` and `ω_max²` into one scalar that could
+not be taken apart again. **Rotor speed is what every aerodynamic effect in §5
 needs** — advance ratio, flapping, coaxial interference and gyroscopic precession
-all take ω, not a normalized command. So `RotorModel` moves to:
+all take ω, not a normalized command. `RotorModel` is now:
 
 ```
 ω_i   = clip(ω_idle + (ω_max_i − ω_idle) · u_i,  ω_min_i, ω_max_i)
@@ -120,22 +123,45 @@ Because ω is affine in `u`, low-passing `u` and low-passing ω are equivalent (
 constant idle term is unaffected by the filter), so the existing lag implementation
 carries over unchanged.
 
-**The one real knock-on cost.** A non-zero idle speed moves the hover operating
-point. For an X8 at ~3 kg with `ω_max = 1100 rad/s`, holding full-command
-thrust-to-weight at 4.0:
+Coefficients are scalar-or-per-rotor: a scalar broadcasts, a sequence must match
+the rotor count. `ω_idle` is shared — it is an ESC setting, not a per-rotor one.
 
-| | Current | ω-based |
+**The one real knock-on cost.** A non-zero idle speed moves the hover operating
+point. With `ω_idle / ω_max = 1/11` and full-command thrust-to-weight at 4.0:
+
+| | Old `k_thrust · u²` | ω-based |
 |---|---|---|
 | Hover command | 0.500 | **0.450** |
 | Normalized local gain `d(T/W)/du` | 4.000 | **3.636** (0.909×) |
 | Thrust at zero command | 0 | 3.3 % of weight |
 
-So `MPC_THR_HOVER` has to be recomputed, and the argument in
-[px4/22001_mujoco_quad:60-63](px4/22001_mujoco_quad#L60-L63) and
-[vehicle.py:34-37](src/mujoco_px4_sitl/vehicle.py#L34-L37) — that the quadratic
-plant and PX4's linear allocator share a slope at `u = 0.5`, so `THR_MDL_FAC` can
-stay 0 — has to be redone. Not a blocker, but it is the only genuine knock-on
-change, and missing it presents as altitude oscillation in hover.
+Note this is mass-independent: the hover command depends only on `ω_idle / ω_max`
+and `thrust_to_weight`, so 0.450 covers the quad, the X8 and any arm mass on top —
+which is what makes a single `MPC_THR_HOVER` viable at all. Verified in
+`tests/test_vehicle.py` against both a 1.52 kg quad and a 3 kg X8.
+
+**`MPC_THR_HOVER` is now 0.45, and `THR_MDL_FAC` stays 0** — but not for the old
+reason. The old argument was that `T = k·u²` has local gain exactly 1 against PX4's
+linear allocator at `u = 0.5`. The idle offset breaks that coincidence: at
+`u = 0.450` the plant is 0.909× the linear model. Redone, the argument is:
+
+1. **No `THR_MDL_FAC` can reproduce this plant.** PX4 inverts
+   `rel_thrust = a·x² + (1−a)·x`
+   (`mixer_module/functions/FunctionMotors.hpp:81-107`), which is zero at zero
+   command. Ours is 3.3 % of weight there. Any `a` mismatches the offset.
+2. **A 9 % gain deficit sits inside the altitude loop's margin**, and `MPC_USE_HTE`
+   defaults to 1 (`multicopter_position_control_params.c:60`), so the hover thrust
+   estimator absorbs the residual in flight. `MPC_THR_HOVER` is then the
+   estimator's initial value, not a fixed feedforward. **Measured**: the quad
+   re-flight shows vertical error 0.035 m median / 0.158 m max and no altitude
+   oscillation (`IMPLEMENTATION_PLAN.md` phase 5).
+3. **`THR_MDL_FAC = 1` would linearize better** — the plant is genuinely quadratic
+   in `u`, so PX4's square-root inversion very nearly cancels it, leaving gain
+   0.94–1.01 across the range against 0.909 at hover and a 11× spread overall. But
+   it needs `MPC_THR_HOVER = 0.2025`, and Phase 5's flight baseline was measured at
+   `fac = 0`; changing both at once leaves nothing to compare a regression against.
+
+If altitude oscillates in hover, point 3 is the first thing to try.
 
 ---
 
@@ -286,10 +312,10 @@ ratio collapsing to 0.03 and PX4's clock stalling.
 
 ### What aerodynamics actually needs: rotor-disc inflow
 
-The current rotor model is pure feedforward — thrust is a function of command only,
+The rotor model is still pure feedforward — thrust is a function of command only,
 and `vehicle.py` **reads no velocity state at all**. None of the effects below need
-separate links, but all of them need rotor speed, which is why §2.5 promotes ω to a
-state:
+separate links, but all of them need rotor speed, which §2.5 now supplies as
+`RotorState.omega`:
 
 | Effect | What it needs |
 |---|---|
@@ -388,14 +414,20 @@ per-joint gear ratio + stall torque → forcerange and armature
 end-effector reference point = optional, see §8
 ```
 
-From motor and propeller data, for §2.5:
+From motor and propeller data, for §2.5. **Not chosen yet**, so
+`OMEGA_MAX_PLACEHOLDER = 1100`, `OMEGA_IDLE_PLACEHOLDER = 100` and
+`CT_PLACEHOLDER` in `vehicle.py` stand in, with `c_t` auto-calibrated:
 
 ```
-c_t per rotor              [N/(rad/s)²]
-ω_max per rotor            [rad/s]  at flight battery voltage
-ω_idle                     [rad/s]  armed-but-idle
+c_t per rotor              [N/(rad/s)²]  placeholder: auto-calibrated from mass
+ω_max per rotor            [rad/s]  at flight battery voltage — placeholder 1100
+ω_idle                     [rad/s]  armed-but-idle — placeholder 100
 lower-deck c_t discount    = ? or "not modelled"   (§5 suggests 0.75–0.85)
 ```
+
+Replacing the placeholders with measured numbers changes `MPC_THR_HOVER`: it is
+set by `ω_idle / ω_max` and `thrust_to_weight`, and nothing else. `MujocoPhysics`
+logs the hover command at load so a mismatch is visible at boot.
 
 If the motors are not chosen yet, say so — §2.4's auto-calibration stays available
 as a fallback, and the platform-specific numbers can land later without reworking

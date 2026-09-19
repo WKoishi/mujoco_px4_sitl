@@ -648,6 +648,9 @@ mujoco_px4_sitl/
 │   ├── run_sitl.sh             launches PX4 + simulator together
 │   ├── install_px4_files.sh    copies px4/ into the PX4 tree AND registers
 │   │                           both files in the ROMFS CMakeLists (§5)
+│   ├── fly_regression.py       flies the phase 5 profile over MAVLink;
+│   │                           reports corner errors only, not hover accuracy
+│   ├── hover_error.py          hover accuracy from a ulog, datum-corrected
 │   └── sidechannel_example.py  reference side-channel client, imports nothing
 │                               from this package
 └── tests/
@@ -955,8 +958,9 @@ any new work. The exit criterion recorded here stands as the quad baseline.
 - Apply as MuJoCo forces on rotor sites; keep the model's rotor order identical
   to the `CA_ROTOR*` indices in the airframe file.
 - Calibrate so that hover sits near mid-stick: total thrust at command 0.5
-  should be close to vehicle weight. **Note** this holds for the quad's
-  `T = k·u²`; §2.5's idle offset moves it, and `MPC_THR_HOVER` moves with it.
+  should be close to vehicle weight. **Superseded.** §2.5's idle offset has since
+  moved hover to command 0.450 and `MPC_THR_HOVER` to 0.45. The exit criterion
+  below still holds; the 0.5 figure does not.
 
 **Exit**: `tests/test_vehicle.py` confirms hover thrust equals weight within
 tolerance and that yaw torque sums to zero with all four rotors at equal
@@ -980,6 +984,44 @@ failsafe. Keep the resulting ulog as the regression baseline.
 global position: 1` within ~20 s of boot, preflight is clean, the square's corner
 errors are 0.14–0.66 m measured 20 s into each 5 m leg (settling, not converged),
 and the vehicle lands disarmed with no failsafe at `ratio=1.000` throughout.
+
+**Re-measured after the ω-based rotor model** (`MODELING_CONVENTIONS.md` §2.5,
+`MPC_THR_HOVER` 0.50 → 0.45, `THR_MDL_FAC` still 0): passes, same procedure,
+`ratio=1.000 brake=0 timeouts=0` throughout, `Landing detected` → `Disarmed by
+landing`, no failsafe.
+
+| | Baseline (`k·u²`, hover 0.50) | ω-based (hover 0.45) |
+|---|---|---|
+| altitude error | 0.13 m max, mostly < 0.07 | 0.158 m max, 0.035 m median |
+| horizontal error | 0.17 m max | 0.115 m max, 0.056 m median |
+| square corner error | 0.14–0.66 m | 0.02–0.06 m |
+
+Reproduce with `scripts/fly_regression.py` then `scripts/hover_error.py` on the
+resulting ulog. Sampled over 151 s of settled hover (10 s discarded per still
+stretch) from `vehicle_local_position` against
+`vehicle_local_position_groundtruth`. **The
+corner figures are not directly comparable** — both were read 20 s into each leg,
+i.e. mid-settle, so they measure how far convergence had got, not steady-state
+accuracy. Read them as "not worse".
+
+**The 9 % gain deficit did not show up as altitude oscillation.** That was the
+one open risk in leaving `THR_MDL_FAC` at 0 (§2.5's argument, point 2: `MPC_USE_HTE`
+absorbs it). Vertical error median 0.035 m says the hover thrust estimator does
+absorb it. The argument is now measured, not just derived.
+
+**Two traps cost time here and will again.** Both produce plausible-looking
+numbers rather than errors:
+
+- `MAV_CMD_NAV_TAKEOFF`'s param7 is **AMSL**, not relative. Home is 488 m, so
+  passing `5.0` reads as 483 m below home; navigator rejects it with
+  `Already higher than takeoff altitude`, the vehicle sits armed, and
+  `Disarmed by auto preflight disarming` follows ~10 s later. `MIS_TAKEOFF_ALT`
+  is the relative one.
+- **Each topic latches its own datum.** In this run `ref_alt` differed by 0.655 m
+  and `ref_lat` by 3.34e-6° (0.371 m north). Comparing raw `x`/`y`/`z` across the
+  two topics folds that straight into the error: it reads as 0.53 m horizontal /
+  0.77 m vertical with the *median nearly equal to the max*, which is the tell —
+  GPS noise gives a median well below the max, a datum offset does not.
 
 The square was flown by streaming `SET_POSITION_TARGET_LOCAL_NED` at 20 Hz and
 switching to Offboard with `MAV_CMD_DO_SET_MODE` (custom main mode 6) — the stream
