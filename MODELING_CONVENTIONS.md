@@ -132,36 +132,93 @@ point. With `ω_idle / ω_max = 1/11` and full-command thrust-to-weight at 4.0:
 | | Old `k_thrust · u²` | ω-based |
 |---|---|---|
 | Hover command | 0.500 | **0.450** |
-| Normalized local gain `d(T/W)/du` | 4.000 | **3.636** (0.909×) |
 | Thrust at zero command | 0 | 3.3 % of weight |
+
+(An earlier version of this table compared local gains against a linear plant of
+the same full-command thrust, giving 4.000 against 3.636 — "0.909×". The figure is
+arithmetically right but answers nothing useful: the reference is full scale, not
+any model PX4 holds, and it invited being read as a closed-loop regression. §2.6
+has the comparison that matters.)
 
 Note this is mass-independent: the hover command depends only on `ω_idle / ω_max`
 and `thrust_to_weight`, so 0.450 covers the quad, the X8 and any arm mass on top —
 which is what makes a single `MPC_THR_HOVER` viable at all. Verified in
 `tests/test_vehicle.py` against both a 1.52 kg quad and a 3 kg X8.
 
-**`MPC_THR_HOVER` is now 0.45, and `THR_MDL_FAC` stays 0** — but not for the old
-reason. The old argument was that `T = k·u²` has local gain exactly 1 against PX4's
-linear allocator at `u = 0.5`. The idle offset breaks that coincidence: at
-`u = 0.450` the plant is 0.909× the linear model. Redone, the argument is:
+**`MPC_THR_HOVER` moves with the idle offset.** Hover is at `u = 0.450`, so the
+parameter is 0.450 at `fac = 0` and `0.450^2 = 0.2025` at `fac = 1` -- it lives in
+the allocator's domain, which section 2.6 shows is `u^2`. Measured from a ulog:
+`actuator_motors` sits at `MPC_THR_HOVER` in hover, 1:1, which is what fixes the
+relationship.
 
-1. **No `THR_MDL_FAC` can reproduce this plant.** PX4 inverts
-   `rel_thrust = a·x² + (1−a)·x`
-   (`mixer_module/functions/FunctionMotors.hpp:81-107`), which is zero at zero
-   command. Ours is 3.3 % of weight there. Any `a` mismatches the offset.
-2. **A 9 % gain deficit sits inside the altitude loop's margin**, and `MPC_USE_HTE`
-   defaults to 1 (`multicopter_position_control_params.c:60`), so the hover thrust
-   estimator absorbs the residual in flight. `MPC_THR_HOVER` is then the
-   estimator's initial value, not a fixed feedforward. **Measured**: the quad
-   re-flight shows vertical error 0.035 m median / 0.158 m max and no altitude
-   oscillation (`IMPLEMENTATION_PLAN.md` phase 5).
-3. **`THR_MDL_FAC = 1` would linearize better** — the plant is genuinely quadratic
-   in `u`, so PX4's square-root inversion very nearly cancels it, leaving gain
-   0.94–1.01 across the range against 0.909 at hover and a 11× spread overall. But
-   it needs `MPC_THR_HOVER = 0.2025`, and Phase 5's flight baseline was measured at
-   `fac = 0`; changing both at once leaves nothing to compare a regression against.
+`THR_MDL_FAC` is **1**, and section 2.6 owns that argument in full. Superseded
+here: earlier versions of this section argued for leaving it at 0, on the grounds
+that the plant and PX4's linear allocator shared a slope at mid-stick and the idle
+offset only spoiled that by 0.909x. Both the framing and the conclusion were
+wrong. `fac` is not a tuning knob for slope agreement -- it is what makes the
+mixer consistent with `CA_ROTOR*_CT`'s own definition, and at 0 the attitude loop
+runs at exactly twice its design gain.
 
-If altitude oscillates in hover, point 3 is the first thing to try.
+### 2.6 `THR_MDL_FAC` must be 1, and why
+
+**Fixed.** `px4/22001_mujoco_quad` sets `THR_MDL_FAC 1.0`,
+`MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144`. These are one setting; changing any
+one alone leaves the vehicle flyable but mistuned.
+
+This is a consistency requirement of PX4's own rotor model, not a linearization
+of ours. `CA_ROTOR*_CT` is defined as **`Thrust = CT · u²`**
+(`control_allocator/module.yaml:196-209`), while the effectiveness matrix is
+**linear** in the actuator variable — `ct * axis` and `ct * position.cross(axis)`
+(`ActuatorEffectivenessRotors.cpp:195-198`). Both can only hold if the
+allocator's actuator variable is `u²`, and `FunctionMotors`' square root at
+`fac = 1` is what converts it back to `u`
+(`mixer_module/functions/FunctionMotors.hpp:81-107`).
+
+At `fac = 0` that step is the identity, so the plant's square stays in the loop:
+
+```
+control_allocator   thrust domain, linear, correct
+      |             actuator_motors[i]
+FunctionMotors      fac = 1 -> sqrt          fac = 0 -> identity
+      |             u = sqrt(s)              u = s
+our plant           T = c_t * omega(u)^2     T = c_t * omega(u)^2
+                    torque matches intent    torque is 2.00x intent
+```
+
+**The factor is exactly 2.00**, and it does not depend on the idle offset.
+Perturbing an allocation by ε about hover command `h`, with
+`omega_h = omega_idle + k·h`:
+
+| | `omega` | `ΔT` to first order |
+|---|---|---|
+| `fac = 0`, `s = h(1+ε)` | `omega_idle + k·h(1+ε)` | `2·c_t·omega_h·k·h·ε` |
+| `fac = 1`, `s = h²(1+ε)` | `omega_idle + k·h·sqrt(1+ε)` | `c_t·omega_h·k·h·ε` |
+
+Both share `omega_h`, so the ratio is 2 regardless of `omega_idle` — it is just
+the factor differentiating a square introduces. So **`fac = 0` ran the attitude
+loop at exactly twice its design gain.** It flew anyway, inside PX4's default
+gain margin, which is why this needed measuring rather than trusting.
+
+`MPC_THR_MIN` is the trap. It is a floor on the *setpoint*, so at `fac = 1` the
+default 0.12 clamps the command at `sqrt(0.12) = 0.346` — 0.66 of vehicle weight,
+and the vehicle cannot descend. `0.12² = 0.0144` restores the same command floor
+and with it the identical physical range, T/W 0.160 to 4.000.
+
+**There is no cross-axis leak, at either setting.** An earlier draft of this
+section claimed a commanded pure yaw leaks roll and pitch. It does not: the
+quadratic term a command-domain split adds is identical at all four `(x, y)`
+positions, so it cancels by symmetry. That draft generalized from a test that
+drove a *single* coaxial pair, which is asymmetric by construction and not what
+the allocator emits. The error was only ever a gain scale.
+`test_no_cross_axis_leak_at_either_fac` pins this down so the wrong version does
+not come back.
+
+Measured on the plant rather than in flight, deliberately: a 5 m square is far
+too gentle to excite the attitude loop enough to see a 2× gain in a ulog. Fitting
+angular acceleration against commanded torque over the regression flight gives
+R² ≈ 0.15 — noise, not signal. The flight's job is confirming no regression
+(`IMPLEMENTATION_PLAN.md` phase 5); the ratio's job belongs to
+`test_thr_mdl_fac_1_is_what_makes_torque_match_the_allocation`.
 
 ---
 

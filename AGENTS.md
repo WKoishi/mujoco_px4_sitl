@@ -21,15 +21,22 @@ something, the quad numbers are the only way to tell "the change broke it" from
 
 Phase 7 (aerial manipulator) has not started, but its first two prerequisites are
 done: `RotorModel` is ω-based with per-rotor arrays and an arbitrary rotor count
-(`MODELING_CONVENTIONS.md` §2.5), and `MPC_THR_HOVER` moved 0.50 → 0.45 with the
-`THR_MDL_FAC` argument re-derived.
+(`MODELING_CONVENTIONS.md` §2.5), and the PX4 side is consistent with it —
+`THR_MDL_FAC 1.0`, `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144` (§2.6).
 
-**The quad has been re-flown on it** — full arm → takeoff → 5 m square → land,
-hover error 0.158 m vertical / 0.115 m horizontal against ground truth, inside the
-baseline's band. The numbers and the two measurement traps are in
-`IMPLEMENTATION_PLAN.md` phase 5, next to the original baseline. The 9 % hover gain
-deficit did not present as altitude oscillation, which was the one open risk in
-keeping `THR_MDL_FAC` at 0.
+**The quad has been flown twice on it**, once at `fac = 0` and once after the fix,
+with hover error unchanged (0.153 m vertical / 0.121 m horizontal against ground
+truth, inside the baseline's band). `IMPLEMENTATION_PLAN.md` phase 5 has both sets
+of numbers and the two measurement traps.
+
+`fac = 0` was not a tuning preference but an inconsistency: `CA_ROTOR*_CT` is
+defined as `Thrust = CT · u²` while the effectiveness matrix is linear in the
+actuator variable, so the allocator's variable is `u²` and the mixer's square root
+is what converts it back. Without it the attitude loop ran at exactly 2.00× its
+design gain — flyable, inside PX4's default margin, and invisible in a 5 m square
+(fitting angular acceleration against commanded torque over that flight gives
+R² ≈ 0.15, i.e. noise). The ratio is asserted on the plant instead, in
+`tests/test_vehicle.py`.
 
 **The X8 is a different matter: it cannot reach SITL yet.** No `models/x8_arm.xml`
 and the PX4 airframe is still `CA_ROTOR_COUNT 4`. The 8-rotor coverage in

@@ -396,10 +396,12 @@ def test_a_coaxial_pair_produces_pure_yaw(x8: Vehicle):
     between them cancels in roll and pitch and leaves only reaction torque. PZ
     contributes nothing: r x [0,0,T] ignores r's z component.
 
-    The split is by *thrust*, not by command: thrust is quadratic in command, so
-    equal command offsets do not cancel and would leak roll and pitch. That is
-    the allocator's problem to solve, not the plant's -- PX4 mixes in the thrust
-    domain for exactly this reason.
+    The split is by *thrust*, not by command. Splitting one pair by command adds
+    2*c_t*k^2*delta^2 of thrust at that pair's (x, y) and nothing at the others,
+    so it leaks roll and pitch -- 0.085 N.m for delta = 0.08 here. That is an
+    artefact of driving a single pair, which no allocator does: PX4 applies the
+    same differential to all four pairs, and then the extra thrust is equal at
+    every position and cancels. See test_no_cross_axis_leak_at_either_fac.
     """
     hover = x8.hover_command()
     settle(x8, np.full(8, hover))
@@ -486,6 +488,83 @@ def test_omega_is_exposed_as_state_for_the_aero_layer(x8: Vehicle):
     expected = x8.omega_idle + (x8.omega_max - x8.omega_idle) * 0.5
     assert omega == pytest.approx(expected)
     assert x8.state.thrust == pytest.approx(x8.c_t * omega ** 2)
+
+
+def _px4_command(vehicle: Vehicle, thrust_domain, fac: float):
+    """What FunctionMotors puts on the wire for a thrust-domain allocation.
+
+    PX4 inverts ``rel_thrust = a*x^2 + (1-a)*x`` (FunctionMotors.hpp:81-107).
+    ``a = 0`` is the identity; ``a = 1`` is the square root.
+    """
+    s = np.asarray(thrust_domain, dtype=np.float64)
+    if fac <= 0.0:
+        return s
+    b = 1.0 - fac
+    return -b / (2 * fac) + np.sqrt(b * b / (4 * fac * fac) + s / fac)
+
+
+def _torque_for(vehicle: Vehicle, thrust_domain, fac: float):
+    """Body torque the plant produces for a thrust-domain allocation at ``fac``."""
+    vehicle.update_commands(_px4_command(vehicle, thrust_domain, fac), 10.0)
+    return vehicle.wrench_body()[1]
+
+
+def test_thr_mdl_fac_1_is_what_makes_torque_match_the_allocation(x8: Vehicle):
+    """THR_MDL_FAC 1 is required for consistency with PX4's own rotor model.
+
+    ``CA_ROTOR*_CT`` is defined as ``Thrust = CT * u^2``
+    (control_allocator/module.yaml:196-209) while the effectiveness matrix is
+    linear in the actuator variable (ActuatorEffectivenessRotors.cpp:195-198), so
+    the allocator's variable is ``u^2`` and the sqrt at fac=1 is what converts it
+    back. At fac=0 that step is the identity and the plant's square stays in the
+    loop, so every torque comes out larger than the allocator asked for.
+
+    Measured on the plant, not in flight: a 5 m square is too gentle to excite
+    the attitude loop enough to see this in a ulog (R^2 ~0.15 against noise).
+    """
+    # Each setting has its own MPC_THR_HOVER, since that parameter *is* the
+    # allocator-domain hover value: u at fac=0, u^2 at fac=1. Comparing one
+    # absolute number through both mappings would compare different operating
+    # points, not different mixer settings.
+    hover = {0.0: x8.hover_command(), 1.0: x8.hover_command() ** 2}
+    left = x8.arm_body[:, 1] > 0
+
+    for label, yaw, roll in (("yaw", 0.15, 0.0), ("roll", 0.0, 0.2),
+                             ("both", 0.15, 0.2)):
+        # A relative thrust-domain allocation, the way control_allocator emits it.
+        shape = 1.0 + yaw * x8.spin + roll * np.where(left, 1.0, -1.0)
+        t1 = _torque_for(x8, hover[1.0] * shape, 1.0)
+        t0 = _torque_for(x8, hover[0.0] * shape, 0.0)
+
+        # fac=1 reproduces the allocation's intent; fac=0 overshoots it.
+        for axis in range(3):
+            if abs(t1[axis]) < 1e-9:
+                assert abs(t0[axis]) < 1e-9, (
+                    f"{label}: fac=0 leaked {t0[axis]:+.4f} on axis {axis}"
+                )
+                continue
+            ratio = t0[axis] / t1[axis]
+            assert ratio > 1.4, (
+                f"{label} axis {axis}: fac=0 gave {ratio:.2f}x the commanded "
+                f"torque; if this dropped, the plant curve changed"
+            )
+
+
+def test_no_cross_axis_leak_at_either_fac(x8: Vehicle):
+    """The error is a gain scale, not cross-coupling.
+
+    The quadratic term a command-domain split adds is identical at all four
+    (x, y) positions, so it cancels by symmetry: a commanded pure yaw stays pure
+    yaw even at fac=0. Only the magnitude is wrong. Asserted because the opposite
+    was written down first, on the strength of a test that drove a single coaxial
+    pair -- which is asymmetric by construction and not what an allocator emits.
+    """
+    hover = {0.0: x8.hover_command(), 1.0: x8.hover_command() ** 2}
+    for fac in (0.0, 1.0):
+        torque = _torque_for(x8, hover[fac] * (1.0 + 0.15 * x8.spin), fac)
+        assert torque[0] == pytest.approx(0.0, abs=1e-9), f"roll leak at fac={fac}"
+        assert torque[1] == pytest.approx(0.0, abs=1e-9), f"pitch leak at fac={fac}"
+        assert abs(torque[2]) > 1e-3, f"no yaw produced at fac={fac}"
 
 
 def test_build_physics_passes_the_rotor_model_through(tmp_path):

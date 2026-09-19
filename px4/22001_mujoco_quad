@@ -60,24 +60,35 @@ param set-default SENS_EN_GPSSIM 1
 # Rotor speed is an explicit state in the model (MODELING_CONVENTIONS.md 2.5):
 # omega = omega_idle + (omega_max - omega_idle) * u, T = c_t * omega^2, with a
 # non-zero idle speed because an armed motor does not stop at zero command.
-# With omega_idle / omega_max = 1/11 and thrust/weight 4.0 at full command,
-# total thrust equals weight at u = 0.450, not 0.500. Hence the value below.
 #
-# THR_MDL_FAC stays 0, but no longer because the curves agree. The old argument
-# was that T = k*u^2 has slope exactly 1 against PX4's linear allocator at
-# u = 0.5. The idle offset breaks that: at u = 0.450 the plant's normalized gain
-# d(T/W)/du is 3.636 against the linear model's 4.000, i.e. 0.909x. Three
-# reasons that is still the right setting:
+# These three parameters are one setting, not three. Changing any one alone
+# leaves the vehicle flyable but mistuned, which is why they are adjacent.
 #
-#   1. No THR_MDL_FAC can reproduce this plant. PX4 inverts
-#      rel_thrust = a*x^2 + (1-a)*x (mixer_module/functions/FunctionMotors.hpp
-#      :81-107), which is zero at zero command. Ours is 3.3 % of weight there.
-#   2. A 9 % gain deficit is inside the altitude loop's margin, and MPC_USE_HTE
-#      defaults to 1, so the hover thrust estimator absorbs the residual in
-#      flight. MPC_THR_HOVER is then only the estimator's initial value.
-#   3. THR_MDL_FAC 1 would flatten the gain further (~1.01 at hover) but needs
-#      MPC_THR_HOVER 0.2025, and the phase 5 flight baseline was measured at
-#      fac = 0. Changing both at once would leave nothing to compare against.
+# THR_MDL_FAC 1 is required for consistency with PX4's own rotor model, not
+# merely to linearize ours. CA_ROTOR*_CT is defined as Thrust = CT * u^2
+# (control_allocator/module.yaml:196-209), while the effectiveness matrix is
+# linear in the actuator variable -- ct * axis and ct * position.cross(axis)
+# (ActuatorEffectivenessRotors.cpp:195-198). The only way both hold is if the
+# allocator's actuator variable is u^2, and FunctionMotors' sqrt at fac = 1 is
+# what converts it back to u (mixer_module/functions/FunctionMotors.hpp:81-107).
+# At fac = 0 that step is the identity, so the plant's square stays in the loop
+# and every torque comes out exactly 2.00x what the allocator asked for -- the
+# attitude loop running at twice its design gain. The factor is the one
+# differentiating a square introduces, and is independent of omega_idle; see
+# MODELING_CONVENTIONS.md 2.6 for the derivation. It flew anyway, inside PX4's
+# default gain margin, which is why this needed asserting rather than trusting.
 #
-# If altitude oscillates in hover, this block is the first thing to revisit.
-param set-default MPC_THR_HOVER 0.45
+# MPC_THR_HOVER is in the allocator's domain, so it is u^2, not u. Hover is at
+# u = 0.450 (omega_idle / omega_max = 1/11, thrust/weight 4.0 at full command),
+# hence 0.450^2 = 0.2025. Measured: actuator_motors sits at MPC_THR_HOVER in
+# hover, 1:1, so this parameter *is* the command at fac = 0 and its square root
+# at fac = 1.
+#
+# MPC_THR_MIN must move with it, and forgetting this is the trap: the default
+# 0.12 is a floor on the *setpoint*, so at fac = 1 it clamps the command at
+# sqrt(0.12) = 0.346, i.e. 0.66 of vehicle weight. The vehicle cannot descend and
+# landing drifts. 0.12^2 = 0.0144 restores the same command floor, and with it
+# the identical physical range: T/W 0.160 to 4.000, same as fac = 0.
+param set-default THR_MDL_FAC 1.0
+param set-default MPC_THR_HOVER 0.2025
+param set-default MPC_THR_MIN 0.0144

@@ -985,16 +985,25 @@ global position: 1` within ~20 s of boot, preflight is clean, the square's corne
 errors are 0.14–0.66 m measured 20 s into each 5 m leg (settling, not converged),
 and the vehicle lands disarmed with no failsafe at `ratio=1.000` throughout.
 
-**Re-measured after the ω-based rotor model** (`MODELING_CONVENTIONS.md` §2.5,
-`MPC_THR_HOVER` 0.50 → 0.45, `THR_MDL_FAC` still 0): passes, same procedure,
-`ratio=1.000 brake=0 timeouts=0` throughout, `Landing detected` → `Disarmed by
-landing`, no failsafe.
+**Re-measured twice after the ω-based rotor model** (`MODELING_CONVENTIONS.md`
+§2.5): once at `THR_MDL_FAC 0` / `MPC_THR_HOVER 0.45`, then again after §2.6's fix
+at `THR_MDL_FAC 1.0` / `MPC_THR_HOVER 0.2025` / `MPC_THR_MIN 0.0144`. Both pass the
+same procedure, `ratio=1.000 brake=0 timeouts=0` throughout, `Landing detected` →
+`Disarmed by landing`, no failsafe.
 
-| | Baseline (`k·u²`, hover 0.50) | ω-based (hover 0.45) |
-|---|---|---|
-| altitude error | 0.13 m max, mostly < 0.07 | 0.158 m max, 0.035 m median |
-| horizontal error | 0.17 m max | 0.115 m max, 0.056 m median |
-| square corner error | 0.14–0.66 m | 0.02–0.06 m |
+| | Baseline (`k·u²`, hover 0.50) | ω-based, `fac 0` | ω-based, `fac 1` |
+|---|---|---|---|
+| altitude error | 0.13 m max, mostly < 0.07 | 0.158 max / 0.035 median | 0.153 max / 0.036 median |
+| horizontal error | 0.17 m max | 0.115 max / 0.056 median | 0.121 max / 0.051 median |
+| square corner error | 0.14–0.66 m | 0.02–0.06 m | 0.03–0.07 m |
+
+**The two ω-based columns are indistinguishable, and that is the expected
+result** — not evidence the fix did nothing. Position accuracy here is bounded by
+`sensor_gps_sim`'s noise, and the 2.00× attitude gain the fix removes sits inside
+PX4's default gain margin. A flight profile this gentle cannot separate them; the
+gain ratio is asserted on the plant in `tests/test_vehicle.py` instead. What these
+columns do establish is **no regression**, which is what a parameter change of
+this kind needs from a flight.
 
 Reproduce with `scripts/fly_regression.py` then `scripts/hover_error.py` on the
 resulting ulog. Sampled over 151 s of settled hover (10 s discarded per still
@@ -1004,12 +1013,16 @@ corner figures are not directly comparable** — both were read 20 s into each l
 i.e. mid-settle, so they measure how far convergence had got, not steady-state
 accuracy. Read them as "not worse".
 
-**The 9 % gain deficit did not show up as altitude oscillation.** That was the
-one open risk in leaving `THR_MDL_FAC` at 0 (§2.5's argument, point 2: `MPC_USE_HTE`
-absorbs it). Vertical error median 0.035 m says the hover thrust estimator does
-absorb it. The argument is now measured, not just derived.
+**Neither flight would have caught the `fac = 0` defect, and that is worth
+knowing.** It was found by reading `CA_ROTOR*_CT`'s definition against the
+effectiveness matrix, not from flight data. The first flight was read as clearing
+`fac = 0` on the strength of hover error alone; it did not. **A gentle profile
+bounds how wrong a parameter can be before it shows, and that bound is generous** —
+a 2× attitude gain flew through takeoff, a square and landing with no visible
+symptom. Anything derived rather than measured needs an assertion somewhere it can
+fail, not a flight that merely fails to contradict it.
 
-**Two traps cost time here and will again.** Both produce plausible-looking
+**Three traps cost time here and will again.** All produce plausible-looking
 numbers rather than errors:
 
 - `MAV_CMD_NAV_TAKEOFF`'s param7 is **AMSL**, not relative. Home is 488 m, so
@@ -1022,6 +1035,11 @@ numbers rather than errors:
   two topics folds that straight into the error: it reads as 0.53 m horizontal /
   0.77 m vertical with the *median nearly equal to the max*, which is the tell —
   GPS noise gives a median well below the max, a datum offset does not.
+- **`MPC_THR_MIN` is a floor on the setpoint, so it lives in the allocator's
+  domain too.** Left at its 0.12 default when `THR_MDL_FAC` went to 1, it clamps
+  the command at `sqrt(0.12) = 0.346`, i.e. 0.66 of vehicle weight: the vehicle
+  cannot descend and landing drifts. `0.12² = 0.0144` restores the same command
+  floor. `MPC_THR_HOVER`, `MPC_THR_MIN` and `THR_MDL_FAC` are one setting.
 
 The square was flown by streaming `SET_POSITION_TARGET_LOCAL_NED` at 20 Hz and
 switching to Offboard with `MAV_CMD_DO_SET_MODE` (custom main mode 6) — the stream
