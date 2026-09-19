@@ -10,8 +10,14 @@ lockstep. Sensor strategy A: we supply IMU + ground truth, and PX4's own
 
 No ROS 2 dependency here. See [ROS 2 integration](#ros-2-integration).
 
-`IMPLEMENTATION_PLAN.md` is the reference for the PX4 v1.17 interface contract
-and the phase order. Read it before changing anything in `src/`.
+## Documents
+
+- **`IMPLEMENTATION_PLAN.md`** — the PX4 v1.17 interface contract, the phase order,
+  and the measured baselines. Read it before changing anything in `src/`.
+- **`MODELING_CONVENTIONS.md`** — how to author a model: CAD → MJCF, the rotor
+  parametrization, the naming the loader requires. Read it before adding a model.
+- **`AGENTS.md`** — current state and what is unimplemented. Start here when
+  picking the work back up.
 
 ## Setup
 
@@ -132,7 +138,7 @@ the simulator. Nothing in `src/` may import `rclpy` or `ament`.
 ## Tests
 
 ```sh
-python -m pytest            # 84 tests, no PX4 build and no GL needed
+python -m pytest            # no PX4 build and no GL needed
 ```
 
 No install step: `pyproject.toml` puts `src` on pytest's path, so a fresh

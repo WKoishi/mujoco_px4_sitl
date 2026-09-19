@@ -3,9 +3,19 @@
 MuJoCo as the physics backend for PX4 SITL, connected over the MAVLink HIL
 interface. Target application: aerial manipulation (multirotor + robotic arm).
 
-This document is the reference for the whole development effort. It records the
-verified PX4 v1.17 interface contract, the phase order, and the exit criteria
-for each phase. Update it when a decision changes; it is not a historical log.
+This document records the verified PX4 v1.17 interface contract, the phase order
+and exit criteria, and the measurements taken when each phase was met. Update it
+when a decision changes; it is not a historical log, but the measured results it
+records **are** kept — they are the regression baseline.
+
+Its scope ends at the PX4 interface and the phase structure. Two siblings own the
+rest, and win inside their own scope:
+
+- **`MODELING_CONVENTIONS.md`** — where models come from (CAD → MJCF), the rotor
+  parametrization, and the target platform. Supersedes Phase 4's thrust curve and
+  Phase 7's model details.
+- **`AGENTS.md`** — current state, what is unimplemented, and what to do next.
+  Read it first when picking up the work.
 
 ---
 
@@ -606,8 +616,13 @@ consequences for bring-up:
 
 ```
 mujoco_px4_sitl/
-├── IMPLEMENTATION_PLAN.md      this file
-├── README.md                   quickstart, kept short
+├── IMPLEMENTATION_PLAN.md      this file: interface contract, phase design,
+│                               measured baselines
+├── MODELING_CONVENTIONS.md     model authoring: CAD -> MJCF, rotor
+│                               parametrization, platform config
+├── AGENTS.md                   handoff: current state, what is unimplemented,
+│                               next steps, which document wins
+├── README.md                   quickstart for users, kept short
 ├── pyproject.toml              deps: mujoco>=3.13, numpy, pymavlink
 ├── src/mujoco_px4_sitl/
 │   ├── __init__.py
@@ -624,18 +639,23 @@ mujoco_px4_sitl/
 │   └── viewer.py               optional mujoco.viewer, off by default
 ├── models/
 │   ├── quad_x.xml              phase 3-5 airframe (FLU body frame, §3.6)
-│   └── quad_x_arm.xml          phase 7 aerial manipulator
+│   └── x8_arm.xml              phase 7 aerial manipulator, generated
+│                               (MODELING_CONVENTIONS.md §6)
 ├── px4/
 │   ├── 22001_mujoco_quad       PX4 airframe file (copied into PX4 tree)
 │   └── 22001_mujoco_quad.post  starts the sensor_*_sim modules
 ├── scripts/
 │   ├── run_sitl.sh             launches PX4 + simulator together
-│   └── install_px4_files.sh    copies px4/ into the PX4 tree AND registers
-│                               both files in the ROMFS CMakeLists (§5)
+│   ├── install_px4_files.sh    copies px4/ into the PX4 tree AND registers
+│   │                           both files in the ROMFS CMakeLists (§5)
+│   └── sidechannel_example.py  reference side-channel client, imports nothing
+│                               from this package
 └── tests/
     ├── test_frames.py          the §3.6 attitude table, round-trips, geodetic
     ├── test_hil.py             message encode/decode against pymavlink
-    └── test_vehicle.py         rotor model: hover thrust, torque balance
+    ├── test_vehicle.py         rotor model: hover thrust, torque balance
+    ├── test_config.py          flag combinations that would fail silently
+    └── test_loop.py            lockstep loop against a fake PX4
 ```
 
 `viewer.py` stays optional and off by default: under lockstep the viewer's
@@ -925,13 +945,18 @@ waste a day in this phase.
 
 ### Phase 4 — Rotor model and actuator mapping
 
-- Map `HIL_ACTUATOR_CONTROLS.controls[0..3]` ∈ `[0,1]` to thrust and reaction
-  torque per rotor. Start with quadratic thrust vs. normalized command, first
-  order motor lag, and a `CA_ROTOR*_KM`-consistent torque coefficient.
+**Quadrotor only, and complete.** The rotor parametrization has since moved on:
+`MODELING_CONVENTIONS.md` §2.5 owns it, and supersedes the thrust curve below for
+any new work. The exit criterion recorded here stands as the quad baseline.
+
+- Map `HIL_ACTUATOR_CONTROLS.controls[i]` ∈ `[0,1]` to thrust and reaction torque
+  per rotor, with first-order motor lag and a `CA_ROTOR*_KM`-consistent torque
+  coefficient. The thrust curve itself is `MODELING_CONVENTIONS.md` §2.5's.
 - Apply as MuJoCo forces on rotor sites; keep the model's rotor order identical
   to the `CA_ROTOR*` indices in the airframe file.
 - Calibrate so that hover sits near mid-stick: total thrust at command 0.5
-  should be close to vehicle weight.
+  should be close to vehicle weight. **Note** this holds for the quad's
+  `T = k·u²`; §2.5's idle offset moves it, and `MPC_THR_HOVER` moves with it.
 
 **Exit**: `tests/test_vehicle.py` confirms hover thrust equals weight within
 tolerance and that yaw torque sums to zero with all four rotors at equal
@@ -1022,10 +1047,16 @@ Two things found while getting there, both worth keeping:
 
 ### Phase 7 — Aerial manipulator
 
-- `models/quad_x_arm.xml`: multirotor plus serial arm, actuated joints with
-  realistic limits, torque limits, and mass.
-- Arm joints driven from the side channel (position or torque, decide when the
-  arm's controller design is known).
+**`MODELING_CONVENTIONS.md` owns the model, the platform and the rotor
+parametrization for this phase.** Target is a coaxial X8 octorotor plus serial arm,
+authored in SolidWorks. This section keeps only the phase's intent and exit
+criterion.
+
+- `models/x8_arm.xml`: multirotor plus serial arm, actuated joints with realistic
+  limits, torque limits, and mass. Generated by the conversion pipeline of
+  `MODELING_CONVENTIONS.md` §6, not hand-authored.
+- Arm joints driven from the side channel, position-controlled
+  (`MODELING_CONVENTIONS.md` §3.4).
 - Expected physics coupling: the arm moves the composite CoM and adds reaction
   torques on the base. PX4 will see this as a disturbance, which is the point.
 - Investigate whether the arm needs its own control rate distinct from the
@@ -1171,12 +1202,14 @@ deliberate benefit of strategy A.
 
 ## 9. Open questions
 
-Resolve when the phase that needs them arrives, not before.
+Resolve when the phase that needs them arrives, not before. Questions about the
+model, the platform or the rotor parametrization belong in
+`MODELING_CONVENTIONS.md` §8, not here.
 
-- Arm control interface: joint position targets vs. torque. Depends on the
-  manipulation controller design.
 - Physics rate for contact-rich manipulation: 1 kHz may not be enough; measure
   before deciding, and note that raising it costs wall-clock time only, not
-  correctness.
+  correctness. `MODELING_CONVENTIONS.md` §5 has the headroom measurement this
+  needs — 74k steps/s on `quad_x.xml`, 296 steps per IMU frame at real time.
 - Whether the aerial manipulator eventually needs a custom `CA_*` allocation or
-  benefits from PX4's existing disturbance rejection alone.
+  benefits from PX4's existing disturbance rejection alone. Still open, and the
+  move to X8 does not settle it.
