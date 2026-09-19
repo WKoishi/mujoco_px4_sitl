@@ -137,3 +137,8 @@ the phase that produced them.
 - **Frame conversions live only in `frames.py`.** A rotation anywhere else is a bug.
 - **`brake` and `timeouts` should both be 0 in healthy flight**, and `ratio` alone
   will not tell you otherwise. `IMPLEMENTATION_PLAN.md` §7 diagnoses both.
+- **Commit messages: 10–20 lines of body.** The history runs to 53 lines and 640
+  words because it restates derivations the documents already own. State a
+  constraint once, in the document that owns it per §5, and have the commit point
+  there. Worth a sentence in the commit and nowhere else: what an earlier version
+  of the reasoning got wrong, since that is what a reader may already believe.
