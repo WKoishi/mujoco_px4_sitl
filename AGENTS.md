@@ -19,10 +19,12 @@ delete them from the plan when the platform changes.** If an X8 change breaks
 something, the quad numbers are the only way to tell "the change broke it" from
 "it never worked".
 
-Phase 7 (aerial manipulator) has not started, but its first two prerequisites are
-done: `RotorModel` is ω-based with per-rotor arrays and an arbitrary rotor count
+Phase 7 (aerial manipulator) is under way. Its first two prerequisites were done
+earlier: `RotorModel` is ω-based with per-rotor arrays and an arbitrary rotor count
 (`MODELING_CONVENTIONS.md` §2.5), and the PX4 side is consistent with it —
-`THR_MDL_FAC 1.0`, `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144` (§2.6).
+`THR_MDL_FAC 1.0`, `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144` (§2.6), those being
+the **quad's** values. The conversion pipeline and the X8 model have since landed
+(§3, §4).
 
 **The quad has been flown twice on it**, once at `fac = 0` and once after the fix,
 with hover error unchanged (0.153 m vertical / 0.121 m horizontal against ground
@@ -38,13 +40,18 @@ design gain — flyable, inside PX4's default margin, and invisible in a 5 m squ
 R² ≈ 0.15, i.e. noise). The ratio is asserted on the plant instead, in
 `tests/test_vehicle.py`.
 
-**The X8 is a different matter: it cannot reach SITL yet.** No `models/x8_arm.xml`
-and the PX4 airframe is still `CA_ROTOR_COUNT 4`. The 8-rotor coverage in
-`tests/test_vehicle.py` is a synthetic inline model (a 3 kg box with 8 sites in
-§4's order), so it verifies force/torque algebra and the hover point, not flight.
+**The X8 is a different matter: it cannot reach SITL yet**, though for a narrower
+reason than before. The model now exists — generated from the first CAD export by
+`scripts/urdf_to_mjcf.py`, passing every self-check (§4) — but nothing constructs
+an 8-rotor `RotorModel` at startup, so loading it raises, and the PX4 airframe is
+still `CA_ROTOR_COUNT 4`. The 8-rotor coverage in `tests/test_vehicle.py` is a
+synthetic inline model (a 3 kg box with 8 sites in `MODELING_CONVENTIONS.md` §4's
+order), so it verifies force/torque algebra and the hover point, not flight.
 
-Motors are still unchosen, so `c_t` is auto-calibrated from mass and `ω_max` /
-`ω_idle` are placeholders (§2.4, §7).
+Motors are now chosen: `c_t`, `km` and `ω_max` are fitted from the manufacturer's
+data and live in the private sidecar (§4). `ω_idle` is not in that data and is
+still a choice, and `vehicle.py`'s placeholders remain the fallback for any model
+that does not supply its own.
 
 ---
 
@@ -53,15 +60,17 @@ Motors are still unchosen, so `c_t` is auto-calibrated from mass and `ω_max` /
 | Gap | Where | Consequence |
 |---|---|---|
 | `arm_cmd` never reaches the physics | `sidechannel.py` parses it into `ArmCommand`; nothing in `src/` writes `data.ctrl` | arm commands are received and silently dropped |
-| Real motor / propeller numbers | `c_t` auto-calibrated, `ω_max` / `ω_idle` placeholders in `vehicle.py` | thrust/weight is 4.0 by construction, not by measurement |
-| `models/x8_arm.xml` does not exist | — | Phase 7 has no model |
-| No URDF → MJCF conversion script | designed in `MODELING_CONVENTIONS.md` §6, not written | nothing consumes the CAD export yet |
-| PX4 airframe is quad-only | [px4/22001_mujoco_quad](px4/22001_mujoco_quad) | `CA_ROTOR_COUNT 4`, no X8 allocation |
+| **Nothing builds a `RotorModel` from the sidecar** | `main.py:46` calls `build_physics(cfg)` with no `rotors` | **the X8 model cannot be run at all**: the default 4-entry `spin` raises against 8 rotor sites. The sidecar's measured `c_t` / `km` / `ω_max` are parsed, printed, and then dropped |
+| Arm joint limits | exported as `0/0`; provisional values in the private sidecar | the arm moves, but over invented ranges |
+| PX4 airframe is quad-only | [px4/22001_mujoco_quad](px4/22001_mujoco_quad) | `CA_ROTOR_COUNT 4`, no X8 allocation, `KM` at the 0.05 default |
 | No aerodynamics | ω is available but nothing reads it | §5's effects are expressible, none are expressed |
+| Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (§5) |
 
-One authoring hazard with **no test coverage**: rotor sites must be direct children
-of `base_link`. A site on a child body gets the wrong lever arm silently — see
-`MODELING_CONVENTIONS.md` §2.2.
+One authoring hazard has **no test coverage in `src/`**: rotor sites must be
+direct children of `base_link`, or the lever arm is silently wrong
+(`MODELING_CONVENTIONS.md` §2.2). The conversion script now places them there by
+construction and fails the check otherwise, so a generated model is safe — a
+hand-written one is still exposed.
 
 ---
 
@@ -71,39 +80,97 @@ Steps 1 and 2 — the ω-based `RotorModel` and the `MPC_THR_HOVER` / `THR_MDL_F
 recomputation — are **done and flight-verified on the quad** (§1;
 `IMPLEMENTATION_PLAN.md` phase 5 has the numbers). `MODELING_CONVENTIONS.md` §2.5
 records the parametrization and the re-derived `THR_MDL_FAC` argument;
-`px4/22001_mujoco_quad` carries it as a comment block. What remains:
+`px4/22001_mujoco_quad` carries it as a comment block.
 
-1. **Conversion script + sidecar config** (§6). The sidecar's rotor block is what
-   feeds `RotorModel` now, so its schema is settled: `c_t` / `km` / `spin` /
-   `ω_min` / `ω_max` per rotor, `ω_idle` shared.
-2. **`models/x8_arm.xml`**, generated by that script.
-3. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
+Step 3, the **conversion script and its sidecar schema**, is also done:
+[scripts/urdf_to_mjcf.py](scripts/urdf_to_mjcf.py) plus
+[models/x8_arm.conversion.yaml.template](models/x8_arm.conversion.yaml.template),
+covered by `tests/test_urdf_to_mjcf.py`. It converts the first CAD export
+end-to-end and the generated model passes every self-check (§4 has the numbers).
+What remains:
+
+1. **Build the `RotorModel` from the sidecar.** Now the blocker: the model exists
+   and carries measured motor numbers, but `main.py` passes no `rotors`, so
+   `RotorModel`'s quad default `spin` is rejected against 8 sites and the X8
+   cannot be loaded at all. Everything below is downstream of this. The sidecar is
+   a private file outside the repo, so the mechanism needs deciding — a `--rotors`
+   path on the CLI, or having the conversion script emit the parameters into the
+   MJCF as a `<custom><numeric>` block so the model is self-contained.
+2. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
    `step_frame` at [sim.py:127](src/mujoco_px4_sitl/sim.py#L127). `clear()` only
    zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
-   owns its own clearing.
-4. **Switch the PX4 airframe to X8** (§4).
-5. **Real motor numbers when chosen.** Replace the placeholders and pass a measured
-   `c_t`; recheck the logged hover command against `MPC_THR_HOVER`.
+   owns its own clearing. The generated model already has `arm_act0..4` with
+   `ctrlrange` set.
+3. **Switch the PX4 airframe to X8** (`MODELING_CONVENTIONS.md` §4 has the
+   layout), with the measured numbers rather than defaults — `CA_ROTOR*_CT` 40.96,
+   `KM` ±0.02154, `MPC_THR_HOVER` 0.2162. The conversion script prints all of
+   them, and the private sidecar records the full parameter list. `THR_MDL_FAC`
+   and `MPC_THR_MIN` are unchanged.
+4. **Real arm joint limits** (§4 for why the export has none). The ranges in the
+   private sidecar are invented.
 
 Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
 exit criterion; `RotorState.omega` is what makes them expressible.
 
 ---
 
-## 4. Blocked on input
+## 4. The platform: what is measured, and what is still input
 
-The CAD does not exist yet. `MODELING_CONVENTIONS.md` §7 lists what is needed —
-rotor hub positions and spin directions, arm joint limits and gearing, and the
-motor/propeller numbers (`c_t`, `ω_max`, `ω_idle`) that §2.5 wants.
+**The first CAD export has landed** — a whole-vehicle SolidWorks export of the
+coaxial X8 plus a 5-DoF arm, in the private repo (the URDF, its STLs, the filled
+sidecar and the generated MJCF all stay there; this repo holds only the script and
+the no-geometry template). Naming already matched §3.3, so no renaming was needed,
+and the STLs are in metres.
 
-Steps 1 and 2 above do **not** depend on any of it. Steps 3 onward do.
+The conversion runs clean, and every self-check passes: mass and CoM match the
+CAD figures, the 8 rotor sites are contiguous and on `base_link`, the coaxial
+pairs' spins oppose, and the origin sits on the rotor symmetry centre to sub-mm
+as §3.1 requires. **The numbers themselves live with the filled sidecar in the
+private repo** — hub coordinates and an inertia tensor describe the airframe as
+surely as the STLs do, which is the whole point of keeping the products there.
+Run the script with `--check-only` to see them.
 
-The motors were not chosen when the ω rework landed, so the mass-based
-auto-calibration of `c_t` stayed as the fallback (§2.4) and **warns on every
-load** — otherwise a heavy arm silently gets implausibly strong motors. `ω_max`
-and `ω_idle` are named placeholder constants in `vehicle.py`, not measurements.
-The hover command they imply is mass-independent, so the platform flies with them
-and the real numbers can land later without reworking anything.
+What the export did **not** carry:
+
+- **Arm joint limits: every one is `lower=upper=0`.** The real blocker, and worse
+  than it looks — MuJoCo reads 0/0 as *unlimited*, so the export's default is a
+  free joint, not a locked one. The private sidecar has provisional ranges to
+  keep work moving; they are invented and must be replaced. The zero-position and
+  sign convention are needed with them, since `arm_cmd.values[i]` is an absolute
+  angle.
+- **Spin directions and index→ESC mapping.** The sidecar assumes
+  `MODELING_CONVENTIONS.md` §4's PX4 order; it needs confirming against the
+  wiring, since a mismatch presents as yaw drift.
+
+**Motors are now chosen and measured**, which removes the largest remaining
+guess. `c_t`, `km` and `ω_max` are fitted from the manufacturer's thrust/RPM/torque
+table by least squares through the origin; the `c_t` fit is R² = 0.9997 with the
+worst point 0.9 % off full thrust. Three consequences worth carrying forward:
+
+- **Thrust/weight is 3.79, measured.** The auto-calibration's 4.0 was a
+  construction; it is now within 5 % of it by coincidence, not by design.
+- **`km` is 0.43× PX4's default.** Left at `CA_ROTOR*_KM 0.05` the allocator
+  expects 2.3× the yaw torque these props make. Flyable, so it does not announce
+  itself — it presents as sluggish yaw.
+- **`MPC_THR_HOVER` moves to 0.2162**, from the quad's 0.2025. It depends only on
+  `ω_idle / ω_max` and thrust-to-weight (§2.5), and `ω_max` is now a real number.
+
+What is still missing from the motor side: `ω_idle`, because the datasheet starts
+at 0.40 throttle, so the armed idle speed is not in it. The sidecar carries
+`ω_max / 11` to match the quad's operating point, which is a choice rather than a
+measurement, and `MPC_THR_HOVER` moves with it — 0.171 to 0.264 across the
+plausible range. Bench-measure the armed idle RPM.
+
+One clearance worth watching, and an argument for getting the limits right: the
+gap between the arm's swept envelope and the nearest propeller disc is **under
+8 cm**. Nothing in the model prevents a commanded angle from closing it — the
+joint limits are the only thing that keeps the arm out of the propellers.
+
+`vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
+**stay in place and still warn on every load** — they are what any model without
+measured motor numbers falls back on, including the quad. Now that the X8's
+numbers exist, the warning firing is a signal that the sidecar's values did not
+reach `RotorModel`, which §2's first row says they currently cannot.
 
 ---
 

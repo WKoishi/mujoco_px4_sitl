@@ -431,18 +431,34 @@ later. It costs nothing now.
 
 ## 6. Conversion pipeline
 
-The CAD will be revised repeatedly, so conversion has to be repeatable:
+**Implemented**: [scripts/urdf_to_mjcf.py](scripts/urdf_to_mjcf.py), with
+[models/x8_arm.conversion.yaml.template](models/x8_arm.conversion.yaml.template)
+as the sidecar schema and `tests/test_urdf_to_mjcf.py` covering it.
+
+**The CAD is private, and so are the conversion products.** The URDF, its STLs,
+the filled sidecar and the generated MJCF all live in the private repo; this
+repository holds the script and the no-geometry template only. Rotor hub
+coordinates and an inertia tensor describe the airframe as surely as a mesh does,
+so a filled sidecar is not a configuration file that can be published. Nothing in
+`models/` but `quad_x.xml` and the template.
+
+The CAD will be revised repeatedly, so conversion is repeatable:
 
 ```
-your.urdf  +  models/<name>.conversion.yaml  →  models/<name>.xml
+your.urdf  +  <name>.conversion.yaml  →  <name>.xml  +  decimated meshes
                   ↑ hand-maintained; everything URDF cannot express lives here
 ```
 
 The sidecar config holds: rotor / imu / ee site positions and orientations, the
 per-rotor `c_t` / `km` / `spin` / `ω_min` / `ω_max` arrays of §2.5, actuator gains
-and limits, collision primitive substitutions, `<option>` overrides, and mesh
-scaling. Re-exporting from CAD then only means re-running the script, and no hand
-edits are lost.
+and limits, collision primitive substitutions, `<option>` overrides, mesh
+scaling, and the world (floor, light, ENU markers — a URDF describes one robot
+and has no syntax for a scene). Re-exporting from CAD then only means re-running
+the script, and no hand edits are lost.
+
+Angles accept radians, `{deg: 45}`, or `"45deg"`; unknown keys are rejected
+rather than ignored, since a dropped `omega_max` silently leaves the placeholder
+in place and still flies.
 
 The script uses MuJoCo 3.13's `MjSpec` to inject programmatically, then self-checks
 and prints:
@@ -450,57 +466,126 @@ and prints:
 - `freejoint` exists and is `base_link`'s first joint
 - `rotor*` sites are on `base_link`, contiguously numbered, count matching `spin`
 - `imu_accel` / `imu_gyro` exist and are 3-axis
+- CAD meshes survived, and the vehicle has colliding geometry and a floor
+- arm joints are limited, with non-zero `damping` / `armature`
 - total mass / CoM / inertia matrix, to cross-check against SolidWorks
+
+`--check-only` runs all of it without writing. A failed check is a non-zero exit
+and no MJCF, so a bad conversion cannot be flown by accident.
 
 FLU orientation cannot be checked automatically — that rests on §3.1 and a manual
 review.
+
+### Three things the conversion has to fight MuJoCo about
+
+All three produce a model that loads, has the right mass, and flies — wrongly.
+
+**`discardvisual` defaults to true on the URDF path, and applies during
+parsing.** It deletes every geom that does not collide, which is exactly what the
+CAD meshes become once §3.2's rule is applied. Clearing the flag on the loaded
+spec is too late — the geometry is already gone — so the script injects
+`<mujoco><compiler discardvisual="false"/></mujoco>` into the URDF text before
+parsing. A link whose only geometry is `<visual>`, like every arm link here, is
+what gets lost; nothing in a headless run reveals it.
+
+**SolidWorks writes `lower=upper=0` when limits were never set in CAD, and MuJoCo
+compiles that as *unlimited*.** So the export's own default is not a locked joint
+but a free one, carrying a position actuator whose `ctrlrange` spans nothing.
+Zero-length limits are a hard error in the sidecar, and
+`test_that_zero_limits_really_do_compile_to_unlimited` pins the premise against
+MuJoCo itself.
+
+**MuJoCo's binary STL decoder refuses any file above 200 000 faces.** A raw
+SolidWorks export routinely exceeds it — `base_link` here is 303 527 faces — so
+decimation is a requirement, not a performance preference, and the error without
+it names the STL rather than the cause. The script decimates by vertex
+clustering: no extra dependency, and the error is bounded by one grid cell
+(2 mm on a 0.95 m body at the default budget). These meshes are visual only, so
+shape fidelity matters and watertightness does not.
 
 ---
 
 ## 7. Data still needed
 
-From CAD:
+The first CAD export has landed. What it answers and what it does not is in
+`AGENTS.md` §4 — geometry and mass properties came through; joint limits and motor
+numbers did not. Figures stay with the filled sidecar in the private repo.
+
+Still needed from CAD:
 
 ```
-rotor i hub position (FLU) = (x, y, z)  ×8   4 per deck, z as built
-rotor i spin               = CCW / CW   ×8   copy §4's order
-rotor radius / blade count / I_prop
-arm mount point on the base = arm_joint0's origin
-per-joint range            = (lo, hi) rad
+rotor i spin               = CCW / CW   ×8   confirm against §4's order and ESC wiring
+per-joint range            = (lo, hi) rad    THE blocker: exported as 0/0
+per-joint zero and sign convention           arm_cmd is an absolute angle
 per-joint gear ratio + stall torque → forcerange and armature
+rotor radius / blade count / I_prop
 end-effector reference point = optional, see §8
 ```
 
-From motor and propeller data, for §2.5. **Not chosen yet**, so
-`OMEGA_MAX_PLACEHOLDER = 1100`, `OMEGA_IDLE_PLACEHOLDER = 100` and
-`CT_PLACEHOLDER` in `vehicle.py` stand in, with `c_t` auto-calibrated:
+Hub positions, deck spacing and prop radius were **measured off the exported
+mesh** rather than read from CAD reference frames — the export carried none for
+the rotors. They are in the sidecar and the script cross-checks mass and CoM
+against the CAD figures, but the hub coordinates themselves are worth confirming
+in SolidWorks.
+
+**Motor and propeller data has landed** and §2.5's coefficients are fitted from it
+rather than assumed:
 
 ```
-c_t per rotor              [N/(rad/s)²]  placeholder: auto-calibrated from mass
-ω_max per rotor            [rad/s]  at flight battery voltage — placeholder 1100
-ω_idle                     [rad/s]  armed-but-idle — placeholder 100
-lower-deck c_t discount    = ? or "not modelled"   (§5 suggests 0.75–0.85)
+c_t per rotor              [N/(rad/s)²]  fitted, least squares through the origin
+km  per rotor              [m]           fitted from the torque column
+ω_max per rotor            [rad/s]  at flight battery voltage, from the sheet's
+                                    full-throttle RPM — not the nominal KV
+                                    product, which is 25 % high
+ω_idle                     [rad/s]  STILL A CHOICE: datasheets start near 0.40
+                                    throttle, so armed idle is not in them.
+                                    Bench-measure it rather than extrapolating
+                                    the curve to zero, which overestimates badly
+lower-deck c_t discount    = still not modelled   (§5 suggests 0.75–0.85)
 ```
 
-Replacing the placeholders with measured numbers changes `MPC_THR_HOVER`: it is
-set by `ω_idle / ω_max` and `thrust_to_weight`, and nothing else. `MujocoPhysics`
-logs the hover command at load so a mismatch is visible at boot.
+`c_t` and `ω_max` must come from the same sheet: thrust is `c_t · ω²`, so only the
+product is physical, and a measured `c_t` against the placeholder `ω_max` silently
+rescales every thrust in the model — it raises nothing and still flies. The
+conversion script rejects that combination outright.
 
-If the motors are not chosen yet, say so — §2.4's auto-calibration stays available
-as a fallback, and the platform-specific numbers can land later without reworking
-the model.
+A fitted `km` is rarely PX4's `CA_ROTOR*_KM` default of 0.05, and the airframe file
+must carry the fitted value; left at the default the allocator expects the wrong
+yaw authority, which presents as sluggish yaw rather than as an error.
+
+`ω_idle / ω_max` and `thrust_to_weight` set `MPC_THR_HOVER` and nothing else does,
+so a platform with its own motor numbers needs its own value — the quad's does not
+carry over. `MujocoPhysics` logs the hover command at load, and the conversion
+script prints it, so a mismatch is visible before flight.
+
+`vehicle.py`'s `OMEGA_MAX_PLACEHOLDER` / `OMEGA_IDLE_PLACEHOLDER` /
+`CT_PLACEHOLDER` remain the fallback for any model that supplies none of this, and
+still warn on every load (§2.4). A new platform whose motors are not yet chosen can
+therefore be modelled and flown before they are, with the real numbers landing
+later and reworking nothing.
 
 ---
 
 ## 8. Open questions
 
-**The lower-deck `c_t` discount.** §2.5 provides the per-rotor array, so this is now
-a number to pick, not a design question. Undecided.
+**The lower-deck `c_t` discount.** §2.5 provides the per-rotor array and the sidecar
+now carries per-rotor `c_t`, so the mechanism is in place and this is only a number
+to pick. Undecided, and currently **not applied**: the datasheet is for an isolated
+rotor, so all 8 carry the same value and the lower deck is modelled too strong.
 
 **Whether end-effector pose joins the side channel.** An `ee` site plus end-effector
 pose in `ground_truth` makes visual servoing or impedance control on the ROS 2 side
-much easier. Cheap now; later it costs a schema version bump
+much easier. The site itself now exists in the model (the sidecar places it), so
+only the schema side is open — and later it costs a version bump
 (`SCHEMA_VERSION`, [sidechannel.py:28](src/mujoco_px4_sitl/sidechannel.py#L28)).
+
+**How the sidecar's rotor parameters reach `RotorModel`.** The sidecar holds
+measured `c_t` / `km` / `ω_max`, the script validates and prints them, and nothing
+consumes them — `main.py` builds no `RotorModel`, so an 8-rotor model cannot load
+(`AGENTS.md` §2). Two candidate mechanisms, undecided: a `--rotors` path on the CLI,
+or having the conversion script emit them into the MJCF as `<custom><numeric>` so
+the model is self-contained. The second keeps `src/` free of a YAML dependency and
+cannot drift from the model it describes.
 
 **Whether the arm needs a control rate distinct from the physics rate.** Listed as
 open in Phase 7 of `IMPLEMENTATION_PLAN.md`.

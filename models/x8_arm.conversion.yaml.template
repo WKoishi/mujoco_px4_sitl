@@ -1,0 +1,214 @@
+# Sidecar template for scripts/urdf_to_mjcf.py -- coaxial X8 + serial arm.
+#
+# This TEMPLATE lives in the public repository and carries NO GEOMETRY. Every
+# number below is a placeholder written as `REPLACE_*` or a documented default.
+# Copy it next to the private CAD export, fill it in, and keep the filled copy
+# and the generated MJCF out of this repository:
+#
+#     cp models/x8_arm.conversion.yaml.template \
+#        <private-repo>/model/x8_arm.conversion.yaml
+#     python scripts/urdf_to_mjcf.py <private-repo>/model/x8_arm.conversion.yaml
+#
+# Rotor hub coordinates and the inertia cross-check are themselves a description
+# of the airframe, which is why the filled sidecar is private too, not only the
+# URDF and the STLs.
+#
+# What each section owns is documented in MODELING_CONVENTIONS.md section 6.
+# Angles accept radians (a bare number), `{deg: 45}`, or `"45deg"`.
+
+# --- inputs and outputs ---------------------------------------------------
+# Relative paths resolve against THIS file's directory.
+urdf: REPLACE_WITH_PATH_TO/kani_common_urdf_export_v3.urdf
+output: REPLACE_WITH_PATH_TO/x8_arm.xml
+
+# Decimated visual meshes are written to <output's directory>/<mesh_dir>/ and
+# referenced through <compiler meshdir=...>. MuJoCo does not understand
+# package:// URIs; the script rewrites them.
+mesh_dir: meshes
+
+# Set to 0.001 if the STL export is in millimetres. Confirm before trusting it:
+# a 1000x model still compiles and simply never flies.
+mesh_scale: 1.0
+
+# Face budget per mesh. MuJoCo's binary STL decoder hard-refuses anything above
+# 200000 faces, so a raw SolidWorks export cannot be loaded at all -- decimation
+# is a requirement, not a tuning knob. Meshes are visual only.
+max_faces: 60000
+# Per-mesh overrides, keyed by STL stem, for parts that need more or less.
+decimate:
+  base_link: 30000
+
+# Take the CAD meshes out of collision and use the primitives below instead.
+# Leave true: the convex hull of 8 propellers wraps the whole vehicle, so mesh
+# collision makes takeoff, landing and arm motion all hit the ground (3.2).
+collision_meshes_off: true
+
+# --- rotors ---------------------------------------------------------------
+# Index IS the PX4 rotor index: HIL_ACTUATOR_CONTROLS.controls[i] drives
+# rotor{i}, so this list's order must match CA_ROTOR* in the airframe file up to
+# the FLU/FRD y-sign. A mismatch presents as yaw drift or attitude
+# cross-coupling and is routinely misdiagnosed as an EKF fault.
+#
+# Order below follows PX4's own 12001_octo_cox converted to FLU
+# (MODELING_CONVENTIONS.md section 4). Copy PX4's order rather than inventing
+# one, so a misbehaving model can be compared against a known-good airframe.
+# The coaxial pairs are (0,5) (1,4) (2,7) (3,6) -- NOT (0,4) (1,5).
+#
+#   spin: CCW / CW as seen from ABOVE (+1 = CCW about body +z), or +1 / -1.
+#   km:   reaction torque = km * thrust, PX4's CA_ROTOR*_KM definition.
+#   pos:  FLU, in base_link's frame. The z coordinate is documentation only --
+#         thrust is along body +z, so r x [0,0,T] uses only x and y, and a
+#         coaxial deck's height produces no torque in our model or in PX4's.
+#   c_t:  thrust coefficient, N/(rad/s)^2, i.e. T = c_t * omega^2. Fit it from the
+#         motor/propeller datasheet by least squares through the origin over the
+#         thrust and RPM columns (omega = rpm * 2*pi/60). Omit to fall back on
+#         vehicle.py's mass-based auto-calibration, which warns on every load.
+#   omega_max: MANDATORY whenever c_t is given, and from the same datasheet.
+#         Only the product c_t * omega_max^2 is physical, so a measured c_t left
+#         against the placeholder omega_max silently rescales every thrust in the
+#         model -- it raises nothing and still "flies". The script rejects the
+#         combination rather than letting it through.
+#   km:   reaction torque / thrust, in metres. Fit from the torque column the same
+#         way. Real props are often far from PX4's 0.05 default, and the airframe
+#         file must then carry the fitted value or the allocator expects the wrong
+#         yaw authority -- flyable, so it does not announce itself.
+rotors:
+  - {label: front-right upper, deck: upper, spin: CCW, km: 0.05, pos: [REPLACE_X, REPLACE_-Y, REPLACE_Z_UPPER]}
+  - {label: front-left  upper, deck: upper, spin: CW,  km: 0.05, pos: [REPLACE_X, REPLACE_+Y, REPLACE_Z_UPPER]}
+  - {label: rear-left   upper, deck: upper, spin: CCW, km: 0.05, pos: [REPLACE_-X, REPLACE_+Y, REPLACE_Z_UPPER]}
+  - {label: rear-right  upper, deck: upper, spin: CW,  km: 0.05, pos: [REPLACE_-X, REPLACE_-Y, REPLACE_Z_UPPER]}
+  - {label: front-left  lower, deck: lower, spin: CCW, km: 0.05, pos: [REPLACE_X, REPLACE_+Y, REPLACE_Z_LOWER]}
+  - {label: front-right lower, deck: lower, spin: CW,  km: 0.05, pos: [REPLACE_X, REPLACE_-Y, REPLACE_Z_LOWER]}
+  - {label: rear-right  lower, deck: lower, spin: CCW, km: 0.05, pos: [REPLACE_-X, REPLACE_-Y, REPLACE_Z_LOWER]}
+  - {label: rear-left   lower, deck: lower, spin: CW,  km: 0.05, pos: [REPLACE_-X, REPLACE_+Y, REPLACE_Z_LOWER]}
+# With motor data, each entry gains c_t / omega_max / a fitted km, e.g.
+#   - {label: ..., spin: CCW, km: 0.0215, c_t: 1.02e-04, omega_max: 633.4, pos: [...]}
+# The lower four can carry a reduced c_t for coaxial interference (section 5
+# suggests 0.75-0.85 of the isolated value); a datasheet is for an isolated rotor.
+
+# Armed-but-idle rotor speed, rad/s. Shared: it is an ESC setting, not a
+# per-rotor one. Omit to keep vehicle.py's placeholder (100) and its warning.
+#
+# This value and thrust_to_weight are the ONLY things that set MPC_THR_HOVER --
+# not mass -- so changing it means rechecking the PX4 airframe file. Datasheets
+# usually start around 0.4 throttle and so do not contain it; measure the armed
+# idle RPM on the bench rather than extrapolating the thrust curve to zero, which
+# overestimates it badly.
+#
+# The script prints the resulting hover command and MPC_THR_HOVER on every run.
+# omega_idle: REPLACE_OMEGA_IDLE
+
+# --- arm joints -----------------------------------------------------------
+# Every arm_joint* in the URDF must appear here, or conversion fails.
+#
+# lower/upper are MANDATORY and load-bearing. SolidWorks writes
+# `lower=upper=0` when the limits were never set in CAD, and MuJoCo compiles
+# that as *UNLIMITED* -- so an unset limit is not a locked joint, it is a free
+# one whose position actuator has a meaningless ctrlrange.
+#
+# damping and armature are gearbox friction and reflected inertia. They are not
+# cosmetic: a stiff position actuator on an undamped, inertialess hinge
+# oscillates at the physics rate. armature ~ motor_rotor_inertia * ratio^2.
+#
+# side-channel semantics: arm_cmd.values[i] is arm_joint{i}'s ABSOLUTE angle in
+# radians (section 3.4), so these signs must match the real hardware.
+joints:
+  arm_joint0:
+    lower: REPLACE_LOWER   # e.g. {deg: -90}
+    upper: REPLACE_UPPER   # e.g. {deg: 90}
+    kp: 40.0               # position gain, N m / rad
+    kv: 2.0                # damping on the actuator's own error
+    damping: 0.5           # joint viscous damping, N m s / rad
+    armature: 0.01         # reflected inertia, kg m^2
+    # force_range: [-REPLACE_TORQUE, REPLACE_TORQUE]   # stall torque, N m
+    # gear_ratio: REPLACE_RATIO                        # recorded, sets armature
+    # home: 0.0            # stowed angle; must lie inside [lower, upper]
+  arm_joint1:
+    lower: REPLACE_LOWER
+    upper: REPLACE_UPPER
+    kp: 40.0
+    kv: 2.0
+    damping: 0.5
+    armature: 0.01
+  arm_joint2:
+    lower: REPLACE_LOWER
+    upper: REPLACE_UPPER
+    kp: 20.0
+    kv: 1.0
+    damping: 0.3
+    armature: 0.005
+  arm_joint3:
+    lower: REPLACE_LOWER
+    upper: REPLACE_UPPER
+    kp: 10.0
+    kv: 0.5
+    damping: 0.2
+    armature: 0.003
+  arm_joint4:
+    lower: REPLACE_LOWER
+    upper: REPLACE_UPPER
+    kp: 5.0
+    kv: 0.3
+    damping: 0.1
+    armature: 0.002
+
+# --- sites ----------------------------------------------------------------
+# `imu` is required: sim.py reads imu_accel / imu_gyro off it every frame. Its
+# quat is forced to identity (1 0 0 0) -- every conversion in frames.py assumes
+# the IMU site is aligned to the body frame.
+#
+# `ee` is optional (section 8). Adding it now is free; adding it later, once
+# end-effector pose is in the side channel's ground_truth, costs a
+# SCHEMA_VERSION bump. Put it on the last arm link, not on base_link.
+sites:
+  imu:
+    pos: [0.0, 0.0, 0.0]        # flight controller mount, FLU, in base_link
+  ee:
+    body: REPLACE_LAST_ARM_LINK  # e.g. arm_link4
+    pos: [REPLACE_X, REPLACE_Y, REPLACE_Z]
+
+# --- collision primitives -------------------------------------------------
+# Hand-written, replacing the CAD meshes (section 3.2). Massless by
+# construction: the URDF <inertial> blocks already carry all the mass, and a
+# primitive that also had density would double-count it.
+#
+#   box       size: [hx, hy, hz]        half-extents
+#   cylinder  size: [radius, half_len]  or use fromto with size: [radius]
+#   capsule   fromto: [x1,y1,z1, x2,y2,z2]  size: [radius]
+#   sphere    size: [radius]
+collisions:
+  - name: hull
+    type: box
+    body: base_link
+    pos: [REPLACE_X, REPLACE_Y, REPLACE_Z]
+    size: [REPLACE_HX, REPLACE_HY, REPLACE_HZ]
+  # One per landing-gear leg, so the vehicle rests stably and ground contact is
+  # at the feet rather than at a hull corner.
+  - name: leg0
+    type: capsule
+    body: base_link
+    fromto: [REPLACE_X, REPLACE_Y, REPLACE_Z_TOP, REPLACE_X, REPLACE_Y, REPLACE_Z_FOOT]
+    size: [REPLACE_RADIUS]
+  # Give the arm links their own primitives too, or the arm passes through the
+  # ground and through the airframe.
+
+# --- MuJoCo options -------------------------------------------------------
+# timestep is deliberately NOT accepted here: sim.py overwrites it from
+# --physics-rate on every load, so setting it would be a lie (section 3.5).
+option:
+  integrator: RK4
+  gravity: [0.0, 0.0, -9.80665]
+
+# --- cross-check against SolidWorks --------------------------------------
+# The script prints total mass, CoM and inertia. Give the CAD figures here and a
+# mismatch becomes a failed check instead of something to notice later. A part
+# with no material assigned is the usual cause -- and mass is what sets the
+# auto-calibrated c_t, so it propagates straight into thrust.
+expected_mass: REPLACE_TOTAL_MASS_KG
+mass_tolerance: 0.02
+expected_com: [REPLACE_X, REPLACE_Y, REPLACE_Z]
+
+notes: >
+  Fill in from the private CAD export. Frame convention is not checkable by the
+  script: confirm in SolidWorks that the exported reference frame is X forward,
+  Y left, Z up, with the origin at the rotor symmetry centre (section 3.1).
