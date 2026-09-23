@@ -506,7 +506,9 @@ what gets lost; nothing in a headless run reveals it.
 
 **SolidWorks writes `lower=upper=0` when limits were never set in CAD, and MuJoCo
 compiles that as *unlimited*.** So the export's own default is not a locked joint
-but a free one, carrying a position actuator whose `ctrlrange` spans nothing.
+but a free one, carrying a position actuator whose `ctrlrange` spans nothing. This
+is why the sidecar owns the ranges rather than deferring to the export: the limits
+are a property of the mechanism and the export simply has no field carrying them.
 Zero-length limits are a hard error in the sidecar, and
 `test_that_zero_limits_really_do_compile_to_unlimited` pins the premise against
 MuJoCo itself.
@@ -531,7 +533,6 @@ Still needed from CAD:
 
 ```
 rotor i spin               = CCW / CW   ×8   confirm against §4's order and ESC wiring
-per-joint range            = (lo, hi) rad    THE blocker: exported as 0/0
 per-joint zero and sign convention           arm_cmd is an absolute angle
 per-joint gear ratio + stall torque → forcerange and armature
 rotor radius / blade count / I_prop

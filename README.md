@@ -135,6 +135,43 @@ must not cause any braking. If `brake` instead tracks `frames` divided by
 PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
 `ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
 
+## Workspace manipulability
+
+`scripts/manipulability.py` asks whether an arm can hold an arbitrary pose at an
+arbitrary point. It needs no PX4, no flight and no physics step -- only forward
+kinematics -- so it runs against any MJCF carrying an `ee` site.
+
+```sh
+python scripts/manipulability.py <model>.xml --task pose --slice y --view
+python scripts/manipulability.py <model>.xml --task pose --freeze arm_joint3
+```
+
+The vehicle contributes **yaw only**: translations are ignored because a
+free-flying base puts the workspace wherever it likes, and roll and pitch are not
+steady states in hover. `--freeze` locks any joint, `base_yaw` included.
+
+```
+task            pose
+movable         base_yaw, arm_joint0, ... , arm_joint4  (6 DoF)
+reachable       N voxels
+rank-deficient  N voxels (P% of reachable)
+w (full rank)   median ...  max ...
+```
+
+The counts are left out on purpose: a voxel total is an arm's reach by another
+name, and this model's geometry is private (`AGENTS.md` §4). Run the script to see
+your own.
+
+The headline is `rank-deficient`: voxels no configuration reaches at full task
+rank, where the task cannot be executed however the arm approaches. Two traps the
+script's docstring covers and the output repeats:
+
+- **`w` does not compare across configurations.** It is an *m×m* determinant, so
+  removing a joint drops a factor and usually makes the number *larger*. Compare
+  rank deficiency, which is dimensionless.
+- **A solid cloud shows only its shell.** Use `--slice` for a true cross-section;
+  without it the interior is invisible behind the outermost voxels.
+
 ## Regression flight
 
 Two scripts fly the Phase 5 profile and measure it. They are separate on purpose:
@@ -218,7 +255,9 @@ would otherwise fail silently, and `test_loop.py` runs the lockstep loop against
 fake PX4 — including the deadlock, runaway, back-pressure and shutdown cases that
 a live smoke test cannot distinguish.
 
-`test_rotorconfig.py` covers the sidecar parser and `test_urdf_to_mjcf.py` the
-conversion and the generated PX4 airframe. Both build their own fixtures, so no
-CAD geometry is needed — the X8's real numbers are private, and asserting them
-here would publish them.
+`test_rotorconfig.py` covers the sidecar parser, `test_urdf_to_mjcf.py` the
+conversion and the generated PX4 airframe, and `test_manipulability.py` the
+Jacobian metric — including a fixture whose rank deficiency is an analytic fact
+rather than a measurement. All three build their own fixtures, so no CAD geometry
+is needed — the X8's real numbers are private, and asserting them here would
+publish them.

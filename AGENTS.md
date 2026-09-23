@@ -93,11 +93,17 @@ that does not supply its own — which is now only the quad.
 | Gap | Where | Consequence |
 |---|---|---|
 | `arm_cmd` never reaches the physics | `sidechannel.py` parses it into `ArmCommand`; nothing in `src/` writes `data.ctrl` | arm commands are received and silently dropped |
-| **A dropped `arm_cmd` writer has no failsafe** | `ArmCommand` has no timestamp and no expiry | when the writer lands: a controller that crashes leaves the arm holding its last command forever. With under 8 cm to the nearest disc (§4 below), design the staleness behaviour with the writer, not after |
-| Arm joint limits | exported as `0/0`; provisional values in the private sidecar | the arm moves, but over invented ranges |
+| **A dropped `arm_cmd` writer has no failsafe** | `ArmCommand` has no timestamp and no expiry | when the writer lands: a controller that crashes leaves the arm holding its last command forever. Since some reachable poses intersect a propeller disc (§4), design the staleness behaviour with the writer, not after |
+| **Nothing enforces propeller clearance** | no guard anywhere; the joint limits are not one | the limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a propeller disc — measured, not inferred. Deferred by decision, but it is a constraint on the `arm_cmd` writer above, not a separate task |
+| Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
 | No arm state on the side channel | `SimState` has 9 fields, none of them joint state | an out-of-process controller is flying blind on the arm. Extending it touches `SimState`, the `Physics` protocol and `StubPhysics` |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
 | Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (`MODELING_CONVENTIONS.md` §5 suggests 0.75–0.85). Deliberately deferred so the first X8 flight introduces one unverified quantity, not two: it moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75, so the sidecar's `c_t` and the airframe must change together |
+
+`scripts/manipulability.py` answers the kinematic half of the arm question —
+whether a pose is reachable at all, per voxel, with any subset of joints frozen.
+It needs no PX4 and no physics step, so it is available before step 1 below and
+says nothing about it: rank is not thrust.
 
 One authoring hazard has **no test coverage in `src/`**: rotor sites must be
 direct children of `base_link`, or the lever arm is silently wrong
@@ -144,9 +150,7 @@ model whose rotor count still matches flies with the wrong thrust. What remains:
    zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
    owns its own clearing. The generated model already has `arm_act0..4` with
    `ctrlrange` set. Decide the staleness behaviour here, not later (§2, row 2).
-3. **Real arm joint limits** (§4 for why the export has none). The ranges in the
-   private sidecar are invented.
-4. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
+3. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
    separable from step 1's result.
 
 Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
@@ -199,12 +203,13 @@ Run the script with `--check-only` to see them.
 
 What the export did **not** carry:
 
-- **Arm joint limits: every one is `lower=upper=0`.** The real blocker, and worse
-  than it looks — MuJoCo reads 0/0 as *unlimited*, so the export's default is a
-  free joint, not a locked one. The private sidecar has provisional ranges to
-  keep work moving; they are invented and must be replaced. The zero-position and
-  sign convention are needed with them, since `arm_cmd.values[i]` is an absolute
-  angle.
+- **Arm joint limits: every one is `lower=upper=0`.** Worse than it looks in the
+  export — MuJoCo reads 0/0 as *unlimited*, so the export's default is a free
+  joint, not a locked one. **The sidecar's ranges are not a placeholder for this:
+  they are the mechanical limits, read off each joint's structure rather than out
+  of the export.** What the export withheld was the *encoding*, and the sidecar
+  supplies it. Still unverified is the zero-position and sign convention, since
+  `arm_cmd.values[i]` is an absolute angle.
 - **Spin directions and index→ESC mapping.** The sidecar assumes
   `MODELING_CONVENTIONS.md` §4's PX4 order; it needs confirming against the
   wiring, since a mismatch presents as yaw drift.
@@ -228,10 +233,16 @@ at 0.40 throttle, so the armed idle speed is not in it. The sidecar carries
 measurement, and `MPC_THR_HOVER` moves with it — 0.171 to 0.264 across the
 plausible range. Bench-measure the armed idle RPM.
 
-One clearance worth watching, and an argument for getting the limits right: the
-gap between the arm's swept envelope and the nearest propeller disc is **under
-8 cm**. Nothing in the model prevents a commanded angle from closing it — the
-joint limits are the only thing that keeps the arm out of the propellers.
+**The arm's envelope and the propeller discs intersect, inside the mechanical
+limits.** Not a near miss: a small fraction of the poses the mechanism genuinely
+permits put an arm collision capsule *inside* a disc, measured on the model with
+the real ranges (the figures are in the private sidecar). So the limits cannot be
+the guard — they are the mechanism's, and the mechanism can do this. Nothing in
+the model stops a commanded angle from doing it either.
+
+Deferred by decision, and the place it lands is the `arm_cmd` writer (§2, §3
+step 2), not the model: a reachable-set guard there, or a collision check on the
+commanded pose before it reaches `data.ctrl`.
 
 `vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
 **stay in place and still warn on every load** — they are what any model without
