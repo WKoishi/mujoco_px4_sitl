@@ -51,6 +51,12 @@ class Config:
     # --- Model -------------------------------------------------------------
     model_path: Path = field(default_factory=lambda: DEFAULT_MODEL)
     stub_physics: bool = False
+    # Conversion sidecar supplying the rotor parameters. No default: a model
+    # whose rotor count differs from RotorModel's quad default is rejected at
+    # load, so forgetting this is loud rather than a silent fall back to
+    # placeholder motors. The filled sidecar for the X8 lives in the private
+    # repo alongside its MJCF (AGENTS.md section 4).
+    rotors_path: Path | None = None
 
     # --- Phase 3 open-loop bring-up ----------------------------------------
     # Pin the vehicle so ground truth moves only in ways we dictate.
@@ -121,6 +127,8 @@ class Config:
             )
         if not self.stub_physics and not Path(self.model_path).is_file():
             raise FileNotFoundError(f"model not found: {self.model_path}")
+        if self.rotors_path is not None and not Path(self.rotors_path).is_file():
+            raise FileNotFoundError(f"rotors sidecar not found: {self.rotors_path}")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -135,6 +143,11 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def _env_path(name: str) -> Path | None:
+    raw = os.environ.get(name)
+    return None if raw is None or raw == "" else Path(raw)
 
 
 def _euler_triple(raw: str) -> tuple[float, float, float]:
@@ -163,6 +176,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-m", "--model", dest="model_path", type=Path, default=DEFAULT_MODEL,
         help="MuJoCo MJCF model (default: %(default)s)",
+    )
+    p.add_argument(
+        "--rotors", dest="rotors_path", type=Path, default=_env_path("MUJOCO_SITL_ROTORS"),
+        help=(
+            "conversion sidecar supplying rotor parameters. Required for any "
+            "model whose rotor count is not 4 (default: $MUJOCO_SITL_ROTORS, "
+            "else vehicle.py's quad placeholders)"
+        ),
     )
     p.add_argument("--imu-rate", dest="imu_rate_hz", type=float, default=250.0,
                    help="must match IMU_INTEG_RATE (default: %(default)s)")

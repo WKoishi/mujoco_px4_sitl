@@ -647,3 +647,93 @@ def test_the_generated_file_reloads_from_disk(rig, tmp_path: Path):
     model = mujoco.MjModel.from_xml_path(str(sidecar.output))
     assert model.nmesh == 2
     assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "rotor3") >= 0
+
+
+# --- the PX4 airframe ------------------------------------------------------
+#
+# Generated rather than hand-written because every PY is the negation of the
+# model's py and KM's sign follows the spin, so transcription is where a
+# mismatch gets in -- and a mismatch presents as yaw drift, which is routinely
+# misdiagnosed as an EKF fault.
+
+
+def test_airframe_py_is_the_negation_of_the_model_py(rig, tmp_path):
+    """FLU -> FRD. Getting this wrong mirrors the vehicle left/right."""
+    path, data = rig
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    text = out.read_text()
+    # Sidecar rotor 0 is at y = -0.2, so the airframe must say +0.2.
+    assert "CA_ROTOR0_PY 0.20000" in text
+    assert "CA_ROTOR1_PY -0.20000" in text
+    assert "CA_ROTOR0_PX 0.20000" in text
+
+
+def test_airframe_km_sign_follows_spin(rig, tmp_path):
+    path, _ = rig
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    text = out.read_text()
+    assert "CA_ROTOR0_KM +0.05000" in text  # CCW
+    assert "CA_ROTOR2_KM -0.05000" in text  # CW
+
+
+def test_airframe_rotor_count_and_pwm_match_the_sidecar(rig, tmp_path):
+    path, _ = rig
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    text = out.read_text()
+    assert "CA_ROTOR_COUNT 4" in text
+    assert "PWM_MAIN_FUNC4 104" in text
+    assert "PWM_MAIN_FUNC5" not in text
+
+
+def test_airframe_ct_is_thrust_at_full_command_not_c_t(rig, tmp_path):
+    """CA_ROTOR*_CT is defined as Thrust = CT * u^2, so it is c_t * omega_max^2.
+
+    Writing c_t here instead would be off by ~six orders of magnitude, and PX4
+    would still boot.
+    """
+    path, data = rig
+    for r in data["rotors"]:
+        r["c_t"] = 1.0e-04
+        r["omega_max"] = 600.0
+    _write(path, data)
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    assert "CA_ROTOR0_CT 36.0000" in out.read_text()
+
+
+def test_airframe_hover_matches_the_vehicle_the_simulator_builds(rig, tmp_path):
+    """MPC_THR_HOVER must come from the same RotorModel sim.py will construct.
+
+    Computing it any other way is how the airframe and the plant disagree while
+    both stay flyable -- it presents as altitude oscillation.
+    """
+    from mujoco_px4_sitl.rotorconfig import load_rotors
+    from mujoco_px4_sitl.vehicle import Vehicle
+
+    path, data = rig
+    for r in data["rotors"]:
+        r["c_t"] = 1.0e-04
+        r["omega_max"] = 600.0
+    data["omega_idle"] = 55.0
+    _write(path, data)
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+
+    expected = Vehicle(model, load_rotors(path)).hover_command() ** 2
+    assert f"MPC_THR_HOVER {expected:.4f}" in out.read_text()
+
+
+def test_airframe_leaves_no_unfilled_placeholder(rig, tmp_path):
+    path, _ = rig
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    assert "{{" not in out.read_text()

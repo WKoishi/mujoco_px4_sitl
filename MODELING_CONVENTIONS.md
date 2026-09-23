@@ -436,18 +436,34 @@ later. It costs nothing now.
 as the sidecar schema and `tests/test_urdf_to_mjcf.py` covering it.
 
 **The CAD is private, and so are the conversion products.** The URDF, its STLs,
-the filled sidecar and the generated MJCF all live in the private repo; this
-repository holds the script and the no-geometry template only. Rotor hub
-coordinates and an inertia tensor describe the airframe as surely as a mesh does,
-so a filled sidecar is not a configuration file that can be published. Nothing in
-`models/` but `quad_x.xml` and the template.
+the filled sidecar, the generated MJCF and the generated PX4 airframe all live in
+the private repo; this repository holds the script and two no-geometry templates
+(the sidecar's and the airframe's). Rotor hub coordinates and an inertia tensor
+describe the airframe as surely as a mesh does, so a filled sidecar is not a
+configuration file that can be published, and neither is an airframe file whose
+`CA_ROTOR*_PX` / `_PY` block is those same coordinates. Nothing in `models/` but
+`quad_x.xml` and the template.
 
 The CAD will be revised repeatedly, so conversion is repeatable:
 
 ```
 your.urdf  +  <name>.conversion.yaml  →  <name>.xml  +  decimated meshes
-                  ↑ hand-maintained; everything URDF cannot express lives here
+                  ↑ hand-maintained;      + 22NNN_<name>  (--emit-airframe)
+                    everything URDF
+                    cannot express
 ```
+
+Both products come from the one sidecar, which is what keeps `CA_ROTOR*` and the
+rotor sites from disagreeing. Regenerate them together.
+
+**The sidecar is also a runtime input**, not only a build input: the simulator
+reads its `rotors` block and `omega_idle` at every startup through `--rotors` /
+`MUJOCO_SITL_ROTORS` ([src/mujoco_px4_sitl/rotorconfig.py](src/mujoco_px4_sitl/rotorconfig.py)),
+which is how a non-quad gets its `RotorModel`. Script and simulator share one
+parser — `RotorSpec` lives in that module and the script imports it — because a
+second parser for the same file drifts silently: a model whose rotor count still
+matches flies with the wrong thrust. Keep the filled sidecar beside the MJCF it
+generated.
 
 The sidecar config holds: rotor / imu / ee site positions and orientations, the
 per-rotor `c_t` / `km` / `spin` / `ω_min` / `ω_max` arrays of §2.5, actuator gains
@@ -546,17 +562,23 @@ lower-deck c_t discount    = still not modelled   (§5 suggests 0.75–0.85)
 
 `c_t` and `ω_max` must come from the same sheet: thrust is `c_t · ω²`, so only the
 product is physical, and a measured `c_t` against the placeholder `ω_max` silently
-rescales every thrust in the model — it raises nothing and still flies. The
-conversion script rejects that combination outright.
+rescales every thrust in the model — it raises nothing and still flies. The shared
+parser rejects that combination outright, so it is refused at conversion *and* at
+startup rather than only once.
 
 A fitted `km` is rarely PX4's `CA_ROTOR*_KM` default of 0.05, and the airframe file
 must carry the fitted value; left at the default the allocator expects the wrong
 yaw authority, which presents as sluggish yaw rather than as an error.
+`--emit-airframe` writes the fitted value, with `KM`'s sign taken from each
+rotor's spin, so this is a reason to generate the airframe rather than hand-write
+one.
 
 `ω_idle / ω_max` and `thrust_to_weight` set `MPC_THR_HOVER` and nothing else does,
 so a platform with its own motor numbers needs its own value — the quad's does not
 carry over. `MujocoPhysics` logs the hover command at load, and the conversion
-script prints it, so a mismatch is visible before flight.
+script prints it, so a mismatch is visible before flight. `--emit-airframe`
+computes it through the same `Vehicle` the simulator builds, which is the only way
+to be sure the airframe's value and the plant's hover point are the same number.
 
 `vehicle.py`'s `OMEGA_MAX_PLACEHOLDER` / `OMEGA_IDLE_PLACEHOLDER` /
 `CT_PLACEHOLDER` remain the fallback for any model that supplies none of this, and
@@ -579,13 +601,17 @@ much easier. The site itself now exists in the model (the sidecar places it), so
 only the schema side is open — and later it costs a version bump
 (`SCHEMA_VERSION`, [sidechannel.py:28](src/mujoco_px4_sitl/sidechannel.py#L28)).
 
-**How the sidecar's rotor parameters reach `RotorModel`.** The sidecar holds
-measured `c_t` / `km` / `ω_max`, the script validates and prints them, and nothing
-consumes them — `main.py` builds no `RotorModel`, so an 8-rotor model cannot load
-(`AGENTS.md` §2). Two candidate mechanisms, undecided: a `--rotors` path on the CLI,
-or having the conversion script emit them into the MJCF as `<custom><numeric>` so
-the model is self-contained. The second keeps `src/` free of a YAML dependency and
-cannot drift from the model it describes.
+**~~How the sidecar's rotor parameters reach `RotorModel`.~~ Decided: `--rotors`.**
+The simulator reads the sidecar's `rotors` block at startup, via `--rotors` or
+`MUJOCO_SITL_ROTORS` (§6). The alternative was emitting them into the MJCF as
+`<custom><numeric>`, which would keep `src/` free of a YAML dependency and could
+not drift from the model it describes — a real advantage, and still available
+later. `--rotors` won because the sidecar is already the one file holding measured
+motor numbers, so reading it directly means **one parser** rather than a writer and
+a reader that can disagree. The YAML import is lazy, so it stays off the path of a
+run that does not use the flag. Left open by this choice: nothing binds a sidecar
+to the MJCF it generated, so a mismatched pair with the same rotor count loads and
+flies with the wrong thrust (`AGENTS.md` §2).
 
 **Whether the arm needs a control rate distinct from the physics rate.** Listed as
 open in Phase 7 of `IMPLEMENTATION_PLAN.md`.

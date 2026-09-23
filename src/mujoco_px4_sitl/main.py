@@ -14,9 +14,11 @@ from types import FrameType
 
 from .config import Config, config_from_args
 from .loop import LockstepLoop
+from .rotorconfig import load_rotors
 from .sidechannel import SideChannel
 from .sim import MujocoPhysics, build_physics
 from .transport import HilServer
+from .vehicle import RotorModel
 
 _log = logging.getLogger("mujoco_px4_sitl")
 _PROG = "mujoco_px4_sitl"
@@ -30,12 +32,33 @@ def _configure_logging(level: str) -> None:
     )
 
 
-def run(cfg: Config) -> int:
+def run(cfg: Config, rotors: RotorModel | None = None) -> int:
+    """Run the simulator. ``rotors`` overrides ``cfg.rotors_path``.
+
+    Two ways in, because there are two callers. The CLI gives a sidecar path and
+    this function parses it. An in-process driver -- a research script that wants
+    ``MjData`` rather than the side channel -- passes a built ``RotorModel`` and
+    skips the file entirely. Passing both is a contradiction rather than a
+    precedence question, so it raises.
+    """
     _log.info(
         "mujoco_px4_sitl instance %d: HIL tcp://%s:%d%s",
         cfg.instance, cfg.hil_bind_host, cfg.hil_port,
         " (stub physics)" if cfg.stub_physics else f", model {cfg.model_path}",
     )
+    if rotors is not None and cfg.rotors_path is not None:
+        raise ValueError(
+            "both a RotorModel and --rotors were given; pass one. The file "
+            "would be parsed and then discarded"
+        )
+    if rotors is None and cfg.rotors_path is not None:
+        rotors = load_rotors(cfg.rotors_path)
+        _log.info("rotors: %d from %s", len(rotors.spin), cfg.rotors_path)
+    if rotors is not None and cfg.stub_physics:
+        # Accepted and ignored: build_physics already has this semantics, and a
+        # hard error would make --stub-physics awkward to use for transport
+        # debugging on a vehicle that normally needs a sidecar.
+        _log.warning("rotor parameters are ignored with --stub-physics")
 
     # Bind before loading the model: PX4 retries connect() every 500 us so
     # either start order works (plan 3.1), but binding first also means a port
@@ -43,7 +66,7 @@ def run(cfg: Config) -> int:
     server = HilServer(cfg.hil_bind_host, cfg.hil_port)
     sidechannel = None
     try:
-        physics = build_physics(cfg)
+        physics = build_physics(cfg, rotors)
         if cfg.sidechannel_enabled:
             sidechannel = SideChannel(cfg.sidechannel_bind_host, cfg.sidechannel_port)
     except BaseException:

@@ -41,6 +41,11 @@ unregistered airframe fails at boot with `no autostart file found`. It is
 idempotent, and `--uninstall` reverses both steps. The PX4 checkout ends up
 carrying exactly one patched file.
 
+`--airframe PATH` installs a different airframe, including one from outside this
+repo; airframes may be installed alongside each other. The `.post` always comes
+from this repo and is copied under the target airframe's own name, because `rcS`
+looks for `"$autostart_file".post`. See "Non-quad models" under Run.
+
 ## Run
 
 ```sh
@@ -72,6 +77,38 @@ python -m mujoco_px4_sitl --instance 0 --model models/quad_x.xml
 
 `--instance N` derives the HIL port as `4560+N` and the side-channel port as
 `14650+N`, matching PX4's own convention.
+
+### Non-quad models
+
+`models/quad_x.xml` needs nothing further: `vehicle.py`'s placeholder motors
+match its 4 rotors. Any other rotor count needs its parameters, via a conversion
+sidecar:
+
+```sh
+python -m mujoco_px4_sitl -m /path/x8.xml --rotors /path/x8.conversion.yaml
+MUJOCO_SITL_ROTORS=/path/x8.conversion.yaml ./scripts/run_sitl.sh -m /path/x8.xml
+```
+
+The environment variable is what lets `run_sitl.sh` fly a non-quad without a
+flag of its own. There is deliberately **no default**: a model whose rotor count
+does not match is rejected at load rather than flown with placeholder motors.
+
+Only the rotor block and `omega_idle` are read, so the CAD export the sidecar
+names need not be present — flying does not depend on the STLs.
+
+A non-quad also needs its own PX4 airframe, since `CA_ROTOR*` must match the
+model. `urdf_to_mjcf.py --emit-airframe PATH` generates one from the same
+sidecar, and `install_px4_files.sh --airframe PATH` installs it from anywhere:
+
+```sh
+python scripts/urdf_to_mjcf.py x8.conversion.yaml --emit-airframe /path/22002_mujoco_x8
+./scripts/install_px4_files.sh --airframe /path/22002_mujoco_x8
+make -C ../PX4-Autopilot px4_sitl_default
+PX4_SYS_AUTOSTART=22002 ./scripts/run_sitl.sh -m /path/x8.xml
+```
+
+The `.post` comes from this repo either way and is installed under the
+airframe's own name, because `rcS` looks for `"$autostart_file".post`.
 
 ## Health check
 
@@ -180,3 +217,8 @@ the model-authoring preconditions, `test_config.py` the flag combinations that
 would otherwise fail silently, and `test_loop.py` runs the lockstep loop against a
 fake PX4 — including the deadlock, runaway, back-pressure and shutdown cases that
 a live smoke test cannot distinguish.
+
+`test_rotorconfig.py` covers the sidecar parser and `test_urdf_to_mjcf.py` the
+conversion and the generated PX4 airframe. Both build their own fixtures, so no
+CAD geometry is needed — the X8's real numbers are private, and asserting them
+here would publish them.

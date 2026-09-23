@@ -49,6 +49,22 @@ import numpy as np
 import yaml
 from numpy.typing import NDArray
 
+# RotorSpec and the rotors-block parser come from the package rather than living
+# here. The simulator reads the same block at startup through --rotors, and one
+# file with two parsers is how the two drift -- silently, because a model whose
+# rotor count still matches flies with the wrong thrust.
+#
+# The sys.path line keeps this script runnable from a fresh checkout with nothing
+# installed, which is how the tests load it and how it is documented. It is a
+# no-op once the package is installed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from mujoco_px4_sitl.rotorconfig import (  # noqa: E402
+    RotorSpec,
+    parse_rotor_entry,
+    rotors_from_specs,
+)
+from mujoco_px4_sitl.vehicle import Vehicle  # noqa: E402
+
 _log = logging.getLogger("urdf_to_mjcf")
 
 # MuJoCo's binary STL decoder refuses a file above this face count, so a raw
@@ -69,54 +85,6 @@ ARM_ACTUATOR_PREFIX = "arm_act"
 #
 # Dataclasses rather than raw dict access so a typo in the YAML is a named
 # error at load time instead of a silently missing rotor.
-
-
-@dataclass
-class RotorSpec:
-    """One rotor: where thrust is applied, and its coefficients.
-
-    ``pos`` is FLU, in ``base_link``'s frame, and the *index is PX4's* --
-    ``HIL_ACTUATOR_CONTROLS.controls[i]`` drives ``rotor{i}``, so this list's
-    order must match ``CA_ROTOR*`` in the airframe file up to the FLU/FRD
-    y-sign. Getting it wrong presents as yaw drift or attitude cross-coupling
-    and is routinely misdiagnosed as an EKF fault.
-
-    ``pz`` (the site's z) is documentation only: thrust is along body +z, so
-    ``r x [0,0,T]`` uses only x and y. A coaxial deck's height contributes no
-    torque, in our model and in PX4's allocator alike (section 4).
-    """
-
-    pos: tuple[float, float, float]
-    spin: int
-    c_t: float | None = None
-    km: float = 0.05
-    omega_max: float | None = None
-    omega_min: float | None = None
-    zaxis: tuple[float, float, float] = (0.0, 0.0, 1.0)
-    deck: str = ""
-    label: str = ""
-
-    def __post_init__(self) -> None:
-        if self.spin not in (1, -1):
-            raise ValueError(
-                f"rotor {self.label or '?'}: spin must be +1 (CCW about body "
-                f"+z) or -1 (CW), got {self.spin!r}"
-            )
-        if len(self.pos) != 3:
-            raise ValueError(f"rotor {self.label or '?'}: pos needs 3 numbers")
-        if self.c_t is not None and self.omega_max is None:
-            # Thrust is c_t * omega^2, so only the product means anything. A
-            # measured c_t left against vehicle.py's placeholder omega_max of
-            # 1100 rad/s raises nothing and produces a plausible-looking model
-            # with wildly wrong thrust -- the MN5008 fit came out 8.4x the
-            # placeholder c_t precisely because its omega_max is 0.58x, and
-            # mixing the two gives thrust/weight 11.4 instead of 3.8.
-            raise ValueError(
-                f"rotor {self.label or '?'}: c_t given without omega_max. "
-                f"Thrust is c_t * omega^2, so a measured c_t against the "
-                f"placeholder omega_max silently rescales every thrust in the "
-                f"model. Give both, from the same datasheet"
-            )
 
 
 @dataclass
@@ -293,31 +261,8 @@ def load_sidecar(path: Path) -> Sidecar:
 
     rotors: list[RotorSpec] = []
     for index, entry in enumerate(_require(raw, "rotors", str(path))):
-        where = f"{path}: rotors[{index}]"
-        _unknown_keys(
-            entry,
-            {"pos", "spin", "c_t", "km", "omega_max", "omega_min", "zaxis",
-             "deck", "label"},
-            where,
-        )
-        spin_raw = _require(entry, "spin", where)
-        if isinstance(spin_raw, str):
-            text = spin_raw.strip().upper()
-            if text not in ("CW", "CCW"):
-                raise ValueError(f"{where}: spin string must be CW or CCW")
-            spin = 1 if text == "CCW" else -1
-        else:
-            spin = int(spin_raw)
-        rotors.append(RotorSpec(
-            pos=tuple(float(v) for v in _require(entry, "pos", where)),
-            spin=spin,
-            c_t=entry.get("c_t"),
-            km=float(entry.get("km", 0.05)),
-            omega_max=entry.get("omega_max"),
-            omega_min=entry.get("omega_min"),
-            zaxis=tuple(float(v) for v in entry.get("zaxis", (0.0, 0.0, 1.0))),
-            deck=str(entry.get("deck", "")),
-            label=str(entry.get("label", f"{ROTOR_PREFIX}{index}")),
+        rotors.append(parse_rotor_entry(
+            entry, index, f"{path}: rotors[{index}]", ROTOR_PREFIX
         ))
     if not rotors:
         raise ValueError(f"{path}: 'rotors' is empty")
@@ -1418,6 +1363,68 @@ def _describe_coaxial(sidecar: Sidecar) -> list[str]:
     return notes
 
 
+AIRFRAME_TEMPLATE = Path(__file__).resolve().parents[1] / "px4" / "mujoco_x8.airframe.template"
+
+
+def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
+    """Fill the PX4 airframe template from the sidecar and write it.
+
+    Generated rather than hand-written because the derivable part is 8 rotors x 4
+    parameters, every PY is the negation of the model's py (FLU -> FRD), and KM's
+    sign follows the spin. Hand-transcribing that is how a mismatch gets in, and
+    a mismatch presents as yaw drift or attitude cross-coupling, which is
+    routinely misdiagnosed as an EKF fault.
+
+    The template owns everything that is *not* derivable -- why SIM_GZ_EN must
+    stay unset, the THR_MDL_FAC derivation, the MPC_THR_MIN trap. Those are
+    debugging knowledge, not platform data, so they stay in the public repo.
+    """
+    if not AIRFRAME_TEMPLATE.is_file():
+        raise FileNotFoundError(f"airframe template not found: {AIRFRAME_TEMPLATE}")
+
+    rotors: list[str] = [f"param set-default CA_ROTOR_COUNT {len(sidecar.rotors)}"]
+    for i, r in enumerate(sidecar.rotors):
+        px, py, _ = r.pos
+        rotors.append("")
+        if r.label:
+            rotors.append(f"# {i}: {r.label} ({'CCW' if r.spin > 0 else 'CW'})")
+        rotors.append(f"param set-default CA_ROTOR{i}_PX {px:.5f}")
+        # FLU -> FRD: y flips. Written even when zero so the negation is visible.
+        rotors.append(f"param set-default CA_ROTOR{i}_PY {-py:.5f}")
+        rotors.append(f"param set-default CA_ROTOR{i}_KM {r.spin * r.km:+.5f}")
+        if r.c_t is not None and r.omega_max is not None:
+            # CA_ROTOR*_CT is Thrust = CT * u^2, so it is the thrust at full
+            # command: c_t * omega_max^2, not c_t itself.
+            rotors.append(
+                f"param set-default CA_ROTOR{i}_CT {r.c_t * r.omega_max ** 2:.4f}"
+            )
+
+    pwm = [""] + [
+        f"param set-default PWM_MAIN_FUNC{i + 1} {101 + i}"
+        for i in range(len(sidecar.rotors))
+    ]
+
+    vehicle = Vehicle(model, rotors_from_specs(sidecar.rotors, sidecar.omega_idle))
+    hover = vehicle.hover_command() ** 2
+
+    text = AIRFRAME_TEMPLATE.read_text(encoding="utf-8")
+    text = text.replace("{{ROTOR_BLOCK}}", "\n".join(rotors) + "\n")
+    text = text.replace("{{PWM_BLOCK}}", "\n".join(pwm) + "\n")
+    text = text.replace("{{MPC_THR_HOVER}}", f"{hover:.4f}")
+    if "{{" in text:
+        leftover = text[text.index("{{"):][:40]
+        raise ValueError(f"unfilled placeholder in the airframe template: {leftover}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    print(f"\nairframe {out}")
+    print(f"  CA_ROTOR_COUNT {len(sidecar.rotors)}, MPC_THR_HOVER {hover:.4f}")
+    print(
+        f"  install with: scripts/install_px4_files.sh --airframe {out}\n"
+        f"  then run with PX4_SYS_AUTOSTART={out.name.split('_')[0]}"
+    )
+
+
 def _print_meshes(reports: list[MeshReport]) -> None:
     print("\nmeshes (visual only; collision uses the sidecar's primitives)")
     for report in sorted(reports, key=lambda r: -r.source_faces):
@@ -1447,6 +1454,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
         help="override the sidecar's output path",
+    )
+    parser.add_argument(
+        "--emit-airframe", type=Path, default=None, metavar="PATH",
+        help=(
+            "also write the PX4 airframe file, filled from this sidecar. Write "
+            "it next to the MJCF: the CA_ROTOR* block is hub geometry"
+        ),
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -1502,6 +1516,15 @@ def main(argv: list[str] | None = None) -> int:
     if result.failures:
         print(f"\n{len(result.failures)} check(s) FAILED; not writing the MJCF.")
         return 1
+
+    # After the self-check, deliberately: an airframe file derived from a model
+    # whose mass or geometry failed its checks would carry the same error into
+    # PX4, where it is far harder to see.
+    if args.emit_airframe is not None:
+        if write:
+            emit_airframe(sidecar, model, args.emit_airframe.resolve())
+        else:
+            print("\nairframe not written: --check-only")
 
     if write:
         write_model(spec, sidecar, mesh_dir)

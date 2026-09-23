@@ -2,16 +2,30 @@
 #
 # This TEMPLATE lives in the public repository and carries NO GEOMETRY. Every
 # number below is a placeholder written as `REPLACE_*` or a documented default.
-# Copy it next to the private CAD export, fill it in, and keep the filled copy
-# and the generated MJCF out of this repository:
+# Copy it next to the private CAD export, fill it in, and keep the filled copy,
+# the generated MJCF and the generated airframe out of this repository:
 #
 #     cp models/x8_arm.conversion.yaml.template \
 #        <private-repo>/model/x8_arm.conversion.yaml
-#     python scripts/urdf_to_mjcf.py <private-repo>/model/x8_arm.conversion.yaml
+#     python scripts/urdf_to_mjcf.py <private-repo>/model/x8_arm.conversion.yaml \
+#         --emit-airframe <private-repo>/model/px4/22002_mujoco_x8
 #
 # Rotor hub coordinates and the inertia cross-check are themselves a description
 # of the airframe, which is why the filled sidecar is private too, not only the
-# URDF and the STLs.
+# URDF and the STLs. The generated PX4 airframe is private for the same reason:
+# its CA_ROTOR*_PX / _PY block IS the hub geometry.
+#
+# THE FILLED SIDECAR IS READ TWICE, and not only at conversion time:
+#
+#   - scripts/urdf_to_mjcf.py reads all of it, to build the MJCF and the airframe;
+#   - the simulator reads the `rotors` block and `omega_idle` at every startup,
+#     via --rotors / MUJOCO_SITL_ROTORS (src/mujoco_px4_sitl/rotorconfig.py).
+#
+# So this file is a runtime input, not a build artefact: keep it beside the MJCF
+# it generated. One parser serves both readers, so an error here surfaces the same
+# way in each. Editing a coefficient changes the next run with no reconversion --
+# but changing one that the airframe also carries (c_t, km, omega_max, omega_idle)
+# means regenerating, or PX4's allocator and the plant will disagree.
 #
 # What each section owns is documented in MODELING_CONVENTIONS.md section 6.
 # Angles accept radians (a bare number), `{deg: 45}`, or `"45deg"`.

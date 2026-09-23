@@ -247,10 +247,11 @@ class StubPhysics:
 def build_physics(cfg: Config, rotors: RotorModel | None = None) -> Physics:
     """Build the physics backend. ``rotors`` is ignored by the stub.
 
-    The X8's per-rotor arrays arrive through here: an 8-rotor model needs an
-    8-entry ``spin``, and the default quad tuple would be rejected. Once the
-    conversion script's sidecar config exists (MODELING_CONVENTIONS.md section
-    6) it is what builds the ``RotorModel`` passed in.
+    Per-rotor arrays arrive through here: an 8-rotor model needs an 8-entry
+    ``spin``, and the default quad tuple is rejected against it rather than
+    truncated. ``main.py`` builds the ``RotorModel`` from the sidecar named by
+    ``--rotors`` / ``MUJOCO_SITL_ROTORS`` (:mod:`rotorconfig`), or an in-process
+    caller passes one it built itself.
     """
     if cfg.stub_physics:
         return StubPhysics(cfg)

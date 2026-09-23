@@ -70,6 +70,7 @@ def test_a_non_integer_rate_ratio_is_rejected():
     ["--stub-physics", "--inject-attitude", "30,0,0"],
     ["--model", "/nonexistent/model.xml"],
     ["--stub-physics", "--physics-rate", "1100"],
+    ["--stub-physics", "--rotors", "/nonexistent/x.conversion.yaml"],
 ])
 def test_rejected_configs_exit_cleanly_rather_than_traceback(argv, capsys):
     """User error should read like argparse's own, not like a crash. Exit 2 is
@@ -79,3 +80,40 @@ def test_rejected_configs_exit_cleanly_rather_than_traceback(argv, capsys):
 
     assert main(argv) == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_rotors_path_defaults_to_the_environment(monkeypatch):
+    """run_sitl.sh passes the model by env var; rotors follows that pattern so
+    the shell script needs no change to fly a non-quad.
+    """
+    monkeypatch.setenv("MUJOCO_SITL_ROTORS", "/tmp/some.conversion.yaml")
+    from mujoco_px4_sitl.config import build_parser
+
+    args = build_parser().parse_args([])
+    assert str(args.rotors_path) == "/tmp/some.conversion.yaml"
+
+
+def test_rotors_path_has_no_default():
+    """A non-quad model must not silently fall back to placeholder motors.
+
+    There is deliberately no default sidecar: the filled one is private
+    (AGENTS.md section 4), and an 8-rotor model met by RotorModel's 4-entry spin
+    raises rather than flying with the quad's numbers.
+    """
+    from mujoco_px4_sitl.config import build_parser
+
+    assert build_parser().parse_args([]).rotors_path is None
+
+
+def test_passing_both_a_rotor_model_and_a_sidecar_is_rejected(tmp_path):
+    """One would be parsed and then discarded, so it is a contradiction rather
+    than a precedence question.
+    """
+    from mujoco_px4_sitl.main import run
+    from mujoco_px4_sitl.vehicle import RotorModel
+
+    sidecar = tmp_path / "x.conversion.yaml"
+    sidecar.write_text("rotors: [{pos: [0,0,0], spin: 1}]\n", encoding="utf-8")
+    cfg = Config(stub_physics=True, rotors_path=sidecar)
+    with pytest.raises(ValueError, match="both a RotorModel and --rotors"):
+        run(cfg, RotorModel(spin=(1, -1, 1, -1)))
