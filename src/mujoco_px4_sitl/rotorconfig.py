@@ -27,6 +27,7 @@ from .vehicle import RotorModel
 # rotors block where it means a dropped coefficient.
 _ROTOR_KEYS = {
     "pos", "spin", "c_t", "km", "omega_max", "omega_min", "zaxis", "deck", "label",
+    "radius",
 }
 
 
@@ -40,9 +41,15 @@ class RotorSpec:
     y-sign. Getting it wrong presents as yaw drift or attitude cross-coupling
     and is routinely misdiagnosed as an EKF fault.
 
-    ``pz`` (the site's z) is documentation only: thrust is along body +z, so
+    ``pz`` (the site's z) produces no torque: thrust is along body +z, so
     ``r x [0,0,T]`` uses only x and y. A coaxial deck's height contributes no
-    torque, in our model and in PX4's allocator alike (section 4).
+    torque, in our model and in PX4's allocator alike (section 4). It does
+    place the propeller disc, so it should be the blade plane.
+
+    ``radius`` is the propeller's, in metres. The conversion draws it as the
+    rotor site's disc, which is what the simulator's propeller clearance check
+    reads (``arm.PropellerMonitor``). Geometry, like ``pos``: it reaches the
+    simulator through the generated MJCF, not through ``--rotors``.
     """
 
     pos: tuple[float, float, float]
@@ -54,6 +61,7 @@ class RotorSpec:
     zaxis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     deck: str = ""
     label: str = ""
+    radius: float | None = None
 
     def __post_init__(self) -> None:
         if self.spin not in (1, -1):
@@ -63,6 +71,8 @@ class RotorSpec:
             )
         if len(self.pos) != 3:
             raise ValueError(f"rotor {self.label or '?'}: pos needs 3 numbers")
+        if self.radius is not None and not self.radius > 0.0:
+            raise ValueError(f"rotor {self.label or '?'}: radius must be > 0")
         if self.c_t is not None and self.omega_max is None:
             # Thrust is c_t * omega^2, so only the product means anything. A
             # measured c_t left against vehicle.py's placeholder omega_max of
@@ -115,6 +125,7 @@ def parse_rotor_entry(entry: Any, index: int, where: str, prefix: str) -> RotorS
         zaxis=tuple(float(v) for v in entry.get("zaxis", (0.0, 0.0, 1.0))),
         deck=str(entry.get("deck", "")),
         label=str(entry.get("label", f"{prefix}{index}")),
+        radius=None if entry.get("radius") is None else float(entry["radius"]),
     )
 
 

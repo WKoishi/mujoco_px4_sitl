@@ -70,9 +70,16 @@ collision_meshes_off: true
 #
 #   spin: CCW / CW as seen from ABOVE (+1 = CCW about body +z), or +1 / -1.
 #   km:   reaction torque = km * thrust, PX4's CA_ROTOR*_KM definition.
-#   pos:  FLU, in base_link's frame. The z coordinate is documentation only --
+#   pos:  FLU, in base_link's frame. The z coordinate produces no torque --
 #         thrust is along body +z, so r x [0,0,T] uses only x and y, and a
 #         coaxial deck's height produces no torque in our model or in PX4's.
+#         It does place the propeller disc (radius, below), so make it the
+#         BLADE PLANE -- the mid-plane of the blade sweep -- not the motor mount.
+#   radius: blade-tip radius, metres; all rotors or none. The rotor site becomes
+#         a flat disc the simulator checks the arm against every frame,
+#         reported and never blocked; without it that check is off and the
+#         script warns. Geometry like pos, so it reaches the simulator through
+#         the MJCF: change it, reconvert. A diameter here fails the overlap check.
 #   c_t:  thrust coefficient, N/(rad/s)^2, i.e. T = c_t * omega^2. Fit it from the
 #         motor/propeller datasheet by least squares through the origin over the
 #         thrust and RPM columns (omega = rpm * 2*pi/60). Omit to fall back on
@@ -96,7 +103,7 @@ rotors:
   - {label: rear-right  lower, deck: lower, spin: CCW, km: 0.05, pos: [REPLACE_-X, REPLACE_-Y, REPLACE_Z_LOWER]}
   - {label: rear-left   lower, deck: lower, spin: CW,  km: 0.05, pos: [REPLACE_-X, REPLACE_+Y, REPLACE_Z_LOWER]}
 # With motor data, each entry gains c_t / omega_max / a fitted km, e.g.
-#   - {label: ..., spin: CCW, km: 0.0215, c_t: 1.02e-04, omega_max: 633.4, pos: [...]}
+#   - {label: ..., spin: CCW, km: 0.0215, c_t: 1.02e-04, omega_max: 633.4, radius: REPLACE_R, pos: [...]}
 # The lower four can carry a reduced c_t for coaxial interference (section 5
 # suggests 0.75-0.85 of the isolated value); a datasheet is for an isolated rotor.
 
@@ -119,6 +126,10 @@ rotors:
 # `lower=upper=0` when the limits were never set in CAD, and MuJoCo compiles
 # that as *UNLIMITED* -- so an unset limit is not a locked joint, it is a free
 # one whose position actuator has a meaningless ctrlrange.
+#
+# Give the mechanism's real limits even where they let the arm into a propeller
+# disc; with rotor radii set, the self-check reports how much of the envelope
+# does.
 #
 # damping and armature are gearbox friction and reflected inertia. They are not
 # cosmetic: a stiff position actuator on an undamped, inertialess hinge

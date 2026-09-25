@@ -135,6 +135,14 @@ must not cause any braking. If `brake` instead tracks `frames` divided by
 PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
 `ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
 
+A model with an arm appends its own counters. `STALE` shows while the watchdog
+has acted, and a negative `prop_clearance` means an arm capsule is inside a
+propeller disc:
+
+```
+... brake=0 timeouts=0 arm_cmd=4846 age=0.004s stale_episodes=2 rejected=0 clamped=0 prop_clearance=-16.0mm intrusions=1
+```
+
 ## Workspace manipulability
 
 `scripts/manipulability.py` asks whether an arm can hold an arbitrary pose at an
@@ -229,6 +237,49 @@ the receive buffer, so a client that reads once per second gets second-old state
 and one that reads after a long sleep gets state from the start of that sleep. The
 example's `--latest` mode shows the pattern. Suspect this before believing any
 disagreement between the side channel and PX4's own topics.
+
+### Driving the arm
+
+`values[i]` is `arm_joint{i}`'s absolute angle in radians, one per `arm_act*`
+servo; a command of the wrong length, a mode other than `"position"`, or a
+non-finite value is rejected with a warning. Values outside a joint's range are
+clamped and counted. Optional fields:
+
+| Field | Meaning |
+|---|---|
+| `seq` | yours, echoed back as `arm.cmd_seq`; not used for ordering |
+| `state_time` | the `ground_truth.time` the command was computed from |
+
+**Send commands as a stream.** A watchdog on simulated time treats a command
+older than `--arm-timeout` (default 0.5 s; 0 turns it off) as a controller that
+has stopped, and `--arm-on-timeout` says what the servos do then:
+
+| Action | Servos | Models |
+|---|---|---|
+| `freeze` (default) | retarget to the pose reached | an arm driver whose watchdog stops the arm |
+| `keep` | hold the last target | a servo bus with no watchdog |
+| `limp` | torque off; the arm falls | a driver that cuts power on a fault |
+
+The next command that is fresh on arrival resumes control, as a step: after a
+stall, restart from the arm's reached pose, not the old plan. With `state_time`
+the age runs from the state the command was computed from, which also catches a
+controller that keeps sending on stale state, and a command older than the one
+in force is dropped as out of order. Without it, age runs from arrival. Through
+`run_sitl.sh`, pass the flags after `--`:
+`./scripts/run_sitl.sh -m <model> -- --arm-timeout 0.2 --arm-on-timeout limp`.
+
+For a model with an arm, `ground_truth` carries an `arm` block:
+
+| Field | Meaning |
+|---|---|
+| `cmd_seq` | `seq` of the command in force, `null` before the first |
+| `cmd_age` | simulated seconds since that command's `state_time` (or arrival) |
+| `cmd_stale` | whether the watchdog has acted |
+| `prop_clearance` | metres from the arm's collision capsules to the nearest propeller disc, on the pose reached; negative means inside. `null` if the model has no disc-shaped rotor sites |
+
+**Propeller intrusion is reported, never blocked**: logged when it starts and
+ends, and counted on the status line. Keeping clear is the controller's job.
+Joint state is not on the side channel (`AGENTS.md` §3).
 
 ## ROS 2 integration
 

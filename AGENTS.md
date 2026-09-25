@@ -63,8 +63,7 @@ Of the three dynamic unknowns that flight was meant to settle:
   against the *wiring*, which no simulation can settle.
 - **Coaxial yaw authority is weak, and PX4's default gains do not suit it.**
   Measured, and the cause is known — see below.
-- **The arm's mass moving in flight** is still untested, because `arm_cmd` is
-  still dropped (§2).
+- **The arm's mass moving in flight** is now flown; see below.
 
 **PX4's rate gains act on a normalized torque**: the allocator scales each axis
 so that ±1 means the vehicle's own authority on that axis. So the physical loop
@@ -103,19 +102,35 @@ data and live in the private sidecar (§4). `ω_idle` is not in that data and is
 still a choice, and `vehicle.py`'s placeholders remain the fallback for any model
 that does not supply its own — which is now only the quad.
 
+**The arm is driven** through [arm.py](src/mujoco_px4_sitl/arm.py);
+`README.md` ("Driving the arm") has the interface. Two decisions came with it:
+
+- **A command watchdog on simulated time**, on by default, whose timeout action
+  (`freeze`, `keep`, `limp`) is configurable: it models the arm driver, which a
+  lockstep stall must not trip, and what the arm does when its controller
+  stalls is what the private research studies. A command may carry
+  `state_time`, making its age the age of the data behind it.
+- **Propeller intrusion is checked every frame on the reached pose, never
+  blocked**, against discs drawn from a per-rotor `radius` (§4).
+
+Flown the same day (`IMPLEMENTATION_PLAN.md` phase 7): PX4 held position
+through every arm move within 2° of attitude, **except after a watchdog stall,
+when the first fresh command landed as a step and cost 7.8° of pitch**. Servo
+droop moved reached poses across a disc in both directions, so **the commanded
+pose does not predict an intrusion**.
+
 ---
 
 ## 2. What is not implemented
 
 | Gap | Where | Consequence |
 |---|---|---|
-| `arm_cmd` never reaches the physics | `sidechannel.py` parses it into `ArmCommand`; nothing in `src/` writes `data.ctrl` | arm commands are received and silently dropped |
-| **A dropped `arm_cmd` writer has no failsafe** | `ArmCommand` has no timestamp and no expiry | when the writer lands: a controller that crashes leaves the arm holding its last command forever. The private research models computation timeouts and faults, so what the arm does when its controller stalls is part of what it studies: design the staleness behaviour with the writer, not after |
-| **Nothing detects propeller intrusion** | rotors are force sites with no geometry, so an arm inside a disc collides with nothing and costs no thrust | the joint limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a disc — measured, not inferred. Here that is silent: a trajectory through a disc succeeds in simulation and strikes a propeller on the real vehicle. **Detect and report it, do not block it**: the research has to show its controller keeps this constraint, and a simulator that clamped commands would hide the violation. A blocking guard belongs to the real vehicle, not to this repo (§4) |
+| **`--hold-pose` makes the arm weightless** | `_pin_pose` restores the base only between frames, so within one the vehicle free-falls | no droop, and a `limp` arm does not fall. Phase 3's IMU table is unaffected; testing the arm on a pinned vehicle is not. `tests/test_arm.py` welds the base instead. The fix is a support wrench at the subtree CoM |
+| Propeller clearance is idealized | `PropellerMonitor` in [arm.py](src/mujoco_px4_sitl/arm.py) | flat discs (the real sweep is about ±7 mm thick at the root), capsules and spheres only, once per IMU frame, against collision primitives fitted by eye (§4). The conversion's envelope survey is kinematic, so droop can move its poses across a disc either way. Margin is the consumer's to add |
 | Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
-| No arm state on the side channel | `SimState` has 9 fields, none of them joint state | an out-of-process controller is flying blind on the arm. Extending it touches `SimState`, the `Physics` protocol and `StubPhysics` |
-| Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `ArmCommand.mode` accepts `"torque"`, but no actuator can honour it | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too: they hold the folded arm but droop up to ~8° when gravity loads the shoulder (sidecar) |
-| No reproducible feedback delay | out of process the delay is wall clock (§3, the research-controller boundary); in process `run(cfg, rotors=...)` exists, but `step_frame` calls no controller and holds no delay buffer | an argument that bounds data age cannot be tested at a chosen age. An in-process arm controller with configurable sample, hold and drop would give that on the arm. PX4-side setpoints still arrive over MAVLink or DDS outside lockstep, so their delay can only be measured |
+| No arm joint state on the side channel | `ground_truth.arm` carries command age, staleness and propeller clearance, not `qpos` | an out-of-process controller is flying blind on the arm. Whether to add it is §3's topology decision, not a missing field |
+| Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `arm.py` refuses any other kind, and rejects `mode: "torque"` | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too, and decide intrusions as well as tracking: their gravity droop moved reached poses across a disc (§1) |
+| No reproducible feedback delay | out of process the delay is wall clock (§3, the research-controller boundary), now measured by `arm.cmd_age` when commands echo `state_time`; in process `run(cfg, rotors=...)` exists, but `step_frame` calls no controller and holds no delay buffer | an argument that bounds data age cannot be tested at a chosen age. An in-process arm controller with configurable sample, hold and drop would give that on the arm. PX4-side setpoints still arrive over MAVLink or DDS outside lockstep, so their delay can only be measured |
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's home pose | an arm that moves in flight changes the inertia and the gains do not follow. Rigid-arm inertia is what the Phase 7 disturbance test starts from, so it is the right starting point, not the whole answer |
 | IMU has no noise or bias | `sim.py` sends MuJoCo's ideal accel/gyro, and PX4's `simulator_mavlink` only quantizes them (`SimulatorMavlink.cpp:198-270`): under MAVLink HIL the simulator owns IMU noise. Baro, mag and GPS do get noise, from PX4's `sensor_*_sim` | EKF2's bias estimation is never exercised, and estimate errors look better than they will be. The derived attitude gains were verified on a noiseless gyro, and noise is what the rate D term suffers from, so re-fly the step tests once it lands. Add white noise and a bias random walk on the `HIL_SENSOR` path only, sized from the chosen IMU's datasheet: `SimState.gyro_frd` also feeds ground truth (`HIL_STATE_QUATERNION`, the side channel), which must stay clean |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
@@ -165,15 +180,15 @@ Flying the X8 is **done** (§1): it passes the Phase 5 profile. So are its
 attitude gains: `--emit-airframe` derives them from the model and the sidecar
 the same way it derives `MPC_THR_HOVER`, so they follow the arm and the motors
 when either changes (§1). A private research controller that replaces PX4's
-rate loop needs none of it. What remains:
+rate loop needs none of it.
 
-1. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
-   `step_frame` at [sim.py:137](src/mujoco_px4_sitl/sim.py#L137). `clear()` only
-   zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
-   owns its own clearing. The generated model already has `arm_act0..4` with
-   `ctrlrange` set. Decide the staleness behaviour here, not later (§2, row 2).
-   Propeller intrusion becomes possible the moment the arm moves, so its
-   detection lands with this step: reported, never blocked (§2, §4).
+Driving the arm is **done** (§1). A future writer that applies forces to the
+arm owns its own clearing: `clear()` zeros only `base_link`'s `xfrc_applied`.
+What remains:
+
+1. **The research-controller topology** (below). Joint state for the
+   controller and a reproducible feedback delay are both blocked on it, and it
+   is the research's decision, not a code task.
 2. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
    separable from the others. It moves the plant gain as well as the hover
    point, so regenerate the airframe and fly the attitude steps again.
@@ -190,9 +205,10 @@ process** and sees only the side channel.
 That choice buys isolation — a slow solver cannot stall lockstep — and sells two
 things. Both are inherent to the process boundary, not schema gaps:
 
-- **Determinism.** `serve()` polls and publishes without ever waiting, so the
-  feedback delay is wall-clock and unreproducible. No counter reports it:
-  `brake` and `timeouts` watch the PX4 side, not this one.
+- **Determinism.** `poll()` and `publish()` never wait, so the feedback delay
+  is wall-clock and unreproducible. `arm.cmd_age` measures it when the
+  controller echoes `state_time`; nothing can choose it. `brake` and `timeouts`
+  watch the PX4 side, not this one.
 - **Speed.** `frame_wall_dt = imu_dt / speed_factor`, so at 5× the controller's
   unchanged wall-clock latency becomes 5× the sim-time delay. An out-of-process
   controller cannot batch experiments faster than real time.
@@ -264,14 +280,23 @@ limits.** Not a near miss: a small fraction of the poses the mechanism genuinely
 permits put an arm collision capsule *inside* a disc, measured on the model with
 the real ranges (the figures are in the private sidecar). So the limits cannot be
 the guard — they are the mechanism's, and the mechanism can do this. Nothing in
-the model stops a commanded angle from doing it either.
+the model stops a commanded angle from doing it either. Only the front rotors
+are reachable, on both decks, and only by the last link.
 
 Decided 2026-09-25: in simulation it is **detected and reported, never
 blocked** (§2). Check the pose the arm actually reaches, its collision capsules
 against the disc volumes each step, rather than the commanded one, since the
 servo lags its command. Blocking is a real-vehicle safety layer and belongs in
 the arm driver or the companion computer, outside this repo. The joint limits
-cannot do it on either side.
+cannot do it on either side. Implemented the same day (§1).
+
+**Measuring the discs corrected two inputs.** Each rotor's `radius` is the blade
+tip off the base mesh; the earlier hand survey had used a smaller radius of no
+recorded origin. And the rotor sites now sit on the blade planes, which the
+upper deck's did not — harmless while z carried no torque and no `PZ`, but z
+places the disc. The airframe regenerated byte-identical. The conversion's
+self-check now reruns the envelope survey with the simulator's own check, and
+on the old geometry it reproduces the hand survey exactly.
 
 `vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
 **stay in place and still warn on every load** — they are what any model without

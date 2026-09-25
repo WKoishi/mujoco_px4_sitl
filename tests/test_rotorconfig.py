@@ -161,3 +161,14 @@ def test_empty_rotors_block_is_rejected(tmp_path):
 def test_parse_rotor_entry_labels_by_index():
     spec = parse_rotor_entry({"pos": [0, 0, 0], "spin": 1}, 3, "w", "rotor")
     assert spec.label == "rotor3"
+
+
+def test_a_rotor_radius_is_accepted_and_does_not_touch_thrust(tmp_path):
+    """radius is geometry: it reaches the simulator through the MJCF's disc
+    sites, so the runtime rotor block parses it and otherwise ignores it."""
+    plain = load_rotors(_write(tmp_path, {"rotors": [_rotor("CCW"), _rotor("CW")]}))
+    with_radius = load_rotors(_write(tmp_path, {"rotors": [
+        _rotor("CCW", radius=0.2), _rotor("CW", radius=0.2),
+    ]}))
+    assert with_radius == plain
+    assert parse_rotor_entry(_rotor("CCW", radius=0.2), 0, "x", "rotor").radius == 0.2

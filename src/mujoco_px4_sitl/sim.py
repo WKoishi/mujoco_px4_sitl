@@ -20,6 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import frames
+from .arm import ArmCommand, ArmServos, ArmStatus, PropellerMonitor
 from .config import Config
 from .vehicle import RotorModel, Vehicle
 
@@ -48,6 +49,8 @@ class Physics(Protocol):
 
     def step_frame(self, controls: NDArray[np.float64]) -> None: ...
     def state(self) -> SimState: ...
+    def submit_arm_command(self, command: ArmCommand) -> None: ...
+    def arm_status(self) -> ArmStatus | None: ...
     @property
     def time(self) -> float: ...
 
@@ -104,6 +107,10 @@ class MujocoPhysics:
             )
 
         mujoco.mj_forward(self.model, self.data)
+        self.arm = ArmServos(self.model, cfg.arm_timeout_s, cfg.arm_on_timeout)
+        self.arm.hold(self.data)
+        self.propellers = PropellerMonitor(self.model, self._body_id, self.vehicle.site_ids)
+        self.propellers.check(self.data)
         _log.info(
             "loaded %s: %d rotors, %.3f kg, physics %.0f Hz (%d steps per IMU frame)",
             cfg.model_path, self.vehicle.num_rotors, self.vehicle.total_mass,
@@ -119,6 +126,13 @@ class MujocoPhysics:
             / self.vehicle.weight,
             self.vehicle.describe_rotors(),
         )
+        if self.arm.count:
+            _log.info(
+                "arm: %d servo(s) %s0..%d driven by arm_cmd; watchdog %s",
+                self.arm.count, "arm_act", self.arm.count - 1,
+                f"{cfg.arm_timeout_s:g} s sim time, then {cfg.arm_on_timeout}"
+                if cfg.arm_timeout_s > 0.0 else "off",
+            )
 
     def _sensor(self, name: str) -> tuple[int, int]:
         sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
@@ -137,6 +151,9 @@ class MujocoPhysics:
     def step_frame(self, controls: NDArray[np.float64]) -> None:
         """Advance one IMU frame, holding ``controls`` for its whole duration."""
         dt = self.model.opt.timestep
+        # data.ctrl is the arm's; the rotors go through xfrc_applied. Writing it
+        # once per frame suffices, since MuJoCo holds ctrl across steps.
+        self.arm.update(self.data)
         for _ in range(self.steps_per_frame):
             self.vehicle.update_commands(controls, dt)
             # Clear before the writers, because apply() accumulates. Without
@@ -151,6 +168,29 @@ class MujocoPhysics:
         # Sensor values are stage-acc/vel quantities; refresh them after the
         # last step so the IMU reading belongs to the frame we just finished.
         mujoco.mj_forward(self.model, self.data)
+        # On the pose the arm reached, which mj_forward just made current.
+        self.propellers.check(self.data)
+
+    def submit_arm_command(self, command: ArmCommand) -> None:
+        """Hand an ``arm_cmd`` to the servos; it drives from the next ``step_frame``."""
+        self.arm.submit(command, self.time)
+
+    def arm_status(self) -> ArmStatus | None:
+        """None for a model with neither arm servos nor a clearance check."""
+        if not self.arm.count and not self.propellers.enabled:
+            return None
+        return ArmStatus(
+            cmd_seq=None if self.arm.command is None else self.arm.command.seq,
+            cmd_age=self.arm.age(self.time),
+            cmd_stale=self.arm.stale,
+            prop_clearance=self.propellers.clearance if self.propellers.enabled else None,
+            accepted=self.arm.accepted,
+            rejected=self.arm.rejected,
+            clamped=self.arm.clamped,
+            stale_episodes=self.arm.stale_episodes,
+            intrusions=self.propellers.intrusions,
+            deepest=self.propellers.deepest,
+        )
 
     def state(self) -> SimState:
         qpos = self.data.qpos[self.qpos_adr:self.qpos_adr + 7]
@@ -221,6 +261,7 @@ class StubPhysics:
         self.cfg = cfg
         self._time = 0.0
         self._dt = cfg.imu_dt
+        self._warned_arm = False
 
     @property
     def time(self) -> float:
@@ -228,6 +269,14 @@ class StubPhysics:
 
     def step_frame(self, controls: NDArray[np.float64]) -> None:  # noqa: ARG002
         self._time += self._dt
+
+    def submit_arm_command(self, command: ArmCommand) -> None:  # noqa: ARG002
+        if not self._warned_arm:
+            self._warned_arm = True
+            _log.warning("stub physics has no arm; arm_cmd is ignored")
+
+    def arm_status(self) -> ArmStatus | None:
+        return None
 
     def state(self) -> SimState:
         return SimState(

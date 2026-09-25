@@ -16,7 +16,9 @@ What is injected, and why URDF cannot carry it:
 ``freejoint``               MuJoCo's URDF parser welds the root link to the
                             world -- without this the vehicle cannot move at all
 ``rotor0..N`` sites          thrust application points; ``vehicle.py`` scans
-                            these names and applies ``xfrc_applied`` at them
+                            these names and applies ``xfrc_applied`` at them.
+                            With a ``radius`` they are drawn as the propeller
+                            disc, which the clearance check in ``arm.py`` reads
 ``imu`` site                 IMU mount, hardcoded name and ``quat="1 0 0 0"``
 ``imu_accel`` / ``imu_gyro`` the sensors ``sim.py`` reads every frame
 ``ee`` site                  optional end-effector reference (section 8)
@@ -58,6 +60,7 @@ from numpy.typing import NDArray
 # installed, which is how the tests load it and how it is documented. It is a
 # no-op once the package is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from mujoco_px4_sitl.arm import PropellerMonitor  # noqa: E402
 from mujoco_px4_sitl.rotorconfig import (  # noqa: E402
     RotorSpec,
     parse_rotor_entry,
@@ -77,6 +80,9 @@ STL_FACE_LIMIT = 200_000
 BASE_BODY = "base_link"
 IMU_SITE = "imu"
 ROTOR_PREFIX = "rotor"
+# A rotor site with a radius is a cylinder, and the clearance check treats it as
+# a flat disc. The thickness is only so the viewer has something to draw.
+DISC_DRAW_HALF_THICKNESS = 0.002
 ARM_JOINT_PREFIX = "arm_joint"
 ARM_ACTUATOR_PREFIX = "arm_act"
 
@@ -793,7 +799,15 @@ def _inject_sites(spec: mujoco.MjSpec, sidecar: Sidecar) -> None:
         # Explicit zaxis costs nothing now and is what a tilt-rotor would need
         # later (section 5). vehicle.py hardcodes thrust along body +z today.
         site.alt.zaxis = list(rotor.zaxis)
-        site.rgba = [0.9, 0.3, 0.3, 1.0] if rotor.spin > 0 else [0.3, 0.3, 0.9, 1.0]
+        colour = [0.9, 0.3, 0.3] if rotor.spin > 0 else [0.3, 0.3, 0.9]
+        site.rgba = colour + [1.0]
+        if rotor.radius is not None:
+            # The disc the propeller sweeps, in the site's xy-plane. Sites never
+            # collide, which is the point: the arm passing through it must be
+            # measured and reported, not stopped (AGENTS.md section 4).
+            site.type = mujoco.mjtGeom.mjGEOM_CYLINDER
+            site.size = [rotor.radius, DISC_DRAW_HALF_THICKNESS, 0.0]
+            site.rgba = colour + [0.25]
 
 
 def _inject_sensors(spec: mujoco.MjSpec) -> None:
@@ -975,7 +989,106 @@ def self_check(model: mujoco.MjModel, sidecar: Sidecar) -> CheckResult:
     _check_mass(model, base_id, sidecar, result)
     _check_geometry(model, sidecar, result)
     _check_thrust(model, base_id, sidecar, result)
+    _check_propeller_discs(sidecar, result)
+    _survey_propeller_clearance(model, base_id, sidecar, result)
     return result
+
+
+# Rotors whose planes are closer than this count as one deck when checking that
+# neighbouring discs do not overlap. Blade sweep is a centimetre or so thick.
+DISC_SAME_PLANE = 0.02
+# Poses sampled for the clearance survey. Seeded, so a rerun reproduces it and a
+# change in the figure means the geometry changed.
+CLEARANCE_SURVEY_POSES = 30_000
+
+
+def _check_propeller_discs(sidecar: Sidecar, result: CheckResult) -> None:
+    """Every rotor has a radius or none does, and no two blades share airspace.
+
+    A radius is what lets the simulator detect the arm entering a propeller
+    disc. Without one that goes unnoticed, which is why its absence on a model
+    with an arm is a warning. The overlap check catches a diameter entered as a
+    radius, which would otherwise report intrusions where there are none.
+    """
+    radii = [rotor.radius for rotor in sidecar.rotors]
+    if all(r is None for r in radii):
+        if sidecar.joints:
+            result.warn(
+                "no rotor has a radius, so the simulator cannot detect the arm "
+                "entering a propeller disc"
+            )
+        return
+    if any(r is None for r in radii):
+        missing = [i for i, r in enumerate(radii) if r is None]
+        result.fail(
+            f"radius given for some rotors but not {missing}; those discs would "
+            f"go unchecked, silently"
+        )
+        return
+    clashes = []
+    for i, first in enumerate(sidecar.rotors):
+        for j in range(i + 1, len(sidecar.rotors)):
+            second = sidecar.rotors[j]
+            planar = math.hypot(first.pos[0] - second.pos[0], first.pos[1] - second.pos[1])
+            same_plane = abs(first.pos[2] - second.pos[2]) < DISC_SAME_PLANE
+            if same_plane and 1e-6 < planar < first.radius + second.radius:
+                clashes.append(f"{i}/{j}")
+    if clashes:
+        result.fail(
+            f"propeller discs overlap in one plane ({', '.join(clashes)}): those "
+            f"blades would strike each other. Is a diameter given as a radius?"
+        )
+    else:
+        shown = "/".join(sorted({f"{r:.4f}" for r in radii}))
+        result.ok(f"{len(radii)} propeller discs, R = {shown} m, none overlapping")
+
+
+def _survey_propeller_clearance(
+    model: mujoco.MjModel, base_id: int, sidecar: Sidecar, result: CheckResult
+) -> None:
+    """How much of the joint envelope puts the arm inside a propeller disc.
+
+    Uniform over the joint limits, with the simulator's own check, so the figure
+    is the one flight would report. The limits are the mechanism's and do not
+    keep the arm out of the discs (AGENTS.md section 4); this says how far they
+    fall short. A warning, not a failure: it is a property of the machine.
+    """
+    sites = []
+    while (site := mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_SITE, f"{ROTOR_PREFIX}{len(sites)}")) >= 0:
+        sites.append(site)
+    monitor = PropellerMonitor(model, base_id, sites)
+    joints = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+              for name in sidecar.joints]
+    if not monitor.enabled or not joints:
+        return
+    addresses = np.array([model.jnt_qposadr[j] for j in joints])
+    low, high = np.asarray(model.jnt_range[joints], dtype=np.float64).T
+    rng = np.random.default_rng(0)
+    data = mujoco.MjData(model)
+    inside = 0
+    deepest, worst_pair = 0.0, 0
+    for pose in rng.uniform(low, high, size=(CLEARANCE_SURVEY_POSES, len(joints))):
+        data.qpos[addresses] = pose
+        mujoco.mj_kinematics(model, data)
+        clearance, pair = monitor.measure(data)
+        if clearance < 0.0:
+            inside += 1
+            if -clearance > deepest:
+                deepest, worst_pair = -clearance, pair
+    if inside:
+        geom, site = monitor.pair_names(worst_pair)
+        result.warn(
+            f"{inside} of {CLEARANCE_SURVEY_POSES} poses inside the joint limits "
+            f"({100.0 * inside / CLEARANCE_SURVEY_POSES:.2f}%) put an arm capsule "
+            f"inside a propeller disc, deepest {deepest * 1e3:.1f} mm ({geom} in "
+            f"{site}). The simulator reports this in flight; nothing blocks it"
+        )
+    else:
+        result.ok(
+            f"no arm capsule enters a propeller disc in {CLEARANCE_SURVEY_POSES} "
+            f"poses sampled inside the joint limits"
+        )
 
 
 def _check_thrust(

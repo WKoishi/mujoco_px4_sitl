@@ -228,12 +228,20 @@ class LockstepLoop:
             if self._frames_since_ack >= cfg.max_lead_frames:
                 self._brake()
 
+            # Every frame and just before stepping, so an arm_cmd drives the
+            # first frame after it arrives rather than waiting for a publish.
+            if self.sidechannel is not None:
+                for command in self.sidechannel.poll():
+                    self.physics.submit_arm_command(command)
+
             controls = self.controls.effective(self.physics.num_actuators)
             self.physics.step_frame(controls)
             self.stats.frames += 1
 
             if self.sidechannel is not None and self.stats.frames % self._sidechannel_decimation == 0:
-                self.sidechannel.serve(self.physics.state(), controls)
+                self.sidechannel.publish(
+                    self.physics.state(), controls, self.physics.arm_status()
+                )
 
             if self.frame_hook is not None:
                 self.frame_hook()
@@ -242,7 +250,7 @@ class LockstepLoop:
             self.stats.sim_time = self.physics.time - t_sim_start
             self.stats.wall_time = now - t_wall_start
             if now >= t_status_next:
-                _log.info("%s", self.stats.summary())
+                _log.info("%s", self._summary())
                 t_status_next = now + cfg.status_interval_s
 
             if cfg.max_sim_time is not None and self.physics.time >= cfg.max_sim_time:
@@ -262,7 +270,12 @@ class LockstepLoop:
         self.running = False
         self.stats.sim_time = self.physics.time - t_sim_start
         self.stats.wall_time = time.monotonic() - t_wall_start
-        _log.info("loop stopped: %s", self.stats.summary())
+        _log.info("loop stopped: %s", self._summary())
+
+    def _summary(self) -> str:
+        """The loop's health line, plus the arm's when the model has one."""
+        arm = self.physics.arm_status()
+        return self.stats.summary() if arm is None else f"{self.stats.summary()} {arm.summary()}"
 
     def stop(self) -> None:
         self.running = False

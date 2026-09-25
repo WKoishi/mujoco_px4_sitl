@@ -638,6 +638,8 @@ mujoco_px4_sitl/
 │   ├── rotorconfig.py          conversion sidecar -> RotorModel (--rotors);
 │   │                           owns RotorSpec, shared with urdf_to_mjcf.py
 │   ├── sidechannel.py          UDP arm-command / ground-truth server
+│   ├── arm.py                  arm_cmd -> data.ctrl with its watchdog;
+│   │                           propeller clearance, reported not blocked
 │   └── viewer.py               optional mujoco.viewer, off by default
 ├── models/
 │   ├── quad_x.xml              phase 3-5 airframe (FLU body frame, §3.6)
@@ -671,6 +673,7 @@ mujoco_px4_sitl/
     ├── test_config.py          flag combinations that would fail silently
     ├── test_rotorconfig.py     sidecar parsing; the silent-at-runtime errors
     ├── test_urdf_to_mjcf.py    conversion + generated airframe, own fixtures
+    ├── test_arm.py             arm writer, watchdog, exact disc clearance
     └── test_loop.py            lockstep loop against a fake PX4
 ```
 
@@ -1096,7 +1099,7 @@ If EKF2 misbehaves here, work down §7 in order before touching EKF2 parameters.
 
 **Measured 2026-09-25 on the coaxial X8 + arm** (private model, airframe
 `22002_mujoco_x8` generated from the same sidecar, stock PX4 attitude gains, arm
-held at zero since `arm_cmd` does not reach the physics yet). Same procedure as
+held at zero, since `arm_cmd` did not reach the physics yet). Same procedure as
 the quad: passes, `ratio=1.000 brake=0 timeouts=0` throughout,
 `Landing detected` → `Disarmed by landing`, no failsafe.
 
@@ -1234,7 +1237,9 @@ criterion.
   profile with the quad's numbers (phase 5, "The X8"), on attitude gains the
   airframe generator derives for it.*
 - Arm joints driven from the side channel, position-controlled
-  (`MODELING_CONVENTIONS.md` §3.4). *Not done: `arm_cmd` is parsed and dropped.*
+  (`MODELING_CONVENTIONS.md` §3.4). *Done: `arm.py` writes `data.ctrl`, with a
+  command watchdog on simulated time and a propeller clearance check that
+  reports and never blocks (`README.md`, "Driving the arm").*
 - Expected physics coupling: the arm moves the composite CoM and adds reaction
   torques on the base. PX4 will see this as a disturbance, which is the point.
 - Investigate whether the arm needs its own control rate distinct from the
@@ -1242,7 +1247,47 @@ criterion.
 
 **Exit**: arm motion during hover produces a measurable, bounded attitude
 disturbance that PX4 rejects without losing position lock. Ground truth for
-both base and arm is available externally.
+both base and arm is available externally. *Half met: the disturbance is
+measured below; arm ground truth is not on the side channel (`AGENTS.md` §3).*
+
+#### Arm motion in hover
+
+**Measured 2026-09-25 on the coaxial X8 + arm**, airframe `22002_mujoco_x8` with
+its derived attitude gains, Offboard position hold at 3 m. Arm commands streamed
+over the side channel at 50 Hz with `state_time` echoed, cosine ramps over 3 s.
+Maxima against ground truth; position is the deviation from the mean of the
+still hover before the first move, which needs no datum correction.
+`ratio=1.000 brake=0 timeouts=0` throughout, no failsafe, landed and disarmed.
+
+| Segment | Roll | Pitch | Yaw | Horizontal | Vertical |
+|---|---|---|---|---|---|
+| still hover, arm at zero | 1.15° | 0.59° | 0.11° | 0.173 m | 0.128 m |
+| shoulder 0 → 90°, hold | 0.65° | 1.61° | 0.08° | 0.137 m | 0.099 m |
+| arm yaw 0 → +90°, arm out | 0.73° | 1.01° | 0.23° | 0.112 m | 0.076 m |
+| arm yaw +90° → −90° | 1.15° | 0.68° | 0.35° | 0.139 m | 0.129 m |
+| back to zero | 0.63° | 1.88° | 0.40° | 0.146 m | 0.134 m |
+| ramp, 3 s silence, resume | 1.00° | **7.83°** | 0.43° | 0.156 m | 0.080 m |
+| into a lower-deck disc, hold (second flight) | 1.26° | 0.93° | 0.46° | 0.246 m | 0.252 m |
+
+What is worth keeping from it:
+
+- **Planned moves are rejected without losing position lock**, within 2° of
+  attitude. The shoulder and arm-yaw moves stay inside the first flight's
+  still-hover spread; folding the arm back over a disc moves the CoM furthest
+  and cost 0.25 m, against 0.05–0.07 m of still hover in that flight. This half
+  of the exit criterion holds at this speed.
+- **The largest disturbance came from recovering from a stall.** The watchdog
+  froze the arm 0.50 s into the silence, a quarter of the way up a shoulder
+  ramp; the first command after it asked for the ramp's end, and the servo took
+  it as a step. After a stall a controller has to restart from the reached pose.
+- **The reached pose decides an intrusion, not the commanded one.** With the
+  provisional gains gravity pulls shoulder and elbow about 4° off target: one
+  pose commanded inside a disc ended 6.6 mm clear, another commanded just
+  inside sagged until the capsule's axis crossed it. That one was reported at
+  its start and its end, 7.3 s later, and nothing stopped it.
+- **Command age is measurable out of process, not reproducible.** `arm.cmd_age`
+  read 20 ms, one publish period, on every sample at 1×: wall-clock latency
+  (`AGENTS.md` §3).
 
 ---
 

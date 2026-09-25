@@ -18,6 +18,7 @@ from pymavlink.dialects.v20 import common as mavlink
 from mujoco_px4_sitl import hil
 from mujoco_px4_sitl.config import Config
 from mujoco_px4_sitl.loop import LockstepLoop
+from mujoco_px4_sitl.sidechannel import SCHEMA_VERSION, SideChannel
 from mujoco_px4_sitl.sim import StubPhysics
 from mujoco_px4_sitl.transport import HilServer
 
@@ -440,3 +441,55 @@ def test_stop_interrupts_the_wait_for_px4():
         assert loop.stats.frames == 0
     finally:
         server.close()
+
+
+# --- the side channel's arm path ------------------------------------------
+
+
+class RecordingPhysics(StubPhysics):
+    """The stub, noting when arm commands arrive relative to frame steps."""
+
+    def __init__(self, cfg: Config) -> None:
+        super().__init__(cfg)
+        self.events: list[tuple[str, float]] = []
+
+    def submit_arm_command(self, command) -> None:
+        self.events.append(("arm_cmd", self.time))
+
+    def step_frame(self, controls) -> None:
+        self.events.append(("step", self.time))
+        super().step_frame(controls)
+
+
+def test_arm_cmds_are_taken_every_frame_not_at_the_publish_rate():
+    """Ground truth goes out every fifth frame; an arm_cmd must not wait for it.
+
+    Polling only when publishing would hold a command for up to 20 ms -- a delay
+    no controller asked for, and one the research could not tell from its own.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    cfg = make_config(sidechannel_enabled=True, max_sim_time=0.1)
+    assert cfg.imu_rate_hz / cfg.sidechannel_rate_hz == 5
+    channel = SideChannel("127.0.0.1", port)
+    physics = RecordingPhysics(cfg)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.sendto(
+                b'{"v": %d, "type": "arm_cmd", "values": [0.1]}' % SCHEMA_VERSION,
+                ("127.0.0.1", port),
+            )
+            deadline = time.monotonic() + 1.0
+            while not select_readable(channel.sock) and time.monotonic() < deadline:
+                time.sleep(0.001)
+            LockstepLoop(cfg, physics, ScriptedServer(), channel).run()
+    finally:
+        channel.close()
+    assert physics.events[:2] == [("arm_cmd", 0.0), ("step", 0.0)]
+
+
+def select_readable(sock: socket.socket) -> bool:
+    import select
+
+    return bool(select.select([sock], [], [], 0.0)[0])

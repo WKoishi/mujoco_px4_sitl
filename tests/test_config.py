@@ -117,3 +117,24 @@ def test_passing_both_a_rotor_model_and_a_sidecar_is_rejected(tmp_path):
     cfg = Config(stub_physics=True, rotors_path=sidecar)
     with pytest.raises(ValueError, match="both a RotorModel and --rotors"):
         run(cfg, RotorModel(spin=(1, -1, 1, -1)))
+
+
+def test_arm_watchdog_flags_reach_the_config():
+    cfg = config_from_args(
+        ["--stub-physics", "--arm-timeout", "0.2", "--arm-on-timeout", "limp"]
+    )
+    assert cfg.arm_timeout_s == 0.2
+    assert cfg.arm_on_timeout == "limp"
+
+
+def test_the_arm_watchdog_is_on_by_default():
+    """A crashed controller must not leave the arm on its last command forever
+    unless someone asked for exactly that with --arm-timeout 0."""
+    cfg = config_from_args(["--stub-physics"])
+    assert cfg.arm_timeout_s > 0.0
+    assert cfg.arm_on_timeout == "freeze"
+
+
+def test_an_unknown_timeout_action_is_rejected_by_the_cli():
+    with pytest.raises(SystemExit):
+        config_from_args(["--stub-physics", "--arm-on-timeout", "hold"])

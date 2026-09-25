@@ -7,7 +7,13 @@ and read state without touching this repo's internals.
 
 JSON first, as the plan specifies: swap for a packed binary format only if
 profiling says so. The ``v`` field is the schema version; bump it on any
-incompatible change.
+incompatible change. Optional fields added since v1 -- ``arm_cmd.state_time``
+and ``ground_truth.arm`` -- are ignorable by an older peer, so they did not.
+
+Inbound is polled every frame and outbound published at ``sidechannel_rate_hz``.
+The asymmetry is deliberate: polling at the publish rate would hold an arriving
+``arm_cmd`` for up to one publish period, a delay no controller asked for and
+the research could not tell from its own.
 """
 
 from __future__ import annotations
@@ -16,26 +22,17 @@ import json
 import logging
 import select
 import socket
-from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .arm import ArmCommand, ArmStatus
 from .sim import SimState
 
 _log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 _MAX_DATAGRAM = 65507
-
-
-@dataclass
-class ArmCommand:
-    """Latest joint command received from the side channel."""
-
-    seq: int = 0
-    mode: str = "position"  # "position" | "torque"
-    values: NDArray[np.float64] = field(default_factory=lambda: np.zeros(0))
 
 
 class SideChannel:
@@ -47,7 +44,9 @@ class SideChannel:
         self.sock.bind((host, port))
         self.sock.setblocking(False)
         self.subscribers: set[tuple[str, int]] = set()
-        self.arm_command = ArmCommand()
+        self._arm_commands: list[ArmCommand] = []
+        self._arm_seq = 0
+        self._arm_malformed = 0
         self._seq = 0
         _log.info("side channel on udp://%s:%d (schema v%d)", host, port, SCHEMA_VERSION)
 
@@ -58,6 +57,14 @@ class SideChannel:
             pass
 
     # -- inbound ------------------------------------------------------------
+
+    def poll(self) -> list[ArmCommand]:
+        """Handle every pending datagram; return the ``arm_cmd``s in arrival
+        order. All of them, not only the newest: ordering by ``state_time`` is
+        the servos' decision, and they can only make it if they see each one."""
+        self._arm_commands = []
+        self._poll()
+        return self._arm_commands
 
     def _poll(self) -> None:
         while True:
@@ -93,17 +100,40 @@ class SideChannel:
             self.subscribers.discard(addr)
             _log.info("side channel: %s:%d unsubscribed", *addr)
         elif kind == "arm_cmd":
-            values = msg.get("values", [])
-            if not isinstance(values, list):
-                _log.warning("side channel: arm_cmd.values must be a list")
-                return
-            self.arm_command = ArmCommand(
-                seq=int(msg.get("seq", self.arm_command.seq + 1)),
-                mode=str(msg.get("mode", "position")),
-                values=np.asarray(values, dtype=np.float64),
-            )
+            command = self._parse_arm_cmd(msg, addr)
+            if command is not None:
+                self._arm_commands.append(command)
         else:
             _log.warning("side channel: unknown message type %r from %s:%d", kind, *addr)
+
+    def _parse_arm_cmd(self, msg: dict, addr: tuple[str, int]) -> ArmCommand | None:
+        """Type-check an ``arm_cmd``. Returns None, and warns, if it is malformed.
+
+        Every conversion is guarded: this runs inside the lockstep loop, and an
+        exception here -- a string among the values was enough -- would take the
+        simulator, and PX4's clock with it, down.
+        """
+        values = msg.get("values", [])
+        state_time = msg.get("state_time")
+        mode = msg.get("mode", "position")
+        try:
+            if not isinstance(values, list):
+                raise ValueError("values must be a list")
+            if not isinstance(mode, str):
+                raise ValueError("mode must be a string")
+            array = np.asarray(values, dtype=np.float64)
+            if array.ndim != 1:
+                raise ValueError("values must be a flat list of numbers")
+            seq = int(msg.get("seq", self._arm_seq + 1))
+            state_time = None if state_time is None else float(state_time)
+        except (TypeError, ValueError) as exc:
+            self._arm_malformed += 1
+            if self._arm_malformed <= 3 or self._arm_malformed % 100 == 0:
+                _log.warning("side channel: malformed arm_cmd from %s:%d (%s; %d so far)",
+                             *addr, exc, self._arm_malformed)
+            return None
+        self._arm_seq = seq
+        return ArmCommand(seq=seq, mode=mode, values=array, state_time=state_time)
 
     # -- outbound -----------------------------------------------------------
 
@@ -118,11 +148,12 @@ class SideChannel:
                 _log.warning("side channel: dropping %s:%d (%s)", *addr, exc)
                 self.subscribers.discard(addr)
 
-    def serve(self, state: SimState, controls: NDArray[np.float64]) -> None:
-        """Handle inbound datagrams, then publish ground truth. Call per tick."""
-        self._poll()
+    def publish(
+        self, state: SimState, controls: NDArray[np.float64], arm: ArmStatus | None = None
+    ) -> None:
+        """Publish one ``ground_truth``. ``arm`` adds the ``arm`` block."""
         self._seq += 1
-        self._publish({
+        payload = {
             "v": SCHEMA_VERSION,
             "type": "ground_truth",
             "seq": self._seq,
@@ -136,4 +167,17 @@ class SideChannel:
             "accel_frd": [round(float(v), 6) for v in state.accel_frd],
             "geodetic": [state.lat_deg, state.lon_deg, round(state.alt_m, 4)],
             "actuators": [round(float(v), 6) for v in controls],
-        })
+        }
+        if arm is not None:
+            # Command bookkeeping and clearance, not joint state: whether an
+            # out-of-process controller should get qpos is the topology question
+            # of AGENTS.md section 3, not a field to add here.
+            payload["arm"] = {
+                "cmd_seq": arm.cmd_seq,
+                "cmd_age": None if arm.cmd_age is None else round(arm.cmd_age, 6),
+                "cmd_stale": arm.cmd_stale,
+                "prop_clearance": (
+                    None if arm.prop_clearance is None else round(arm.prop_clearance, 6)
+                ),
+            }
+        self._publish(payload)

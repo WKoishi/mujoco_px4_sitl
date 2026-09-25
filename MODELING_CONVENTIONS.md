@@ -67,12 +67,23 @@ as yaw drift. `spin` is geometry and cannot be inferred, so its length is what
 declares the expected rotor count; `build_physics` takes the `RotorModel` that
 carries it.
 
-### 2.3 The arm: commands never reach the physics
+### 2.3 The arm: position servos and propeller discs
 
-The side channel parses `arm_cmd` into `ArmCommand(mode, values)`
-([sidechannel.py:95-103](src/mujoco_px4_sitl/sidechannel.py#L95-L103)), but
-**nothing in `src/` writes `data.ctrl`** — the command is received and dropped.
-Phase 7 work.
+`arm_cmd.values[i]` drives `arm_act{i}` through `data.ctrl`
+([arm.py](src/mujoco_px4_sitl/arm.py)). A model has to provide:
+
+- **Unit-gear position servos on joints** (gain `kp`, bias `[0, -kp, -kv]`), or
+  the load fails: a motor would take an angle as a torque, a geared servo would
+  scale it. Torque and velocity interfaces are not simulated yet (`AGENTS.md` §2).
+- **Contiguous indices from 0.** An actuator past a gap is named in a load
+  warning and never written.
+- **Its home in `qpos0`**: the servos hold the initial pose until the first
+  command.
+
+Propeller clearance runs from the rotor sites' discs (§3.3) to the arm's
+collision capsules and spheres; other shapes on the arm are named in a load
+warning and skipped. The command watchdog belongs to the simulated driver, not
+the model (`README.md`).
 
 ### 2.4 Auto-calibrated `c_t` is the fallback when motors are unchosen
 
@@ -262,9 +273,14 @@ CAD mesh; collision uses hand-written primitives.
 | IMU sensors | `imu_accel` / `imu_gyro` | yes |
 | arm joints | `arm_joint0` … | no |
 | arm links | `arm_link0` … | no |
-| arm actuators | `arm_act0` … | no |
+| arm actuators | `arm_act0` … | yes (prefix + 0-based, contiguous; `arm_cmd` indexes them) |
 
 The arm is 0-based to match the rotors and PX4.
+
+**A rotor site may be a disc**: `type="cylinder"`, `size[0]` the propeller
+radius, the site's xy-plane the flat disc; `size[1]` only draws. The conversion
+emits it from the sidecar's `radius`. A point site still carries thrust but is
+not checked, and a model with an arm and no discs says so at load.
 
 ### 3.4 Arm joints
 
@@ -321,8 +337,9 @@ against a known-good official airframe.
 **`PZ` produces no torque.** The height difference between the upper and lower
 rotors contributes **nothing** to roll or pitch in this thrust model — thrust is
 along body +z, and `r × [0,0,T]` only uses `r`'s x and y components. PX4's
-allocator behaves the same way. `CA_ROTOR*_PZ` and the site z coordinate are
-documentation only.
+allocator behaves the same way, and the generated airframe writes no
+`CA_ROTOR*_PZ`. The site z does place the propeller disc (§3.3), so it is the
+blade plane.
 
 **A coaxial pair's `KM` values have opposite signs**, so driving one pair's upper
 and lower rotors differentially produces pure yaw torque with no roll or pitch. An

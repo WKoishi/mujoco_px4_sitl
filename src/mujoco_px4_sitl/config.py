@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .arm import TIMEOUT_ACTIONS
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = _REPO_ROOT / "models" / "quad_x.xml"
 
@@ -57,6 +59,16 @@ class Config:
     # placeholder motors. The filled sidecar for the X8 lives in the private
     # repo alongside its MJCF (AGENTS.md section 4).
     rotors_path: Path | None = None
+
+    # --- Arm command watchdog ----------------------------------------------
+    # How old the arm command in force may get, in *simulated* seconds, before
+    # arm_on_timeout applies. Simulated because it models the arm driver on the
+    # vehicle, whose clock is ours: a lockstep stall must not trip it. 0 turns
+    # the watchdog off, which is the "servo bus with no watchdog" case -- and
+    # what a crashed controller then leaves behind is its last command, forever.
+    arm_timeout_s: float = 0.5
+    # "keep" | "freeze" | "limp"; see arm.TIMEOUT_ACTIONS.
+    arm_on_timeout: str = "freeze"
 
     # --- Phase 3 open-loop bring-up ----------------------------------------
     # Pin the vehicle so ground truth moves only in ways we dictate.
@@ -117,6 +129,12 @@ class Config:
             raise ValueError("max_lead_frames must be >= 1")
         if self.brake_timeout_s <= 0.0:
             raise ValueError("brake_timeout_s must be > 0 (wall clock)")
+        if self.arm_timeout_s < 0.0:
+            raise ValueError("arm_timeout_s must be >= 0 (0 disables the watchdog)")
+        if self.arm_on_timeout not in TIMEOUT_ACTIONS:
+            raise ValueError(
+                f"arm_on_timeout {self.arm_on_timeout!r} not in {TIMEOUT_ACTIONS}"
+            )
         if self.inject_attitude is not None and not self.hold_pose:
             # Without the pin, physics integrates the injected attitude away
             # immediately, so the flag would silently do nothing (plan phase 3
@@ -197,6 +215,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="wall-clock brake timeout in seconds (default: %(default)s)")
     p.add_argument("--status-interval", dest="status_interval_s", type=float, default=5.0,
                    help="seconds between sim/wall ratio log lines (default: %(default)s)")
+    p.add_argument(
+        "--arm-timeout", dest="arm_timeout_s", type=float, default=0.5,
+        help=(
+            "simulated seconds an arm_cmd stays in force; measured from its "
+            "state_time if it carries one, else from arrival. 0 disables the "
+            "watchdog (default: %(default)s)"
+        ),
+    )
+    p.add_argument(
+        "--arm-on-timeout", dest="arm_on_timeout", choices=TIMEOUT_ACTIONS,
+        default="freeze",
+        help=(
+            "what the arm servos do when arm_cmd goes stale: keep the last "
+            "target, freeze where they are, or go limp (default: %(default)s)"
+        ),
+    )
     p.add_argument("--stub-physics", action="store_true",
                    help="phase 1: hardcoded level-hover state, no mj_step")
     p.add_argument("--hold-pose", action="store_true",

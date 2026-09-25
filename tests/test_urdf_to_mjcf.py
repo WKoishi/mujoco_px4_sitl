@@ -868,3 +868,73 @@ def test_yaw_rate_limit_is_hover_yaw_acceleration_over_the_attitude_gain(rig, tm
     expected = np.degrees(torque / 0.035 / 2.8)
     assert expected < 200.0  # the case under test: the limit binds
     assert f"MC_YAWRATE_MAX {expected:.1f}" in out.read_text()
+
+
+# --- propeller discs ------------------------------------------------------
+
+
+def _with_radius(data: dict, radius: float | list[float | None]) -> dict:
+    radii = radius if isinstance(radius, list) else [radius] * len(data["rotors"])
+    for rotor, value in zip(data["rotors"], radii):
+        if value is not None:
+            rotor["radius"] = value
+    return data
+
+
+def test_a_rotor_radius_becomes_a_disc_shaped_site(rig):
+    """What the simulator's clearance check reads. The site keeps its position,
+    so thrust is unchanged; it only gains a shape."""
+    path, data = rig
+    model, result = _convert(_write(path, _with_radius(data, 0.1)))
+    assert not result.failures, result.lines
+    for index in range(4):
+        site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"rotor{index}")
+        assert int(model.site_type[site]) == mujoco.mjtGeom.mjGEOM_CYLINDER
+        assert model.site_size[site, 0] == pytest.approx(0.1)
+        assert model.site_pos[site] == pytest.approx(data["rotors"][index]["pos"])
+    assert any("propeller discs, R = 0.1000 m" in line for line in result.lines)
+
+
+def test_without_a_radius_the_arm_goes_unchecked_and_the_check_says_so(rig):
+    path, _ = rig
+    _, result = _convert(path)
+    assert any("cannot detect the arm entering a propeller disc" in w for w in result.warnings)
+
+
+def test_a_radius_on_some_rotors_only_fails(rig):
+    path, data = rig
+    _, result = _convert(_write(path, _with_radius(data, [0.1, 0.1, None, 0.1])))
+    assert any("radius given for some rotors but not [2]" in f for f in result.failures)
+
+
+def test_a_diameter_given_as_a_radius_fails_as_overlapping_blades(rig):
+    """Hubs 0.4 m apart cannot carry 0.25 m blades; the overlap is the tell."""
+    path, data = rig
+    _, result = _convert(_write(path, _with_radius(data, 0.25)))
+    assert any("blades would strike each other" in f for f in result.failures)
+
+
+def test_a_zero_radius_is_rejected(rig):
+    path, data = rig
+    with pytest.raises(ValueError, match="radius must be > 0"):
+        _convert(_write(path, _with_radius(data, 0.0)))
+
+
+def test_the_clearance_survey_reports_how_much_of_the_envelope_reaches_a_disc(
+    rig, monkeypatch
+):
+    """The rig's arm yaws a capsule 10 mm below the disc plane, so every pose
+    that swings it over a disc is an intrusion 10 mm deep: capsule radius 20 mm
+    minus the gap. Uses the simulator's own check, so the number is the one a
+    flight would report."""
+    monkeypatch.setattr(u2m, "CLEARANCE_SURVEY_POSES", 400)
+    path, data = rig
+    data = _with_radius(data, 0.1)
+    data["collisions"].append({
+        "name": "arm_link0_col", "type": "capsule", "body": "arm_link0",
+        "fromto": [0.0, 0.0, -0.01, 0.2, 0.0, -0.01], "size": [0.02],
+    })
+    _, result = _convert(_write(path, data))
+    survey = [w for w in result.warnings if "poses inside the joint limits" in w]
+    assert len(survey) == 1, result.lines
+    assert "deepest 10.0 mm (arm_link0_col in rotor" in survey[0]
