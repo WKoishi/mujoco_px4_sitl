@@ -241,14 +241,30 @@ deterministic. Three legs stay wall-clock in any topology:
   (`mavlink_receiver.cpp:1640`, `:3180`). Nothing orders it against our next
   `HIL_SENSOR`, which arrives on another socket.
 
-**Phase 2, deferred:** let the host own the MAVLink link to PX4, send setpoints
-before the next `HIL_SENSOR`, and hold the loop until an estimate of the needed
-sample time has arrived. Whether PX4 processes a setpoint before that frame can
-be ensured at all is unverified; probe it before designing on it. Waiting for
-PX4's output every frame would fix the first leg at the cost of a brake timeout
-per frame PX4 skips. In flight that is cheap -- PX4 answered 39978 of 40000
-frames, about 1 s of 50 ms timeouts in 160 s -- but boot and disarm skip far
-more, and whether each answer belongs to that frame is unchecked.
+**Phase 2, deferred.** Probe PX4 before designing. Each leg should end up
+chosen, measured exactly, or wall-clock, with evidence from source or a flight:
+
+- **Setpoints.** Does a setpoint sent before our next `HIL_SENSOR` reach uORB
+  before PX4 runs that frame, and can anything prove it while PX4's clock is
+  frozen? If so, the host can own the MAVLink link to PX4 and send setpoints on
+  simulated time.
+- **Estimates.** Can the loop wait for the `ODOMETRY` of a chosen sample time
+  without deadlock, that is, does PX4 send it before it needs the next frame?
+- **IMU → actuator.** Waiting for PX4's output every frame costs a brake timeout
+  per frame PX4 skips. In flight that is cheap -- PX4 answered 39978 of 40000
+  frames, about 1 s of 50 ms timeouts in 160 s -- but boot and disarm skip far
+  more, and `IMPLEMENTATION_PLAN.md` §3.2's startup deadlock still applies.
+  `time_usec` alone does not prove an answer was computed from that frame.
+- **Reproducibility.** How far apart are two runs once all three hold? PX4's own
+  threads may still interleave differently within a tick. Comparing runs also
+  needs arming and takeoff issued at simulated times: a wall-clocked GCS script
+  arms at different instants.
+- **Speed.** Where `speed_factor` tops out once the loop waits on PX4. The
+  research wants batches faster than real time.
+
+Leave room for the uXRCE-DDS thrust/torque interface. Where a leg cannot be made
+deterministic, keep exact measurement and record why. A probe that starts PX4
+itself meets the exit trap in `IMPLEMENTATION_PLAN.md` §7.
 
 ---
 
