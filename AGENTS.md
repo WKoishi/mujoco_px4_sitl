@@ -119,6 +119,18 @@ when the first fresh command landed as a step and cost 7.8° of pitch**. Servo
 droop moved reached poses across a disc in both directions, so **the commanded
 pose does not predict an intrusion**.
 
+**The research controller runs in process** ([control.py](src/mujoco_px4_sitl/control.py),
+decided in §3), and has flown the X8. It is called from the lockstep loop at
+chosen sample instants of simulated time; its arm command lands after a chosen
+delay, less a seeded drop schedule, so the command age has a known bound. It
+reads the arm's encoders and PX4's EKF2 estimate over MAVLink
+([px4link.py](src/mujoco_px4_sitl/px4link.py)), the path a companion computer
+uses. Ground truth goes only to a recorder. `run_sitl.sh --px4-only` starts PX4
+for it. Two flights under one schedule (`IMPLEMENTATION_PLAN.md` phase 7) gave
+identical sample instants and drops and a bit-identical arm trajectory until
+arming, while the median estimate age went from 8 ms to 4 ms. **The arm leg is
+chosen; the PX4 legs are only measured.**
+
 ---
 
 ## 2. What is not implemented
@@ -128,11 +140,12 @@ pose does not predict an intrusion**.
 | **`--hold-pose` makes the arm weightless** | `_pin_pose` restores the base only between frames, so within one the vehicle free-falls | no droop, and a `limp` arm does not fall. Phase 3's IMU table is unaffected; testing the arm on a pinned vehicle is not. `tests/test_arm.py` welds the base instead. The fix is a support wrench at the subtree CoM |
 | Propeller clearance is idealized | `PropellerMonitor` in [arm.py](src/mujoco_px4_sitl/arm.py) | flat discs (the real sweep is about ±7 mm thick at the root), capsules and spheres only, once per IMU frame, against collision primitives fitted by eye (§4). The conversion's envelope survey is kinematic, so droop can move its poses across a disc either way. Margin is the consumer's to add |
 | Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
-| No arm joint state on the side channel | `ground_truth.arm` carries command age, staleness and propeller clearance, not `qpos` | an out-of-process controller is flying blind on the arm. Whether to add it is §3's topology decision, not a missing field |
+| Arm joint state reaches only an in-process controller | `ground_truth.arm` carries command age, staleness and propeller clearance, not `qpos` | an out-of-process consumer (a ROS 2 bridge, a plot) sees no joints. No longer a controller problem (§3); add it to the side channel when a monitoring consumer needs it |
+| Arm encoders are ideal | `JointReading` in [arm.py](src/mujoco_px4_sitl/arm.py) is MuJoCo's joint state at the sample instant | no quantisation, noise or latency on the controller's joint feedback. Model them from the servo's datasheet once it is chosen |
 | Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `arm.py` refuses any other kind, and rejects `mode: "torque"` | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too, and decide intrusions as well as tracking: their gravity droop moved reached poses across a disc (§1) |
-| No reproducible feedback delay | out of process the delay is wall clock (§3, the research-controller boundary), now measured by `arm.cmd_age` when commands echo `state_time`; in process `run(cfg, rotors=...)` exists, but `step_frame` calls no controller and holds no delay buffer | an argument that bounds data age cannot be tested at a chosen age. An in-process arm controller with configurable sample, hold and drop would give that on the arm. PX4-side setpoints still arrive over MAVLink or DDS outside lockstep, so their delay can only be measured |
+| Only the arm leg's delay is chosen | `control.py` schedules sample, delay and drops on simulated time. Which EKF2 estimate has arrived by a sample, PX4's IMU → actuator response, and setpoints the controller sends PX4 are wall-clock (§3) | a data-age argument can be tested at a chosen age on the arm. On the base, `estimate_age` and `px4_lag` measure the age exactly but cannot set it, so runs differ (median estimate age 8 ms, then 4 ms, under one schedule). Phase 2 of §3 |
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's home pose | an arm that moves in flight changes the inertia and the gains do not follow. Rigid-arm inertia is what the Phase 7 disturbance test starts from, so it is the right starting point, not the whole answer |
-| IMU has no noise or bias | `sim.py` sends MuJoCo's ideal accel/gyro, and PX4's `simulator_mavlink` only quantizes them (`SimulatorMavlink.cpp:198-270`): under MAVLink HIL the simulator owns IMU noise. Baro, mag and GPS do get noise, from PX4's `sensor_*_sim` | EKF2's bias estimation is never exercised, and estimate errors look better than they will be. The derived attitude gains were verified on a noiseless gyro, and noise is what the rate D term suffers from, so re-fly the step tests once it lands. Add white noise and a bias random walk on the `HIL_SENSOR` path only, sized from the chosen IMU's datasheet: `SimState.gyro_frd` also feeds ground truth (`HIL_STATE_QUATERNION`, the side channel), which must stay clean |
+| IMU has no noise or bias | `sim.py` sends MuJoCo's ideal accel/gyro, and PX4's `simulator_mavlink` only quantizes them (`SimulatorMavlink.cpp:198-270`): under MAVLink HIL the simulator owns IMU noise. Baro, mag and GPS do get noise, from PX4's `sensor_*_sim` | EKF2's bias estimation is never exercised, and estimate errors look better than they will be -- including the estimate an in-process controller is handed. The derived attitude gains were verified on a noiseless gyro, and noise is what the rate D term suffers from, so re-fly the step tests once it lands. Add white noise and a bias random walk on the `HIL_SENSOR` path only, sized from the chosen IMU's datasheet: `SimState.gyro_frd` also feeds ground truth (`HIL_STATE_QUATERNION`, the side channel), which must stay clean |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
 | Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (`MODELING_CONVENTIONS.md` §5 suggests 0.75–0.85). Deliberately deferred so the first X8 flight introduces one unverified quantity, not two: it moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75, so the sidecar's `c_t` and the airframe must change together |
 | No uXRCE-DDS agent or `px4_msgs` on this machine | PX4's side is ready: `px4_sitl_default` starts `uxrce_dds_client` on UDP 8888, subscribed to `/fmu/in/vehicle_thrust_setpoint` and `/fmu/in/vehicle_torque_setpoint`, and nothing on the host answers | the normalized thrust/torque interface has no MAVLink offboard path in v1.17, so it cannot be flown until an agent and `px4_msgs` are installed. Attitude and body-rate setpoints work over MAVLink today. Environment rather than code: `src/` stays free of ROS imports (§6) |
@@ -184,11 +197,11 @@ rate loop needs none of it.
 
 Driving the arm is **done** (§1). A future writer that applies forces to the
 arm owns its own clearing: `clear()` zeros only `base_link`'s `xfrc_applied`.
+The research-controller topology is **decided and its first phase built** (below).
 What remains:
 
-1. **The research-controller topology** (below). Joint state for the
-   controller and a reproducible feedback delay are both blocked on it, and it
-   is the research's decision, not a code task.
+1. **Phase 2 of the topology: the PX4 legs**, deferred until phase 1 has been
+   used. Decide it with the research, not before (below).
 2. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
    separable from the others. It moves the plant gain as well as the hover
    point, so regenerate the airframe and fly the attitude steps again.
@@ -196,31 +209,46 @@ What remains:
 Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
 exit criterion; `RotorState.omega` is what makes them expressible.
 
-### The research-controller boundary, decided once
+### The research-controller boundary
 
-The X8 is driven from a launcher in the private repo (`sim/run_x8.py`) that sets
-`MUJOCO_SITL_ROTORS` and calls `run_sitl.sh`. So the research code is **out of
-process** and sees only the side channel.
+**Decided 2026-09-25: in process.** The research controller is called
+synchronously from the lockstep loop (`control.py`), and `sim/run_x8.py` in the
+private repo starts PX4 with `run_sitl.sh --px4-only` and the simulator with
+`run(cfg, controller=...)`. The controller takes the base state from PX4's EKF2
+over MAVLink, as on the vehicle, not from MuJoCo. The requirements behind it
+are the research's: data-age bounds tested at a *chosen* age, counterfactual
+comparisons under identical timing, stalls injected by design, and batches
+faster than real time. Out of process, all four could only be measured.
 
-That choice buys isolation — a slow solver cannot stall lockstep — and sells two
-things. Both are inherent to the process boundary, not schema gaps:
+**What the earlier out-of-process reasoning got wrong.** It was chosen for
+isolation, "a slow solver cannot stall lockstep". But under lockstep a stall is
+harmless to PX4: its clock only advances with our `HIL_SENSOR`, and
+`SimulatorMavlink`'s 1 s wall-clock `poll` timeout only logs. The real costs of
+a synchronous controller are the sim/wall ratio and the pacer's catch-up burst
+after a slow call, which widens PX4's lead. The loop now removes the
+controller's time from its pacing, so only the ratio remains.
 
-- **Determinism.** `poll()` and `publish()` never wait, so the feedback delay
-  is wall-clock and unreproducible. `arm.cmd_age` measures it when the
-  controller echoes `state_time`; nothing can choose it. `brake` and `timeouts`
-  watch the PX4 side, not this one.
-- **Speed.** `frame_wall_dt = imu_dt / speed_factor`, so at 5× the controller's
-  unchanged wall-clock latency becomes 5× the sim-time delay. An out-of-process
-  controller cannot batch experiments faster than real time.
+**What in process does not fix: the PX4 legs.** Only the arm leg became
+deterministic. Three legs stay wall-clock in any topology:
 
-Only an in-process controller called *synchronously inside* `step_frame` recovers
-both, and it pays §6's price: a slow solver then shows up as PX4-side brake and
-timeout counts. `run(cfg, rotors=...)` in `main.py` already accepts a built
-`RotorModel` for that form, which is the hook and not the feature.
+- **IMU → actuator.** The brake lets us run up to `max_lead_frames` ahead, so
+  which of PX4's outputs a frame uses depends on wall timing. `px4_lag` on the
+  status line measures it: 1 frame on about 64 % of frames, at most 2, in flight.
+- **Estimates.** PX4 schedules `ODOMETRY` on its clock, but the datagram arrives
+  on ours. `estimate_age` is still exact, since it carries EKF2's sample time.
+- **Setpoints.** PX4's MAVLink receiver reads its socket on a wall-clock `poll`
+  and stamps a setpoint with the simulated time of arrival
+  (`mavlink_receiver.cpp:1640`, `:3180`). Nothing orders it against our next
+  `HIL_SENSOR`, which arrives on another socket.
 
-**So when the arm controller needs joint state, that is a topology decision, not
-a request for JSON fields.** Adding `qpos` to `SimState` is easy and does not fix
-either bullet above.
+**Phase 2, deferred:** let the host own the MAVLink link to PX4, send setpoints
+before the next `HIL_SENSOR`, and hold the loop until an estimate of the needed
+sample time has arrived. Whether PX4 processes a setpoint before that frame can
+be ensured at all is unverified; probe it before designing on it. Waiting for
+PX4's output every frame would fix the first leg at the cost of a brake timeout
+per frame PX4 skips. In flight that is cheap -- PX4 answered 39978 of 40000
+frames, about 1 s of 50 ms timeouts in 160 s -- but boot and disarm skip far
+more, and whether each answer belongs to that frame is unchecked.
 
 ---
 
@@ -371,10 +399,11 @@ launch line is worth stating once:
 source ../.venv/bin/activate && make -C ../PX4-Autopilot px4_sitl_default
 
 # Then, from the private repo:
-python sim/run_x8.py            # sets MUJOCO_SITL_ROTORS, calls run_sitl.sh
+python sim/run_x8.py            # PX4 via run_sitl.sh --px4-only; simulator and
+                                # research controller in this process
 ```
 
-Equivalently, by hand:
+Without a controller, driving the arm over the side channel instead:
 
 ```sh
 MUJOCO_SITL_ROTORS=~/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml \

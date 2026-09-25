@@ -1,8 +1,9 @@
-"""CLI entry point.
+"""CLI entry point, and :func:`run` for in-process callers.
 
 Launchable as ``python -m mujoco_px4_sitl``, as the ``mujoco-px4-sitl`` script,
 or from a ROS 2 launch file via ``ExecuteProcess`` -- no ROS 2 code here (plan
-section 1).
+section 1). A research script that brings its own controller calls :func:`run`
+instead, and starts PX4 with ``run_sitl.sh --px4-only``.
 """
 
 from __future__ import annotations
@@ -10,10 +11,14 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+from collections.abc import Callable
 from types import FrameType
 
 from .config import Config, config_from_args
+from .control import Controller, ControllerHost, Sample, Schedule
+from .frames import GeodeticProjection
 from .loop import LockstepLoop
+from .px4link import EstimateLink
 from .rotorconfig import load_rotors
 from .sidechannel import SideChannel
 from .sim import MujocoPhysics, build_physics
@@ -24,7 +29,8 @@ _log = logging.getLogger("mujoco_px4_sitl")
 _PROG = "mujoco_px4_sitl"
 
 
-def _configure_logging(level: str) -> None:
+def configure_logging(level: str) -> None:
+    """The CLI's log format; an in-process caller may use it too."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
@@ -32,15 +38,29 @@ def _configure_logging(level: str) -> None:
     )
 
 
-def run(cfg: Config, rotors: RotorModel | None = None) -> int:
+def run(
+    cfg: Config,
+    rotors: RotorModel | None = None,
+    *,
+    controller: Controller | None = None,
+    schedule: Schedule | None = None,
+    recorder: Callable[[Sample], None] | None = None,
+) -> int:
     """Run the simulator. ``rotors`` overrides ``cfg.rotors_path``.
 
-    Two ways in, because there are two callers. The CLI gives a sidecar path and
-    this function parses it. An in-process driver -- a research script that wants
-    ``MjData`` rather than the side channel -- passes a built ``RotorModel`` and
-    skips the file entirely. Passing both is a contradiction rather than a
+    Two ways to give rotors, because there are two callers. The CLI gives a
+    sidecar path and this function parses it; an in-process driver may pass a
+    built ``RotorModel`` instead. Passing both is a contradiction rather than a
     precedence question, so it raises.
+
+    ``controller`` runs in this process, synchronously, on ``schedule``; it reads
+    PX4's estimate over MAVLink and drives the arm. ``recorder`` receives each
+    sample with ground truth attached (:mod:`control`).
     """
+    if controller is None and (schedule is not None or recorder is not None):
+        raise ValueError("a schedule or recorder without a controller does nothing")
+    if controller is not None and schedule is None:
+        raise ValueError("an in-process controller needs a Schedule")
     _log.info(
         "mujoco_px4_sitl instance %d: HIL tcp://%s:%d%s",
         cfg.instance, cfg.hil_bind_host, cfg.hil_port,
@@ -65,15 +85,26 @@ def run(cfg: Config, rotors: RotorModel | None = None) -> int:
     # collision is reported immediately rather than after MuJoCo has loaded.
     server = HilServer(cfg.hil_bind_host, cfg.hil_port)
     sidechannel = None
+    estimates = None
+    host = None
     try:
         physics = build_physics(cfg, rotors)
         if cfg.sidechannel_enabled:
             sidechannel = SideChannel(cfg.sidechannel_bind_host, cfg.sidechannel_port)
+        if controller is not None:
+            estimates = EstimateLink("127.0.0.1", cfg.px4_api_port, cfg.px4_estimate_rate_hz)
+            host = ControllerHost(
+                controller, schedule, cfg.imu_dt, estimates=estimates,
+                home=GeodeticProjection(cfg.home_lat, cfg.home_lon, cfg.home_alt),
+                recorder=recorder,
+            )
+            _log.info("%s", host.describe(cfg.arm_timeout_s))
     except BaseException:
-        # Nothing is running yet, but the listening socket is already bound and
-        # would outlive us as a leaked fd, holding the port against a retry.
-        if sidechannel is not None:
-            sidechannel.close()
+        # Nothing is running yet, but the listening sockets are already bound and
+        # would outlive us as leaked fds, holding the ports against a retry.
+        for sock in (estimates, sidechannel):
+            if sock is not None:
+                sock.close()
         server.close()
         raise
 
@@ -88,7 +119,7 @@ def run(cfg: Config, rotors: RotorModel | None = None) -> int:
         else:
             _log.warning("--viewer has nothing to show with --stub-physics")
 
-    loop = LockstepLoop(cfg, physics, server, sidechannel, frame_hook)
+    loop = LockstepLoop(cfg, physics, server, sidechannel, frame_hook, host)
 
     def _shutdown(signum: int, _frame: FrameType | None) -> None:
         _log.info("signal %d received, shutting down", signum)
@@ -104,6 +135,8 @@ def run(cfg: Config, rotors: RotorModel | None = None) -> int:
     finally:
         if view is not None:
             view.close()
+        if estimates is not None:
+            estimates.close()
         if sidechannel is not None:
             sidechannel.close()
         server.close()
@@ -118,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         # crash: report it the way argparse reports a bad argument.
         print(f"{_PROG}: error: {exc}", file=sys.stderr)
         return 2
-    _configure_logging(cfg.log_level)
+    configure_logging(cfg.log_level)
     return run(cfg)
 
 

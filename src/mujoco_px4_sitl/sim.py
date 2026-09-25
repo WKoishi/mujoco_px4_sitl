@@ -20,7 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import frames
-from .arm import ArmCommand, ArmServos, ArmStatus, PropellerMonitor
+from .arm import ArmCommand, ArmServos, ArmStatus, JointReading, PropellerMonitor
 from .config import Config
 from .vehicle import RotorModel, Vehicle
 
@@ -51,6 +51,7 @@ class Physics(Protocol):
     def state(self) -> SimState: ...
     def submit_arm_command(self, command: ArmCommand) -> None: ...
     def arm_status(self) -> ArmStatus | None: ...
+    def arm_joints(self) -> JointReading: ...
     @property
     def time(self) -> float: ...
 
@@ -192,6 +193,10 @@ class MujocoPhysics:
             deepest=self.propellers.deepest,
         )
 
+    def arm_joints(self) -> JointReading:
+        """The arm's joints now; empty arrays for a model with no arm servos."""
+        return self.arm.joints(self.data)
+
     def state(self) -> SimState:
         qpos = self.data.qpos[self.qpos_adr:self.qpos_adr + 7]
         qvel = self.data.qvel[self.qvel_adr:self.qvel_adr + 6]
@@ -277,6 +282,9 @@ class StubPhysics:
 
     def arm_status(self) -> ArmStatus | None:
         return None
+
+    def arm_joints(self) -> JointReading:
+        return JointReading(q=np.zeros(0), qd=np.zeros(0))
 
     def state(self) -> SimState:
         return SimState(

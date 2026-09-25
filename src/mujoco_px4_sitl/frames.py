@@ -168,3 +168,20 @@ class GeodeticProjection:
         north, east, down = vec_enu_to_ned(pos_enu)
         lat, lon = self.reproject(north, east)
         return lat, lon, self.ref_alt_m - down
+
+
+def rebase_ned(
+    pos_ned: ArrayLike, source: GeodeticProjection, target: GeodeticProjection
+) -> NDArray[np.float64]:
+    """A NED position relative to ``source``'s datum, re-expressed relative to
+    ``target``'s.
+
+    For comparing two local frames that latched different origins: EKF2 picks its
+    own from GNSS, ground truth uses the simulator's home. Raw x/y/z then differ by
+    a near-constant offset that reads as estimator bias (``scripts/hover_error.py``).
+    """
+    north, east, down = (float(v) for v in np.asarray(pos_ned, dtype=np.float64))
+    lat, lon = source.reproject(north, east)
+    north, east = target.project(lat, lon)
+    # alt = source.ref_alt - down_source = target.ref_alt - down_target
+    return np.array([north, east, down + target.ref_alt_m - source.ref_alt_m])

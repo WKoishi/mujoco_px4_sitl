@@ -53,7 +53,11 @@ looks for `"$autostart_file".post`. See "Non-quad models" under Run.
 ./scripts/run_sitl.sh -g              # with the MuJoCo viewer
 ./scripts/run_sitl.sh -s 2            # 2x real time
 ./scripts/run_sitl.sh -- --stub-physics   # protocol only, no mj_step
+./scripts/run_sitl.sh --px4-only      # PX4 alone; the simulator runs in your process
 ```
+
+`--px4-only` is for an in-process controller ("An in-process controller" below):
+the caller runs the simulator itself, and PX4 runs as a daemon.
 
 Start order does not matter: we bind TCP 4560 first and PX4 retries `connect()`
 until we accept. Under lockstep PX4's boot blocks on our first `HIL_SENSOR`, so
@@ -135,12 +139,32 @@ must not cause any braking. If `brake` instead tracks `frames` divided by
 PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
 `ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
 
+The line now ends with `px4_lag`: how many IMU frames old PX4's controls were
+when a frame used them, read from `HIL_ACTUATOR_CONTROLS.time_usec`, which is
+PX4's clock when it sent them. The most common value and its share come first:
+
+```
+... brake=0 timeouts=0 px4_lag=1fr(64.5%) max=2fr
+```
+
+It is a lower bound on PX4's IMU → actuator delay, exact whenever PX4 answered
+before our next frame, and it depends on wall-clock timing because the brake
+lets the simulator run up to `--max-lead-frames` ahead.
+
 A model with an arm appends its own counters. `STALE` shows while the watchdog
 has acted, and a negative `prop_clearance` means an arm capsule is inside a
 propeller disc:
 
 ```
 ... brake=0 timeouts=0 arm_cmd=4846 age=0.004s stale_episodes=2 rejected=0 clamped=0 prop_clearance=-16.0mm intrusions=1
+```
+
+An in-process controller appends its own: samples, commands, drops, samples on
+which it returned nothing, its mean/max wall time per call, and the oldest EKF2
+estimate it was handed:
+
+```
+... ctrl samples=8000 cmd=8000 dropped=1526 idle=0 compute=0.00/0.04ms est_age_max=40.0ms
 ```
 
 ## Workspace manipulability
@@ -279,7 +303,76 @@ For a model with an arm, `ground_truth` carries an `arm` block:
 
 **Propeller intrusion is reported, never blocked**: logged when it starts and
 ends, and counted on the status line. Keeping clear is the controller's job.
-Joint state is not on the side channel (`AGENTS.md` §3).
+Joint state is not on the side channel; an in-process controller reads it
+(`AGENTS.md` §3).
+
+### An in-process controller
+
+A controller can instead run inside the simulator's process, called
+synchronously from the lockstep loop at sample instants of simulated time. Its
+commands reach the arm servos after a chosen delay, less a chosen drop schedule,
+so the age of the arm command in force is known rather than measured. Start PX4
+alone, then call `run` with the controller:
+
+```sh
+PX4_SYS_AUTOSTART=22001 ./scripts/run_sitl.sh --px4-only &
+```
+
+```python
+from mujoco_px4_sitl.config import config_from_args
+from mujoco_px4_sitl.control import CappedDrops, Schedule
+from mujoco_px4_sitl.main import configure_logging, run
+
+class Hold:
+    def step(self, obs):     # an Observation
+        return obs.joints.q  # rad, one per arm_act servo; None sends nothing
+
+samples = []
+cfg = config_from_args(["--model", "models/my_arm.xml"])
+configure_logging(cfg.log_level)
+run(cfg, controller=Hold(), recorder=samples.append,
+    schedule=Schedule(period=0.02, delay=0.008, drops=CappedDrops(0.1, 2, seed=1)))
+```
+
+| `Schedule` | Meaning |
+|---|---|
+| `period` | sample period, s, a whole number of IMU frames (4 ms at 250 Hz) |
+| `delay` | sample instant to servo, s, whole IMU frames; 0 drives the frame that starts at the sample |
+| `drops` | `index -> lost?`, called once per sample in order. `CappedDrops(p, N, seed)` never loses more than `N` in a row, and repeats exactly for a seed |
+
+With at most `N` consecutive drops, the arm command in force is never more than
+`(N + 1) * period + delay` old (`Schedule.age_bound()`), provided the controller
+returns a command every sample. Commands carry the sample instant as
+`state_time`, so the watchdog and `cmd_age` work unchanged; keep `--arm-timeout`
+above the bound, or the watchdog acts on drops the schedule allows (a warning at
+startup says so).
+
+What the controller gets, an `Observation`:
+
+| Field | Meaning |
+|---|---|
+| `time`, `index` | the sample instant `t_k`, and `k` |
+| `joints` | arm joint angles and rates at `t_k`: ideal encoders, no noise or quantisation |
+| `estimate` | the newest EKF2 estimate that has arrived by `t_k`, from PX4's `ODOMETRY` on its API link (UDP 14540 + instance), asked for at 250 Hz: position and velocity in EKF2's local NED frame, attitude FRD → NED, body rates, `reset_counter`. `None` until PX4 streams one |
+| `estimate_age` | `t_k` minus EKF2's sample time. Exact: under lockstep PX4's clock is ours |
+
+Ground truth never reaches the controller. `recorder` gets one `Sample` per
+sample instant: the observation, the command, whether it was dropped and when it
+lands, the controller's wall time, and `truth`. That carries the side channel's
+state, the true joints, the arm status (`cmd_age`, `prop_clearance`) and
+`pos_ned_ekf`, the true position in EKF2's frame. Compare the estimate with that,
+not with `pos_ned`: the two frames latch different origins, which reads as
+decimetres of bias.
+
+- **Compute time does not exist in simulated time.** The loop, and PX4's clock
+  with it, waits while the controller runs; `delay` is where a compute budget
+  goes. `--speed-factor` does not change the controller's delay.
+- **Still wall-clock:** which estimate has arrived by `t_k` (its age stays
+  exact), PX4's IMU → actuator response (`px4_lag`), and anything the controller
+  sends PX4 itself.
+- **This process holds PX4's API link**, so MAVSDK or MAVROS cannot share it. Fly
+  from QGroundControl on 14550, or `scripts/fly_regression.py`.
+- **Side-channel `arm_cmd` is refused** while a controller is attached.
 
 ## ROS 2 integration
 

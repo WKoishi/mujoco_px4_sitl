@@ -1243,12 +1243,14 @@ criterion.
 - Expected physics coupling: the arm moves the composite CoM and adds reaction
   torques on the base. PX4 will see this as a disturbance, which is the point.
 - Investigate whether the arm needs its own control rate distinct from the
-  physics rate.
+  physics rate. *It has one: an in-process controller runs at its own sample
+  period, a whole number of IMU frames (`control.py`).*
 
 **Exit**: arm motion during hover produces a measurable, bounded attitude
 disturbance that PX4 rejects without losing position lock. Ground truth for
-both base and arm is available externally. *Half met: the disturbance is
-measured below; arm ground truth is not on the side channel (`AGENTS.md` §3).*
+both base and arm is available externally. *Met: the disturbance is measured
+below, and base and arm ground truth reach an in-process controller's recorder.
+The side channel still carries no arm joint state, by choice (`AGENTS.md` §3).*
 
 #### Arm motion in hover
 
@@ -1288,6 +1290,48 @@ What is worth keeping from it:
 - **Command age is measurable out of process, not reproducible.** `arm.cmd_age`
   read 20 ms, one publish period, on every sample at 1×: wall-clock latency
   (`AGENTS.md` §3).
+
+#### The in-process controller
+
+**Measured 2026-09-25 on the coaxial X8 + arm**, same airframe, two flights of
+160 s and 130 s. Controller in process (`control.py`): period 20 ms, delay 8 ms,
+`CappedDrops(p=0.2, max_consecutive=2, seed=1)`, so the arm command age bound is
+3 × 20 + 8 = 68 ms. Takeoff to 5 m and Hold from a GCS script; the controller
+swept `arm_joint0` ±0.5 rad at 0.2 Hz for 30 s, starting 10 s after EKF2's
+altitude estimate first read above 3 m. Both flights `ratio=1.000 brake=0
+timeouts=0`, no failsafe, landed and disarmed.
+
+| Quantity | Flight 1 | Flight 2 |
+|---|---|---|
+| samples, all on the 20 ms grid | 8000 | 6500 |
+| dropped, longest run | 1526, 2 | 1245, 2 |
+| `cmd_age` at sample instants, max | 60 ms | 60 ms |
+| PX4 IMU → actuator lag (`px4_lag`) | 1 frame on 64.5 % of frames, max 2 | 1 frame on 63.0 %, max 2 |
+| EKF2 estimate age at sample instants, median | 8 ms | 4 ms |
+
+Flight 1 in more detail: estimate age p99 12 ms, max 40 ms; an estimate reached
+the host a median 4 ms, at most 12 ms, after EKF2's sample. PX4 accepted
+`ODOMETRY` at 250 Hz, and 7959 of the 8000 samples saw a new estimate. Airborne
+(67 s), the estimate against ground truth in EKF2's frame: 0.057 m median /
+0.138 m max horizontal, 0.043 / 0.176 m vertical. The sweep cost at most 2.63°
+of tilt, and the arm stayed 141 mm clear of every disc.
+
+What is worth keeping from it:
+
+- **The arm leg is deterministic; the PX4 legs are not.** Across the two
+  flights the sample instants and the drop pattern are identical, and the arm's
+  joint trajectory is bit-identical until arming, which a wall-clocked GCS
+  script timed differently. The median estimate age halved between the flights
+  under the same schedule: that is the leg wall clock decides (`AGENTS.md` §3).
+- **Without the datum rebase the estimate reads 0.42 m / 0.99 m off**, horizontal
+  and vertical: EKF2's origin against the simulator's home, the trap
+  `scripts/hover_error.py` describes. `Truth.pos_ned_ekf` removes it.
+- **The frame-sampled `cmd_age` peak is one frame below the bound**, 64 ms here,
+  and sample instants see at most 60 ms. `tests/test_control.py` asserts the peak
+  is reached, so a loose bound would show.
+- **EKF2's `reset_counter` stepped four times** in flight 1, three during
+  alignment in the first 3 s and once at takeoff (t = 12.4 s). A controller that
+  differentiates the estimate has to watch it.
 
 ---
 
@@ -1353,6 +1397,13 @@ exclude and each has a mechanical check:
   PX4 to connect — PX4 may never connect at all, a wrong airframe id is enough. A
   wait that ignores SIGINT/SIGTERM hangs `run_sitl.sh`'s cleanup, which signals and
   then waits.
+- **PX4 cannot finish exiting once simulated time stops.** Its `shutdown` runs on
+  the work queue, which under lockstep runs on our clock, so after the simulator
+  stops PX4 prints "PX4 Exiting..." and stays; one still blocked in boot never
+  exits either. An unbounded wait on it hangs the launcher and orphans PX4, which
+  then holds its instance against the next run ("PX4 server already running").
+  `run_sitl.sh` stops PX4 first, while the simulator still runs, and escalates to
+  SIGKILL after 3 s.
 
 These are conformance checks, not tuning. Assert them in `tests/test_loop.py`
 against a fake PX4 that is *uncooperative* — one that never replies, never reads,

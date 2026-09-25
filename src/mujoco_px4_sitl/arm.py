@@ -65,6 +65,19 @@ class ArmCommand:
     state_time: float | None = None
 
 
+@dataclass(frozen=True)
+class JointReading:
+    """Arm joint angles (rad) and rates (rad/s), one per ``arm_act*`` servo.
+
+    Ideal encoders: MuJoCo's own joint state at the instant it was read, with no
+    quantisation, noise or latency. The servo hardware that would set those is
+    not chosen yet, so nothing here pretends to model it.
+    """
+
+    q: NDArray[np.float64]
+    qd: NDArray[np.float64]
+
+
 @dataclass
 class ArmStatus:
     """A snapshot for the side channel and the status line."""
@@ -299,6 +312,14 @@ class ArmServos:
             "arm_cmd resumed at t=%.3f s after %.3f s stale (seq %d)",
             float(data.time), float(data.time) - self._stale_since,
             self.command.seq if self.command else -1,
+        )
+
+    def joints(self, data: mujoco.MjData) -> JointReading:
+        """The joints as they are, unclipped. Needs ``mj_forward`` current."""
+        # With unit gear, actuator_length / _velocity are the joint's own.
+        return JointReading(
+            q=np.array(data.actuator_length[self.ids], dtype=np.float64),
+            qd=np.array(data.actuator_velocity[self.ids], dtype=np.float64),
         )
 
     def _reached(self, data: mujoco.MjData) -> NDArray[np.float64]:

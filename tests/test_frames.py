@@ -254,3 +254,20 @@ def test_gyro_and_ground_truth_rates_share_one_conversion():
     # sim.py feeds state.gyro_frd to both messages; assert the value itself is
     # the converted one, so the shared path cannot silently diverge.
     assert state.gyro_frd == pytest.approx(np.array([0.2, 0.4, -0.6]), abs=1e-9)
+
+
+def test_rebase_ned_moves_a_position_between_two_datums():
+    """EKF2 latches its own origin; truth uses the home. A point expressed in
+    either frame must be the same place on the sphere."""
+    home = frames.GeodeticProjection(REF_LAT, REF_LON, REF_ALT)
+    lat, lon = home.reproject(30.0, -40.0)
+    ekf = frames.GeodeticProjection(lat, lon, REF_ALT + 2.0)
+
+    # The home itself sits 30 m south, 40 m east and 2 m below EKF2's origin --
+    # to 0.3 mm, not exactly: seen from the other end, meridians converge.
+    assert frames.rebase_ned([0.0, 0.0, 0.0], home, ekf) == pytest.approx(
+        [-30.0, 40.0, 2.0], abs=1e-3)
+    point = np.array([12.0, 7.0, -5.0])
+    there = frames.rebase_ned(point, home, ekf)
+    assert frames.rebase_ned(there, ekf, home) == pytest.approx(point, abs=1e-6)
+    assert frames.rebase_ned(point, home, home) == pytest.approx(point, abs=1e-9)

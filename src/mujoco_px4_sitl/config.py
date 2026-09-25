@@ -88,6 +88,14 @@ class Config:
     sidechannel_port_base: int = 14650
     sidechannel_rate_hz: float = 50.0
 
+    # --- PX4 estimate, for an in-process controller (control.py) ------------
+    # PX4's API/offboard MAVLink link: PX4 sends to 14540 + instance
+    # (px4-rc.mavlink). No CLI flags: only an in-process caller reads these.
+    px4_api_port_base: int = 14540
+    # ODOMETRY rate to ask PX4 for. EKF2 publishes once per IMU sample, and the
+    # onboard-mode default of 30 Hz would make most samples see an old estimate.
+    px4_estimate_rate_hz: float = 250.0
+
     # --- Misc --------------------------------------------------------------
     viewer: bool = False
     max_sim_time: float | None = None
@@ -101,6 +109,11 @@ class Config:
     @property
     def sidechannel_port(self) -> int:
         return self.sidechannel_port_base + self.instance
+
+    @property
+    def px4_api_port(self) -> int:
+        # px4-rc.mavlink shares 14549 among every instance above 9.
+        return self.px4_api_port_base + min(self.instance, 9)
 
     @property
     def imu_dt(self) -> float:

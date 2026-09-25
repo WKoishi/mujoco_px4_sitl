@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,6 +29,7 @@ from pymavlink.dialects.v20 import common as mavlink
 
 from . import hil
 from .config import Config
+from .control import ControllerHost
 from .sim import Physics
 from .sidechannel import SideChannel
 from .transport import HilServer
@@ -50,16 +52,30 @@ class LoopStats:
     # samples dropped) nor collapse toward zero (the brake is pacing the loop).
     sim_time: float = 0.0
     wall_time: float = 0.0
+    # How many IMU frames old PX4's controls were when a frame used them, from
+    # HIL_ACTUATOR_CONTROLS.time_usec -- PX4's clock when it sent them, which is
+    # the IMU time that triggered them unless we had already sent the next frame.
+    # So a lower bound on the IMU -> actuator delay, exact when PX4 kept up. The
+    # lead the brake allows makes this wall-clock dependent; this is the measure.
+    px4_lag: Counter = field(default_factory=Counter)
 
     @property
     def ratio(self) -> float:
         return (self.sim_time / self.wall_time) if self.wall_time > 0.0 else 0.0
 
+    def lag_summary(self) -> str:
+        total = sum(self.px4_lag.values())
+        if not total:
+            return "px4_lag=-"
+        mode, count = self.px4_lag.most_common(1)[0]
+        return f"px4_lag={mode}fr({100.0 * count / total:.1f}%) max={max(self.px4_lag)}fr"
+
     def summary(self) -> str:
         return (
             f"t_sim={self.sim_time:8.2f}s ratio={self.ratio:5.3f} "
             f"frames={self.frames} act={self.actuator_messages} "
-            f"brake={self.brake_waits} timeouts={self.brake_timeouts}"
+            f"brake={self.brake_waits} timeouts={self.brake_timeouts} "
+            f"{self.lag_summary()}"
         )
 
 
@@ -73,6 +89,7 @@ class LockstepLoop:
         server: HilServer,
         sidechannel: SideChannel | None = None,
         frame_hook: Callable[[], None] | None = None,
+        controller: ControllerHost | None = None,
     ) -> None:
         self.cfg = cfg
         self.physics = physics
@@ -81,6 +98,11 @@ class LockstepLoop:
         # Called once per IMU frame. Used for the viewer, which must never gate
         # the physics loop, so it decimates internally.
         self.frame_hook = frame_hook
+        # The in-process research controller, run synchronously every frame
+        # (control.py). With one attached, side-channel arm_cmd is refused: two
+        # writers would take turns on the servos by arrival order.
+        self.controller = controller
+        self._refused_arm_cmds = 0
         self.stats = LoopStats()
         self.controls = hil.ActuatorControls()
         self.running = False
@@ -232,8 +254,19 @@ class LockstepLoop:
             # first frame after it arrives rather than waiting for a publish.
             if self.sidechannel is not None:
                 for command in self.sidechannel.poll():
-                    self.physics.submit_arm_command(command)
+                    if self.controller is None:
+                        self.physics.submit_arm_command(command)
+                    else:
+                        self._refuse(command.seq)
+            if self.controller is not None:
+                # The loop was stopped while the controller ran, and PX4's clock
+                # with it. Not counting that time keeps the pacer from following
+                # a slow call with a catch-up burst that widens PX4's lead.
+                t_wall_next += self.controller.before_step(self.physics)
 
+            if self.controls.time_usec > 0:
+                lag = (self.physics.time - self.controls.time_usec * 1e-6) / cfg.imu_dt
+                self.stats.px4_lag[int(round(lag))] += 1
             controls = self.controls.effective(self.physics.num_actuators)
             self.physics.step_frame(controls)
             self.stats.frames += 1
@@ -272,10 +305,23 @@ class LockstepLoop:
         self.stats.wall_time = time.monotonic() - t_wall_start
         _log.info("loop stopped: %s", self._summary())
 
+    def _refuse(self, seq: int) -> None:
+        self._refused_arm_cmds += 1
+        if self._refused_arm_cmds <= 3 or self._refused_arm_cmds % 100 == 0:
+            _log.warning(
+                "side-channel arm_cmd seq %d refused (%d so far): an in-process "
+                "controller drives the arm", seq, self._refused_arm_cmds,
+            )
+
     def _summary(self) -> str:
-        """The loop's health line, plus the arm's when the model has one."""
+        """The loop's health line, plus the arm's and the controller's."""
+        parts = [self.stats.summary()]
         arm = self.physics.arm_status()
-        return self.stats.summary() if arm is None else f"{self.stats.summary()} {arm.summary()}"
+        if arm is not None:
+            parts.append(arm.summary())
+        if self.controller is not None:
+            parts.append(self.controller.summary())
+        return " ".join(parts)
 
     def stop(self) -> None:
         self.running = False

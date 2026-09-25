@@ -169,9 +169,9 @@ class SideChannel:
             "actuators": [round(float(v), 6) for v in controls],
         }
         if arm is not None:
-            # Command bookkeeping and clearance, not joint state: whether an
-            # out-of-process controller should get qpos is the topology question
-            # of AGENTS.md section 3, not a field to add here.
+            # Command bookkeeping and clearance, not joint state. The research
+            # controller runs in process and reads joints there (control.py,
+            # AGENTS.md section 3); add qpos here when a monitoring peer needs it.
             payload["arm"] = {
                 "cmd_seq": arm.cmd_seq,
                 "cmd_age": None if arm.cmd_age is None else round(arm.cmd_age, 6),
