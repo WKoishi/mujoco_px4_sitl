@@ -110,8 +110,8 @@ that does not supply its own — which is now only the quad.
 | Gap | Where | Consequence |
 |---|---|---|
 | `arm_cmd` never reaches the physics | `sidechannel.py` parses it into `ArmCommand`; nothing in `src/` writes `data.ctrl` | arm commands are received and silently dropped |
-| **A dropped `arm_cmd` writer has no failsafe** | `ArmCommand` has no timestamp and no expiry | when the writer lands: a controller that crashes leaves the arm holding its last command forever. Since some reachable poses intersect a propeller disc (§4), design the staleness behaviour with the writer, not after |
-| **Nothing enforces propeller clearance** | no guard anywhere; the joint limits are not one | the limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a propeller disc — measured, not inferred. Deferred by decision, but it is a constraint on the `arm_cmd` writer above, not a separate task |
+| **A dropped `arm_cmd` writer has no failsafe** | `ArmCommand` has no timestamp and no expiry | when the writer lands: a controller that crashes leaves the arm holding its last command forever. The private research models computation timeouts and faults, so what the arm does when its controller stalls is part of what it studies: design the staleness behaviour with the writer, not after |
+| **Nothing detects propeller intrusion** | rotors are force sites with no geometry, so an arm inside a disc collides with nothing and costs no thrust | the joint limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a disc — measured, not inferred. Here that is silent: a trajectory through a disc succeeds in simulation and strikes a propeller on the real vehicle. **Detect and report it, do not block it**: the research has to show its controller keeps this constraint, and a simulator that clamped commands would hide the violation. A blocking guard belongs to the real vehicle, not to this repo (§4) |
 | Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
 | No arm state on the side channel | `SimState` has 9 fields, none of them joint state | an out-of-process controller is flying blind on the arm. Extending it touches `SimState`, the `Physics` protocol and `StubPhysics` |
 | Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `ArmCommand.mode` accepts `"torque"`, but no actuator can honour it | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too: they hold the folded arm but droop up to ~8° when gravity loads the shoulder (sidecar) |
@@ -172,6 +172,8 @@ rate loop needs none of it. What remains:
    zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
    owns its own clearing. The generated model already has `arm_act0..4` with
    `ctrlrange` set. Decide the staleness behaviour here, not later (§2, row 2).
+   Propeller intrusion becomes possible the moment the arm moves, so its
+   detection lands with this step: reported, never blocked (§2, §4).
 2. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
    separable from the others. It moves the plant gain as well as the hover
    point, so regenerate the airframe and fly the attitude steps again.
@@ -264,9 +266,12 @@ the real ranges (the figures are in the private sidecar). So the limits cannot b
 the guard — they are the mechanism's, and the mechanism can do this. Nothing in
 the model stops a commanded angle from doing it either.
 
-Deferred by decision, and the place it lands is the `arm_cmd` writer (§2, §3
-step 1), not the model: a reachable-set guard there, or a collision check on the
-commanded pose before it reaches `data.ctrl`.
+Decided 2026-09-25: in simulation it is **detected and reported, never
+blocked** (§2). Check the pose the arm actually reaches, its collision capsules
+against the disc volumes each step, rather than the commanded one, since the
+servo lags its command. Blocking is a real-vehicle safety layer and belongs in
+the arm driver or the companion computer, outside this repo. The joint limits
+cannot do it on either side.
 
 `vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
 **stay in place and still warn on every load** — they are what any model without
