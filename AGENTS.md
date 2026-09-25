@@ -48,38 +48,41 @@ and its PX4 airframe (`22002_mujoco_x8`, generated from
 load: 8 rotors, `MPC_THR_HOVER 0.2162`, and **no auto-calibration warning** —
 which is the signal §4 describes, now silent because the measured values arrive.
 
-**It has not flown.** Everything verified so far is on *our* side of the HIL
-boundary: the model loads, `Vehicle` builds, the hover point is right. PX4's
-allocator, mixer and attitude loop have not participated once.
+**The X8 has flown the Phase 5 profile**, arm held at zero, and passes it with
+the quad's numbers: hover 0.117 m horizontal / 0.202 m vertical max against
+ground truth, corners 0.01–0.05 m, `brake=0 timeouts=0`, no failsafe.
+`IMPLEMENTATION_PLAN.md` phase 5 has the table. PX4's own `hover_thrust_estimate`
+settled on 0.2162, exactly the generated `MPC_THR_HOVER`, so the sidecar's thrust
+and the airframe agree through PX4's loop and not only on paper.
 
-Nothing about the layout itself is in doubt — the allocator is generic
-(`NUM_ROTORS_MAX = 12`, and the effectiveness matrix is computed from `CA_ROTOR*`
-as `ct·position×axis − ct·km·axis`), and PX4 ships `12001_octo_cox` as a coaxial
-X8. The generated airframe was checked against it statically: pairs (0,5), (1,4),
-(2,7), (3,6), `KM` opposed within each pair, every `PY` the negation of the
-model's `py`. **What has never run is the closed loop** — those 32 generated
-numbers, through PX4's matrix, against our MJCF's sites.
+Of the three dynamic unknowns that flight was meant to settle:
 
-So three things are untested, all dynamic:
+- **The index→ESC mapping is consistent with the model.** Yaw steps move the
+  commanded way, roll/pitch stay under 2° through them, and hover yaw error is
+  0.2°. A mismatch would have diverged or cross-coupled. Still unconfirmed
+  against the *wiring*, which no simulation can settle.
+- **Coaxial yaw authority is weak, and PX4's default gains do not suit it.**
+  Measured, and the cause is known — see below.
+- **The arm's mass moving in flight** is still untested, because `arm_cmd` is
+  still dropped (§2).
 
-- **The index→ESC mapping**, assumed from `12001_octo_cox` and not confirmed
-  against the wiring. When the allocator speeds up "rotor 0", whether the rotor
-  that moves in MuJoCo is at the same place is not knowable statically. Presents
-  as yaw drift or attitude cross-coupling.
-- **Coaxial yaw authority.** X8 yaw comes from differential thrust within each
-  pair, and `km` is 0.43× PX4's default. This channel does not exist on the quad,
-  so no baseline covers it.
-- **The arm's mass moving in flight.** No degree of freedom like it in Phase 5.
+**PX4's rate gains act on a normalized torque**: the allocator scales each axis
+so that ±1 means the vehicle's own authority on that axis. So the physical loop
+gain is the default gain times (authority / inertia), and on this X8 that ratio
+is about 20× below the quad's in yaw, 13× in pitch and 5× in roll. With stock
+`MC_*RATE_*` the yaw-rate loop crosses over *below* the yaw attitude loop
+(`MC_YAW_P 2.8`), and a 20° yaw step overshoots 50–70 % and takes 5–8 s to
+settle. The quad does the same step in 0.6 s with 1–4° overshoot. Pitch is
+marginal (16 % overshoot on a 5° step), roll is fine (≤ 1.4 %). Yaw also runs
+out of authority at hover: on a 90° step a motor sits at zero and yaw
+acceleration tops out near 80°/s², so a 200°/s rate limit cannot be braked in
+time.
 
-The 8-rotor coverage in `tests/test_vehicle.py` does not close this: it is a
-synthetic inline model (a 3 kg box with 8 sites in `MODELING_CONVENTIONS.md` §4's
-order), so it verifies force/torque algebra and the hover point, not flight.
-
-The quad's own history is the argument for not trusting "it loads": the
-`THR_MDL_FAC` inconsistency ran the attitude loop at 2.00× design gain and flew
-anyway, invisible in a 5 m square. The X8 is at an earlier stage than that was.
-Fly the Phase 5 profile (`scripts/fly_regression.py`) and compare against the
-quad's baseline.
+Both yaw problems were confirmed by fixing them, at runtime and not saved:
+`MC_YAWRATE_K 5` brings the 20° step to the quad's response, and adding
+`MC_YAWRATE_MAX 45` does the same for 90°. **The airframe still carries stock
+gains** — where tuned gains should live is §3 step 1, and it matters for the
+arm, since shoulder pitch and base yaw are what the arm disturbs.
 
 Motors are chosen: `c_t`, `km` and `ω_max` are fitted from the manufacturer's
 data and live in the private sidecar (§4). `ω_idle` is not in that data and is
@@ -97,13 +100,14 @@ that does not supply its own — which is now only the quad.
 | **Nothing enforces propeller clearance** | no guard anywhere; the joint limits are not one | the limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a propeller disc — measured, not inferred. Deferred by decision, but it is a constraint on the `arm_cmd` writer above, not a separate task |
 | Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
 | No arm state on the side channel | `SimState` has 9 fields, none of them joint state | an out-of-process controller is flying blind on the arm. Extending it touches `SimState`, the `Physics` protocol and `StubPhysics` |
+| X8 attitude gains are PX4's stock values | the airframe template sets none | yaw overshoots 50–70 % on a 20° step and pitch 16 % on 5°, because the normalized gains assume far more authority per unit inertia than this X8 has (§1). Fixed at runtime, not in the airframe: §3 step 1 |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
 | Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (`MODELING_CONVENTIONS.md` §5 suggests 0.75–0.85). Deliberately deferred so the first X8 flight introduces one unverified quantity, not two: it moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75, so the sidecar's `c_t` and the airframe must change together |
 
 `scripts/manipulability.py` answers the kinematic half of the arm question —
 whether a pose is reachable at all, per voxel, with any subset of joints frozen.
-It needs no PX4 and no physics step, so it is available before step 1 below and
-says nothing about it: rank is not thrust.
+It needs no PX4 and no physics step, and says nothing about flight: rank is not
+thrust.
 
 One authoring hazard has **no test coverage in `src/`**: rotor sites must be
 direct children of `base_link`, or the lever arm is silently wrong
@@ -137,21 +141,30 @@ and the X8 airframe — are **done**: `--rotors` / `MUJOCO_SITL_ROTORS` with
 `rotorconfig.py`, and `--emit-airframe` with `install_px4_files.sh --airframe`.
 `RotorSpec` and the rotors-block parser moved into the package so the script and
 the simulator share **one** parser; a second one would drift silently, since a
-model whose rotor count still matches flies with the wrong thrust. What remains:
+model whose rotor count still matches flies with the wrong thrust.
 
-1. **Fly the X8.** Now the blocker, and it is a measurement rather than code. The
-   vehicle loads with the right hover point but PX4's allocator has never seen
-   this layout. `scripts/fly_regression.py` flies the Phase 5 profile; record the
-   numbers in `IMPLEMENTATION_PLAN.md` phase 5 beside the quad's, and expect the
-   index→ESC mapping to be what a failure implicates first (it presents as yaw
-   drift, §4).
+Flying the X8 is **done** (§1): it passes the Phase 5 profile. What remains:
+
+1. **Give the X8 attitude gains that match its authority**, before any arm
+   flight. The Phase 7 exit criterion measures how PX4 rejects the arm's
+   disturbance, and with stock gains that measures the mistuning in yaw and
+   pitch rather than the arm. §1 has the numbers and the runtime fix. The open
+   question is where the gains live. The recommendation is to have
+   `--emit-airframe` derive `MC_{ROLL,PITCH,YAW}RATE_K` from the plant-gain
+   ratio against the quad, the same way it already derives `MPC_THR_HOVER`, and
+   `MC_YAWRATE_MAX` from the yaw acceleration available at hover. Both come from
+   the model and the sidecar, so they follow the arm and the motors when those
+   change, which a hand-set number in the sidecar would not. A private
+   research controller that replaces PX4's rate loop needs none of this. It is
+   still a decision, since anchoring to the quad is a choice: PX4's defaults were
+   not designed for that model either.
 2. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
    `step_frame` at [sim.py:137](src/mujoco_px4_sitl/sim.py#L137). `clear()` only
    zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
    owns its own clearing. The generated model already has `arm_act0..4` with
    `ctrlrange` set. Decide the staleness behaviour here, not later (§2, row 2).
 3. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
-   separable from step 1's result.
+   separable from the others.
 
 Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
 exit criterion; `RotorState.omega` is what makes them expressible.
@@ -211,8 +224,9 @@ What the export did **not** carry:
   supplies it. Still unverified is the zero-position and sign convention, since
   `arm_cmd.values[i]` is an absolute angle.
 - **Spin directions and index→ESC mapping.** The sidecar assumes
-  `MODELING_CONVENTIONS.md` §4's PX4 order; it needs confirming against the
-  wiring, since a mismatch presents as yaw drift.
+  `MODELING_CONVENTIONS.md` §4's PX4 order. Flight shows it consistent with the
+  model (§1); it still needs confirming against the wiring, since a mismatch
+  there presents as yaw drift on the real vehicle.
 
 **Motors are now chosen and measured**, which removes the largest remaining
 guess. `c_t`, `km` and `ω_max` are fitted from the manufacturer's thrust/RPM/torque

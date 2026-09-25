@@ -106,9 +106,22 @@ class Link:
 
 def fly(link, args):
     m = link.m
+    # A previous flight leaves PX4 in Land, and arming from Land is refused with
+    # "Resolve system health failures first" -- naming neither the mode nor a
+    # sensor. Hold is AUTO (4) / LOITER (3), the mode a fresh boot sits in.
+    command(m, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 1.0, 4.0, 3.0)
+    print(f"Hold {ack(m)}", flush=True)
+    link.pump(1.0)
+
     print("arming", flush=True)
     command(m, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1.0)
-    print(f"  {ack(m)}", flush=True)
+    result = ack(m)
+    print(f"  {result}", flush=True)
+    if result != "MAV_RESULT_ACCEPTED":
+        # Carrying on would send a takeoff that is also ACCEPTED and then report
+        # "did not climb", which reads as a control failure.
+        print("arming refused; the PX4 console says why", flush=True)
+        return None
     link.pump(2.0)
 
     # MAV_CMD_NAV_TAKEOFF's param7 is **AMSL**, not relative to home. Passing a
