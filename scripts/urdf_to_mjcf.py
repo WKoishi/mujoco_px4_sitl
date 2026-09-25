@@ -1271,26 +1271,45 @@ def _subtree_com(model: mujoco.MjModel, base_id: int) -> NDArray[np.float64]:
     the base frame -- so a moving arm does change it, which is the point of
     printing it next to the CAD figure.
     """
+    return _subtree_mass_properties(model, base_id)[0]
+
+
+def _subtree_mass_properties(
+    model: mujoco.MjModel, base_id: int
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """CoM and inertia of ``base_id``'s subtree, both in ``base_id``'s frame.
+
+    The inertia is about the subtree CoM: the arm rigidly locked at its home
+    pose, which is what the vehicle's rate loops see while the arm holds still.
+    Summed body by body with the parallel-axis term, so it does not depend on
+    MuJoCo's mass-matrix API, which has changed signature between releases.
+    """
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    total = 0.0
-    weighted = np.zeros(3)
+    bodies: list[int] = []
     stack = [base_id]
     while stack:
         body = stack.pop()
-        mass = float(model.body_mass[body])
-        total += mass
-        weighted += mass * np.asarray(data.xipos[body], dtype=np.float64)
+        bodies.append(body)
         stack.extend(
             int(child) for child in range(model.nbody)
             if int(model.body_parentid[child]) == body and child != body
         )
+    masses = np.array([float(model.body_mass[b]) for b in bodies])
+    total = float(masses.sum())
     if total <= 0.0:
-        return np.zeros(3)
-    world = weighted / total
+        return np.zeros(3), np.zeros((3, 3))
+    positions = np.array([np.asarray(data.xipos[b], dtype=np.float64) for b in bodies])
+    com_world = masses @ positions / total
+    inertia = np.zeros((3, 3))
+    for mass, pos, body in zip(masses, positions, bodies):
+        frame = np.asarray(data.ximat[body], dtype=np.float64).reshape(3, 3)
+        offset = pos - com_world
+        inertia += frame @ np.diag(model.body_inertia[body]) @ frame.T
+        inertia += mass * (offset @ offset * np.eye(3) - np.outer(offset, offset))
     origin = np.asarray(data.xpos[base_id], dtype=np.float64)
     rotation = np.asarray(data.xmat[base_id], dtype=np.float64).reshape(3, 3)
-    return rotation.T @ (world - origin)
+    return rotation.T @ (com_world - origin), rotation.T @ inertia @ rotation
 
 
 # --- reporting ------------------------------------------------------------
@@ -1365,6 +1384,173 @@ def _describe_coaxial(sidecar: Sidecar) -> list[str]:
 
 AIRFRAME_TEMPLATE = Path(__file__).resolve().parents[1] / "px4" / "mujoco_x8.airframe.template"
 
+# --- attitude gains -------------------------------------------------------
+#
+# The airframe template explains why these are derived. PX4 v1.17 stock values,
+# roll / pitch / yaw: MC_*_P and MC_*RATE_MAX from mc_att_control_params.c,
+# MC_*RATE_P and MC_*RATE_K's documented range from mc_rate_control_params.c
+# (rc.mc_defaults touches none of them), CA_ROTOR*_CT from control_allocator's
+# module.yaml.
+PX4_ATTITUDE_P = np.array([4.0, 4.0, 2.8])
+PX4_RATE_P = np.array([0.15, 0.15, 0.2])
+PX4_RATE_MAX_DEG = np.array([220.0, 220.0, 200.0])
+PX4_CA_ROTOR_CT_DEFAULT = 6.5
+PX4_RATE_K_MAX = 5.0
+
+# How much faster than its attitude loop an axis's rate loop must be, measured
+# as the P-only crossover plant * K * MC_*RATE_P against MC_*_P. The textbook
+# cascade margin is 3-5x. On the first X8 export roll at stock sat at 4.9x and
+# flew cleanly, pitch at 1.8x overshot 16 %, and yaw at 0.45x rang for seconds.
+RATE_LOOP_SEPARATION = 4.0
+
+_AXES = ("roll", "pitch", "yaw")
+_FLU_TO_FRD = np.array([1.0, -1.0, -1.0])
+
+
+@dataclass
+class AttitudeGains:
+    """Per-axis numbers behind the airframe's MC_* block, roll / pitch / yaw."""
+
+    authority: NDArray[np.float64]  # N m per unit normalized torque, at hover
+    inertia: NDArray[np.float64]  # kg m^2, diagonal, about the subtree CoM
+    plant_gain: NDArray[np.float64]  # rad/s^2 per unit normalized torque
+    separation: NDArray[np.float64]  # rate/attitude crossover ratio at stock K
+    rate_k_derived: NDArray[np.float64]  # before PX4's range is applied
+    rate_k: NDArray[np.float64]
+    hover_accel: NDArray[np.float64]  # rad/s^2 before a motor reaches zero
+    rate_max_deg: NDArray[np.float64]
+
+
+def _effectiveness(
+    thrust: NDArray[np.float64], pos_frd: NDArray[np.float64], km: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """PX4's 6 x N effectiveness matrix, rows roll/pitch/yaw/Fx/Fy/Fz (FRD).
+
+    ActuatorEffectivenessRotors::computeEffectivenessMatrix with every axis
+    (0, 0, -1): moment = ct * position x axis - ct * km * axis, force = ct * axis.
+    ``km`` is signed, positive for CCW, as CA_ROTOR*_KM is.
+    """
+    axis = np.array([0.0, 0.0, -1.0])
+    matrix = np.zeros((6, len(thrust)))
+    for i, (ct, pos, k) in enumerate(zip(thrust, pos_frd, km)):
+        matrix[:3, i] = ct * np.cross(pos, axis) - ct * k * axis
+        matrix[3:, i] = ct * axis
+    return matrix
+
+
+def _normalized_torque_mix(effectiveness: NDArray[np.float64]) -> NDArray[np.float64]:
+    """The N x 3 torque columns PX4 allocates with, after its normalization.
+
+    ControlAllocationPseudoInverse::updateControlAllocationMatrixScale: roll and
+    pitch share one scale, sqrt(|col|^2 / (n / 2)) with n the rotors that take
+    part, the larger of the two; yaw is scaled by its column's max. So a unit
+    torque setpoint means this vehicle's own authority on that axis, which is
+    the whole reason stock gains do not transfer. The small-element zeroing
+    that follows in PX4 is left out: it moves nothing a gain depends on.
+    """
+    mix = np.linalg.pinv(effectiveness)[:, :3]
+    scales = []
+    for col in (0, 1):
+        used = int(np.sum(np.abs(mix[:, col]) > 1e-3))
+        scales.append(math.sqrt(float(mix[:, col] @ mix[:, col]) / (used / 2.0)))
+    roll_pitch = max(scales)
+    return np.column_stack(
+        [mix[:, 0] / roll_pitch, mix[:, 1] / roll_pitch, mix[:, 2] / mix[:, 2].max()]
+    )
+
+
+def attitude_gains(
+    model: mujoco.MjModel, vehicle: Vehicle, ct_px4: NDArray[np.float64]
+) -> AttitudeGains:
+    """Plant gain per axis, and the MC_* values the airframe writes.
+
+    Plant gain is the physical angular acceleration one unit of PX4's normalized
+    torque produces: PX4's normalized mix, pushed through our rotor model
+    linearized at hover, divided by the subtree inertia. With THR_MDL_FAC 1 the
+    allocator's variable is a = u^2, so a rotor's slope there is
+    dT/da = c_t * omega * (omega_max - omega_idle) / u.
+
+    ``ct_px4`` is what the airframe writes as CA_ROTOR*_CT. PX4's geometry and
+    ours are the same rotor sites; ours is taken about the subtree CoM, which the
+    torque columns' zero net thrust makes nearly irrelevant.
+    """
+    hover = vehicle.hover_command()
+    if not 0.0 < hover < 1.0:
+        raise ValueError(f"hover command {hover:.3f}: no hover point to linearize about")
+    com, inertia = _subtree_mass_properties(model, vehicle.body_id)
+    pos_frd = np.array([model.site_pos[s] for s in vehicle.site_ids]) * _FLU_TO_FRD
+    lever = pos_frd - com * _FLU_TO_FRD
+    km = vehicle.spin * vehicle.km
+    mix = _normalized_torque_mix(_effectiveness(np.asarray(ct_px4, float), pos_frd, km))
+
+    omega = vehicle.omega(np.full(vehicle.num_rotors, hover))
+    slope = vehicle.c_t * omega * (vehicle.omega_max - vehicle.omega_idle) / hover
+    physical = _effectiveness(slope, lever, km)
+    authority = np.array([(physical @ mix[:, j])[j] for j in range(3)])
+    diagonal = np.diag(inertia).copy()
+    plant = authority / diagonal
+    # Raise an axis only as far as the separation requires, never below stock.
+    # Matching the quad's plant * K instead was tried and flown: it put roll at
+    # K 4.8 and sustained a roll limit cycle once a yaw step drove a motor to
+    # zero, because the same loop gain on far less acceleration headroom
+    # saturates on far smaller signals.
+    separation = plant * PX4_RATE_P / PX4_ATTITUDE_P
+    derived = np.maximum(1.0, RATE_LOOP_SEPARATION / separation)
+
+    # How hard each axis can accelerate at hover. SequentialDesaturation holds
+    # thrust and backs the axis off until one motor reaches its minimum, so push
+    # a = hover^2 along the column until a rotor hits zero, in both directions,
+    # and evaluate the rotors' real thrust there rather than the slope.
+    unit_lever = _effectiveness(np.ones(vehicle.num_rotors), lever, km)
+    thrust_hover = vehicle.c_t * omega ** 2
+    accel = np.empty(3)
+    for j in range(3):
+        torques = []
+        for sign in (1.0, -1.0):
+            column = sign * mix[:, j]
+            falling = column < 0.0
+            reach = float(np.min(hover ** 2 / -column[falling]))
+            a = np.clip(hover ** 2 + reach * column, 0.0, 1.0)
+            thrust = vehicle.c_t * vehicle.omega(np.sqrt(a)) ** 2
+            torques.append(abs(float((unit_lever @ (thrust - thrust_hover))[j])))
+        accel[j] = min(torques) / diagonal[j]
+
+    # The P law asks for deceleration P * rate while it closes on the target, so
+    # a rate limit above accel / P commands more than the rotors can brake.
+    rate_max = np.minimum(PX4_RATE_MAX_DEG, np.degrees(accel / PX4_ATTITUDE_P))
+    return AttitudeGains(
+        authority=authority, inertia=diagonal, plant_gain=plant,
+        separation=separation, rate_k_derived=derived,
+        rate_k=np.minimum(derived, PX4_RATE_K_MAX),
+        hover_accel=accel, rate_max_deg=rate_max,
+    )
+
+
+def _describe_gains(gains: AttitudeGains) -> list[str]:
+    lines = [
+        f"  attitude gains, rate loop >= {RATE_LOOP_SEPARATION:g}x its attitude loop:"
+    ]
+    for j, axis in enumerate(_AXES):
+        k = f"K {gains.rate_k[j]:.2f}"
+        if gains.rate_k[j] < gains.rate_k_derived[j]:
+            k += (
+                f" (needs {gains.rate_k_derived[j]:.2f}; clamped to PX4's "
+                f"{PX4_RATE_K_MAX:g}, separation {gains.separation[j] * gains.rate_k[j]:.1f}x)"
+            )
+        limit = f"rate max {gains.rate_max_deg[j]:.1f} deg/s"
+        if gains.rate_max_deg[j] < PX4_RATE_MAX_DEG[j]:
+            limit += (
+                f" ({np.degrees(gains.hover_accel[j]):.0f} deg/s^2 at hover "
+                f"/ P {PX4_ATTITUDE_P[j]:g})"
+            )
+        else:
+            limit += " (stock)"
+        lines.append(
+            f"    {axis:<5s} plant {gains.plant_gain[j]:8.2f} rad/s^2, stock "
+            f"separation {gains.separation[j]:5.2f}x  {k}; {limit}"
+        )
+    return lines
+
 
 def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
     """Fill the PX4 airframe template from the sidecar and write it.
@@ -1374,6 +1560,10 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
     sign follows the spin. Hand-transcribing that is how a mismatch gets in, and
     a mismatch presents as yaw drift or attitude cross-coupling, which is
     routinely misdiagnosed as an EKF fault.
+
+    The MC_* attitude block is derived too, from the model's inertia and the
+    motors (``attitude_gains``), so it follows the arm and the motors when either
+    changes.
 
     The template owns everything that is *not* derivable -- why SIM_GZ_EN must
     stay unset, the THR_MDL_FAC derivation, the MPC_THR_MIN trap. Those are
@@ -1406,11 +1596,21 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
 
     vehicle = Vehicle(model, rotors_from_specs(sidecar.rotors, sidecar.omega_idle))
     hover = vehicle.hover_command() ** 2
+    ct_px4 = np.array([
+        r.c_t * r.omega_max ** 2 if r.c_t is not None and r.omega_max is not None
+        else PX4_CA_ROTOR_CT_DEFAULT
+        for r in sidecar.rotors
+    ])
+    gains = attitude_gains(model, vehicle, ct_px4)
 
     text = AIRFRAME_TEMPLATE.read_text(encoding="utf-8")
     text = text.replace("{{ROTOR_BLOCK}}", "\n".join(rotors) + "\n")
     text = text.replace("{{PWM_BLOCK}}", "\n".join(pwm) + "\n")
     text = text.replace("{{MPC_THR_HOVER}}", f"{hover:.4f}")
+    for j, axis in enumerate(_AXES):
+        name = axis.upper()
+        text = text.replace(f"{{{{MC_{name}RATE_K}}}}", f"{gains.rate_k[j]:.2f}")
+        text = text.replace(f"{{{{MC_{name}RATE_MAX}}}}", f"{gains.rate_max_deg[j]:.1f}")
     if "{{" in text:
         leftover = text[text.index("{{"):][:40]
         raise ValueError(f"unfilled placeholder in the airframe template: {leftover}")
@@ -1419,6 +1619,7 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
     out.write_text(text, encoding="utf-8")
     print(f"\nairframe {out}")
     print(f"  CA_ROTOR_COUNT {len(sidecar.rotors)}, MPC_THR_HOVER {hover:.4f}")
+    print("\n".join(_describe_gains(gains)))
     print(
         f"  install with: scripts/install_px4_files.sh --airframe {out}\n"
         f"  then run with PX4_SYS_AUTOSTART={out.name.split('_')[0]}"

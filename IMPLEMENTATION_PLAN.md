@@ -1148,8 +1148,38 @@ The 90° row has a second cause that `K` alone does not fix. At hover a motor
 reaches zero within the first sample, and yaw acceleration tops out near
 80°/s². The stock 200°/s rate limit then commands more yaw rate than the
 vehicle can brake. Capping the rate removes it. Both yaw fixes were set at
-runtime and reset afterwards; the airframe still carries stock gains
-(`AGENTS.md` §3).
+runtime only, to confirm the diagnosis.
+
+**The derived gains**, which `--emit-airframe` now writes (the airframe template
+has the rule). For this X8 they are `MC_ROLLRATE_K 1.00`, `MC_PITCHRATE_K 2.18`,
+`MC_YAWRATE_K 5.00` and `MC_YAWRATE_MAX 29.6`. Measured 2026-09-25 with the same
+step procedures:
+
+| step | X8, stock | X8, derived |
+|---|---|---|
+| yaw 20° | 10–14° / 5–8 s | 0.2–2.0° / 0.6–0.7 s |
+| yaw 90° | 47–50° / 11 s | 0.0–0.6° / 2.9–3.1 s |
+| pitch 5° | 16 % / 0.85 s | 1.2–2.1 % / 0.4 s |
+| roll 5° | ≤ 1.4 % / 0.4 s | ≤ 1.5 % / 0.45 s |
+
+The 90° step now takes 3 s because it is rate-limited, which is the point: the
+vehicle turns at a rate it can brake from. The Phase 5 profile passes with them:
+hover 0.160 m horizontal / 0.206 m vertical max (0.054 / 0.055 median),
+corners 0.03–0.10 m, allocator torque achieved on 99.1 % of samples,
+`brake=0 timeouts=0`, `Disarmed by landing`.
+
+**The first version of the rule matched the quad's physical loop gain instead,
+and it flew worse.** That gave roll K 4.78, pitch 5 and yaw 5. It passed the
+Phase 5 profile, and hover rate noise was lower than on stock gains. But after
+the first yaw step drove a motor to zero, roll entered a limit cycle, with rate
+RMS around 11°/s against 0.6–0.9 before it. The torque setpoint swung ±0.3–0.46
+and motors bounced between 0 and 0.55. It lasted more than a minute and
+restarted on the next steps. The frequency is tens of Hz, too high for the logs
+to pin down; the angle amplitude was only about 0.1°. Pitch at K 5 did not
+oscillate. At the same loop gain this X8 has about 4.5× less acceleration
+headroom than the quad in roll at hover, so saturation arrives on much
+smaller signals. Neither a hover nor a gentle square can show
+this, which is why the step tests ran against every candidate.
 
 **A trap in re-running any of this:** after `Disarmed by landing` PX4 stays in
 Land, and refuses to arm from there with `Arming denied: Resolve system health
@@ -1201,8 +1231,8 @@ criterion.
   `MODELING_CONVENTIONS.md` §6, not hand-authored, and generated **into the
   private repo** — it and its PX4 airframe are geometry (§6). *Done, and it
   loads under PX4's HIL with its measured allocation, and flies phase 5's
-  profile with the quad's numbers (phase 5, "The X8"). Attitude gains are
-  still stock and mistuned for it.*
+  profile with the quad's numbers (phase 5, "The X8"), on attitude gains the
+  airframe generator derives for it.*
 - Arm joints driven from the side channel, position-controlled
   (`MODELING_CONVENTIONS.md` §3.4). *Not done: `arm_cmd` is parsed and dropped.*
 - Expected physics coupling: the arm moves the composite CoM and adds reaction

@@ -10,8 +10,8 @@
 # airframe and the MJCF disagree while both stay flyable.
 #
 # Airframe for mujoco_px4_sitl. Modelled on 22001_mujoco_quad, whose derivations
-# it inherits; the differences are the rotor count, the coaxial layout, and the
-# measured motor coefficients.
+# it inherits; the differences are the rotor count, the coaxial layout, the
+# measured motor coefficients, and attitude gains raised where its inertia needs.
 #
 # With PX4_SIMULATOR unset, SYS_AUTOSTART non-zero and not 10017, and SIM_GZ_EN
 # at its default of 0, every branch of px4-rc.simulator's if-chain fails and the
@@ -73,3 +73,32 @@ param set-default SENS_EN_GPSSIM 1
 param set-default THR_MDL_FAC 1.0
 param set-default MPC_THR_HOVER {{MPC_THR_HOVER}}
 param set-default MPC_THR_MIN 0.0144
+
+# Attitude loops. PX4's rate controllers output a normalized torque, and the
+# allocator scales each axis so that +/-1 is this vehicle's own authority on it
+# (ControlAllocationPseudoInverse::updateControlAllocationMatrixScale). The
+# physical loop gain is therefore PX4's gain times the plant gain b = authority
+# / inertia, and stock gains carry no knowledge of b. On the first X8 export b
+# is about 20x below the quad's in yaw, and stock gains put the yaw-rate loop
+# below the yaw attitude loop: 50-70 % overshoot on a 20 deg step
+# (IMPLEMENTATION_PLAN.md phase 5, "The X8").
+#
+# MC_*RATE_K scales an axis's whole rate PID, raised from stock only until the
+# rate loop's crossover (b * K * MC_*RATE_P) is 4x the attitude loop's MC_*_P,
+# and capped at PX4's documented 5 (the generator reports a cap). Raising it
+# further buys nothing and costs robustness: matching the quad's b * K was
+# flown, put roll at K 4.8, and sustained a roll limit cycle once a yaw step
+# drove a motor to zero, because this vehicle has far less acceleration
+# headroom at that gain. b uses the inertia with the arm at its home pose: an
+# arm that moves in flight changes it, and these do not follow.
+#
+# MC_*RATE_MAX is the acceleration available at hover divided by the attitude P
+# gain, capped at stock. The allocator holds thrust and backs an axis off once a
+# motor reaches zero, and above that limit the P law asks for more deceleration
+# than remains: a large yaw step then overshoots by tens of degrees.
+param set-default MC_ROLLRATE_K {{MC_ROLLRATE_K}}
+param set-default MC_PITCHRATE_K {{MC_PITCHRATE_K}}
+param set-default MC_YAWRATE_K {{MC_YAWRATE_K}}
+param set-default MC_ROLLRATE_MAX {{MC_ROLLRATE_MAX}}
+param set-default MC_PITCHRATE_MAX {{MC_PITCHRATE_MAX}}
+param set-default MC_YAWRATE_MAX {{MC_YAWRATE_MAX}}

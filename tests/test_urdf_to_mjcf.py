@@ -737,3 +737,134 @@ def test_airframe_leaves_no_unfilled_placeholder(rig, tmp_path):
     out = tmp_path / "22009_test_rig"
     u2m.emit_airframe(u2m.load_sidecar(path), model, out)
     assert "{{" not in out.read_text()
+
+
+# --- attitude gains -------------------------------------------------------
+#
+# PX4's rate gains act on a normalized torque, so the airframe rescales them by
+# the plant gain against the quad's (the airframe template says why). A flight
+# shows only whether the result is right, not which piece is wrong, so each
+# piece is pinned here: the reference, PX4's normalization, the inertia, and the
+# hover acceleration behind the rate limit.
+
+_QUAD_MODEL = Path(__file__).resolve().parents[1] / "models" / "quad_x.xml"
+
+
+def _rig_vehicle(path: Path, model: mujoco.MjModel):
+    sidecar = u2m.load_sidecar(path)
+    return u2m.Vehicle(model, u2m.rotors_from_specs(sidecar.rotors, sidecar.omega_idle))
+
+
+def test_the_quad_maps_onto_stock_px4():
+    """Phase 5 flies the quad on stock gains, so the rule must leave it there:
+    its rate loops already clear the separation on every axis, and its hover
+    headroom clears every stock rate limit.
+    """
+    model = mujoco.MjModel.from_xml_path(str(_QUAD_MODEL))
+    gains = u2m.attitude_gains(
+        model, u2m.Vehicle(model), np.full(4, u2m.PX4_CA_ROTOR_CT_DEFAULT)
+    )
+    assert np.all(gains.separation >= u2m.RATE_LOOP_SEPARATION)
+    np.testing.assert_array_equal(gains.rate_k, 1.0)
+    np.testing.assert_array_equal(gains.rate_max_deg, u2m.PX4_RATE_MAX_DEG)
+
+
+def test_gains_rise_only_as_far_as_the_separation_needs(rig, tmp_path):
+    """A tenth of the quad's km slows the rig's yaw loop to about its attitude
+    loop, so yaw K goes up to reach 4x; roll and pitch already clear it and stay
+    at stock. Raising every axis to a reference vehicle's loop gain instead was
+    flown on the X8 and sustained a roll limit cycle.
+    """
+    path, data = rig
+    for r in data["rotors"]:
+        r["km"] = 0.005
+    _write(path, data)
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    text = out.read_text()
+
+    gains = u2m.attitude_gains(model, _rig_vehicle(path, model), np.full(4, 6.5))
+    yaw = u2m.RATE_LOOP_SEPARATION * 2.8 / (gains.plant_gain[2] * 0.2)
+    assert 1.0 < yaw < u2m.PX4_RATE_K_MAX  # the case under test: raised, not capped
+    assert f"MC_YAWRATE_K {yaw:.2f}" in text
+    assert "MC_ROLLRATE_K 1.00" in text
+    assert "MC_PITCHRATE_K 1.00" in text
+
+
+def test_px4_normalization_gives_a_symmetric_xs_analytic_authority(rig):
+    """For an X, PX4's scaling makes every roll/pitch entry 1/sqrt(2) and every
+    yaw entry 1, so a unit command buys s*N*r/sqrt(2) and s*N*km.
+
+    A wrong scale moves every derived K by the same factor, and nothing in a
+    flight says why. The rig's arm puts its CoM off the rotor centre, which a
+    torque column's zero net thrust must cancel.
+    """
+    path, _ = rig
+    model, _ = _convert(path)
+    vehicle = _rig_vehicle(path, model)
+    gains = u2m.attitude_gains(model, vehicle, np.full(4, 6.5))
+
+    hover = vehicle.hover_command()
+    omega = vehicle.omega(np.full(4, hover))[0]
+    slope = vehicle.c_t[0] * omega * (vehicle.omega_max[0] - vehicle.omega_idle) / hover
+    np.testing.assert_allclose(gains.authority[:2], slope * 4 * 0.2 / np.sqrt(2), rtol=1e-6)
+    np.testing.assert_allclose(gains.authority[2], slope * 4 * 0.05, rtol=1e-6)
+
+
+def test_inertia_is_the_whole_vehicle_about_its_own_com(rig):
+    """The rate loops turn the vehicle with the arm, about the composite CoM.
+
+    By hand from the rig's URDF: base 2.0 kg at the origin, arm link 0.5 kg at
+    (0.1, 0, 0.07), so the CoM is (0.02, 0, 0.014) and each body adds its
+    parallel-axis term. Using base_link's own inertia instead is the mistake
+    this rules out, and it would overstate every K by the arm's share.
+    """
+    path, _ = rig
+    model, _ = _convert(path)
+    base = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    com, inertia = u2m._subtree_mass_properties(model, base)
+    np.testing.assert_allclose(com, [0.02, 0.0, 0.014], atol=1e-9)
+    np.testing.assert_allclose(np.diag(inertia), [0.02296, 0.02696, 0.035], rtol=1e-6)
+    assert inertia[0, 2] == pytest.approx(-0.0028, rel=1e-6)
+
+
+def test_a_capped_gain_is_written_at_px4s_limit_and_reported(rig, tmp_path, capsys):
+    """km 0.002 leaves yaw needing K ~ 10, past PX4's documented 5. It is written
+    at 5 and said out loud, since the loop then sits short of the separation and
+    a flight would show that without saying why.
+    """
+    path, data = rig
+    for r in data["rotors"]:
+        r["km"] = 0.002
+    _write(path, data)
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    assert "MC_YAWRATE_K 5.00" in out.read_text()
+    assert "clamped to PX4's 5" in capsys.readouterr().out
+
+
+def test_yaw_rate_limit_is_hover_yaw_acceleration_over_the_attitude_gain(rig, tmp_path):
+    """At hover the allocator holds thrust and backs yaw off once a motor reaches
+    zero. For an X that is two rotors down to idle and two up to a = 2 * hover^2;
+    the resulting torque over I_zz, divided by MC_YAW_P, is the fastest yaw the
+    P law can still brake from.
+    """
+    path, data = rig
+    for r in data["rotors"]:
+        r["km"] = 0.005
+    _write(path, data)
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+
+    vehicle = _rig_vehicle(path, model)
+    hover = vehicle.hover_command()
+    thrust = lambda u: float(vehicle.c_t[0] * vehicle.omega(np.array([u]))[0] ** 2)
+    torque = 0.005 * 2 * (
+        (thrust(hover) - thrust(0.0)) + (thrust(np.sqrt(2) * hover) - thrust(hover))
+    )
+    expected = np.degrees(torque / 0.035 / 2.8)
+    assert expected < 200.0  # the case under test: the limit binds
+    assert f"MC_YAWRATE_MAX {expected:.1f}" in out.read_text()

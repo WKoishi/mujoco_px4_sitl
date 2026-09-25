@@ -334,6 +334,13 @@ X8 has far more yaw authority than a quad of the same size.
 all 8 `CA_ROTOR*` blocks, `PWM_MAIN_FUNC1..8 = 101..108`, add `MAV_TYPE 14`, and
 change the filename and `@type` to `Octorotor Coaxial`.
 
+`urdf_to_mjcf.py --emit-airframe` now generates all of this from
+[px4/mujoco_x8.airframe.template](px4/mujoco_x8.airframe.template), and adds
+what the quad's file never needed: attitude gains derived from the model's
+inertia. PX4's rate gains act on a normalized torque, so stock values do not
+transfer to a vehicle with far less authority per unit inertia; the template
+says how they are derived.
+
 No MAVLink-side change: `HIL_ACTUATOR_CONTROLS` carries 16 channels
 ([hil.py:32](src/mujoco_px4_sitl/hil.py#L32)), and `effective(count)` takes the
 first N.

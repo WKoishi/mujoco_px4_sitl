@@ -78,11 +78,25 @@ out of authority at hover: on a 90° step a motor sits at zero and yaw
 acceleration tops out near 80°/s², so a 200°/s rate limit cannot be braked in
 time.
 
-Both yaw problems were confirmed by fixing them, at runtime and not saved:
-`MC_YAWRATE_K 5` brings the 20° step to the quad's response, and adding
-`MC_YAWRATE_MAX 45` does the same for 90°. **The airframe still carries stock
-gains** — where tuned gains should live is §3 step 1, and it matters for the
-arm, since shoulder pitch and base yaw are what the arm disturbs.
+**The generated airframe now carries derived gains**, and the X8 has flown them.
+`--emit-airframe` computes each axis's plant gain from the model and the
+sidecar. It raises `MC_*RATE_K` only until the rate loop is 4× faster than the
+attitude loop (capped at PX4's documented 5), and sets `MC_*RATE_MAX` to the
+acceleration left at hover over the attitude P. The airframe template says
+why. For this X8 that is roll stock, pitch 2.18, yaw 5 (the rule asks for 9),
+and yaw limited to 29.6°/s. With those gains a 20° yaw step settles in 0.7 s
+with at most 2° overshoot, a 90° step overshoots at most 0.6°, pitch overshoots
+2 %, and the Phase 5 profile still passes. `IMPLEMENTATION_PLAN.md` phase 5 has
+the tables.
+
+**The first version of the rule was wrong, and flight caught it.** It matched
+the quad's physical loop gain, which put roll at K 4.8. Hover and the
+regression profile were fine, but after the first yaw step drove a motor to
+zero, roll went into a limit cycle that lasted over a minute. At the same loop
+gain this X8 has about 4.5× less acceleration headroom than the quad, so it
+saturates on much smaller signals. The rule now asks only for enough speed.
+This matters for the arm: shoulder pitch and base yaw are exactly what the arm
+disturbs.
 
 Motors are chosen: `c_t`, `km` and `ω_max` are fitted from the manufacturer's
 data and live in the private sidecar (§4). `ω_idle` is not in that data and is
@@ -100,7 +114,7 @@ that does not supply its own — which is now only the quad.
 | **Nothing enforces propeller clearance** | no guard anywhere; the joint limits are not one | the limits are the real mechanical ones (§4), and poses inside them put the arm *inside* a propeller disc — measured, not inferred. Deferred by decision, but it is a constraint on the `arm_cmd` writer above, not a separate task |
 | Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
 | No arm state on the side channel | `SimState` has 9 fields, none of them joint state | an out-of-process controller is flying blind on the arm. Extending it touches `SimState`, the `Physics` protocol and `StubPhysics` |
-| X8 attitude gains are PX4's stock values | the airframe template sets none | yaw overshoots 50–70 % on a 20° step and pitch 16 % on 5°, because the normalized gains assume far more authority per unit inertia than this X8 has (§1). Fixed at runtime, not in the airframe: §3 step 1 |
+| Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's home pose | an arm that moves in flight changes the inertia and the gains do not follow. Rigid-arm inertia is what the Phase 7 disturbance test starts from, so it is the right starting point, not the whole answer |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
 | Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (`MODELING_CONVENTIONS.md` §5 suggests 0.75–0.85). Deliberately deferred so the first X8 flight introduces one unverified quantity, not two: it moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75, so the sidecar's `c_t` and the airframe must change together |
 
@@ -143,28 +157,20 @@ and the X8 airframe — are **done**: `--rotors` / `MUJOCO_SITL_ROTORS` with
 the simulator share **one** parser; a second one would drift silently, since a
 model whose rotor count still matches flies with the wrong thrust.
 
-Flying the X8 is **done** (§1): it passes the Phase 5 profile. What remains:
+Flying the X8 is **done** (§1): it passes the Phase 5 profile. So are its
+attitude gains: `--emit-airframe` derives them from the model and the sidecar
+the same way it derives `MPC_THR_HOVER`, so they follow the arm and the motors
+when either changes (§1). A private research controller that replaces PX4's
+rate loop needs none of it. What remains:
 
-1. **Give the X8 attitude gains that match its authority**, before any arm
-   flight. The Phase 7 exit criterion measures how PX4 rejects the arm's
-   disturbance, and with stock gains that measures the mistuning in yaw and
-   pitch rather than the arm. §1 has the numbers and the runtime fix. The open
-   question is where the gains live. The recommendation is to have
-   `--emit-airframe` derive `MC_{ROLL,PITCH,YAW}RATE_K` from the plant-gain
-   ratio against the quad, the same way it already derives `MPC_THR_HOVER`, and
-   `MC_YAWRATE_MAX` from the yaw acceleration available at hover. Both come from
-   the model and the sidecar, so they follow the arm and the motors when those
-   change, which a hand-set number in the sidecar would not. A private
-   research controller that replaces PX4's rate loop needs none of this. It is
-   still a decision, since anchoring to the quad is a choice: PX4's defaults were
-   not designed for that model either.
-2. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
+1. **Map `arm_cmd` onto `data.ctrl`**, scanning the `arm_act` prefix, in
    `step_frame` at [sim.py:137](src/mujoco_px4_sitl/sim.py#L137). `clear()` only
    zeros `base_link`'s `xfrc_applied`, so any writer that applies forces to the arm
    owns its own clearing. The generated model already has `arm_act0..4` with
    `ctrlrange` set. Decide the staleness behaviour here, not later (§2, row 2).
-3. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
-   separable from the others.
+2. **The coaxial `c_t` discount**, as its own step with its own flight, so it is
+   separable from the others. It moves the plant gain as well as the hover
+   point, so regenerate the airframe and fly the attitude steps again.
 
 Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
 exit criterion; `RotorState.omega` is what makes them expressible.
@@ -255,7 +261,7 @@ the guard — they are the mechanism's, and the mechanism can do this. Nothing i
 the model stops a commanded angle from doing it either.
 
 Deferred by decision, and the place it lands is the `arm_cmd` writer (§2, §3
-step 2), not the model: a reachable-set guard there, or a collision check on the
+step 1), not the model: a reachable-set guard there, or a collision check on the
 commanded pose before it reaches `data.ctrl`.
 
 `vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
