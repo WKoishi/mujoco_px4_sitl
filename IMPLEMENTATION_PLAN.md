@@ -1524,7 +1524,7 @@ criterion.
 disturbance that PX4 rejects without losing position lock. Ground truth for
 both base and arm is available externally. *Met: the disturbance is measured
 below, and base and arm ground truth reach an in-process controller's recorder.
-The side channel still carries no arm joint state, by choice (`AGENTS.md` §3).*
+The side channel still carries no arm joint state, by choice (`AGENTS.md` §2).*
 
 #### Arm motion in hover
 

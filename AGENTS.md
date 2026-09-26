@@ -1,154 +1,38 @@
 # Handoff
 
-Start here when picking up this work. Current state, what is not built, what to do
-next. No interface contract and no model authoring rules live here — see §5 for
-which document owns what. §7 has the launch lines for each vehicle.
+Start here when picking up this work: current state, what is not built, what to
+do next, and how to work without drowning the session (§6). No interface contract,
+no model authoring rules, no history: §5 says which document owns what, and git
+has the reasoning of each step. §7 has the launch lines.
 
 ---
 
 ## 1. Where things stand
 
-Phases 0–6 are complete and the quadrotor flies under PX4. `python -m pytest` is
-green with no PX4 build and no GL.
+Phases 0–7 are met, and `python -m pytest` is green with no PX4 build and no GL.
+`IMPLEMENTATION_PLAN.md` holds every measured baseline at the phase that produced
+it. **Those are the regression reference: do not copy them here, and do not delete
+them when the platform changes.**
 
-`IMPLEMENTATION_PLAN.md` records the measurements taken when each phase was met —
-Phase 3's attitude table exact to five decimals, Phase 5's full
-arm → takeoff → 5 m square → land with its hover error table, Phase 6's side-channel
-verification. **Those are the regression baseline. Do not copy them here, and do not
-delete them from the plan when the platform changes.** If an X8 change breaks
-something, the quad numbers are the only way to tell "the change broke it" from
-"it never worked".
-
-Phase 7 (aerial manipulator) is under way. Its first two prerequisites were done
-earlier: `RotorModel` is ω-based with per-rotor arrays and an arbitrary rotor count
-(`MODELING_CONVENTIONS.md` §2.5), and the PX4 side is consistent with it —
-`THR_MDL_FAC 1.0`, `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144` (§2.6), those being
-the **quad's** values. The conversion pipeline and the X8 model have since landed
-(§3, §4).
-
-**The quad has been flown twice on it**, once at `fac = 0` and once after the fix,
-with hover error unchanged (0.153 m vertical / 0.121 m horizontal against ground
-truth, inside the baseline's band). `IMPLEMENTATION_PLAN.md` phase 5 has both sets
-of numbers and the two measurement traps.
-
-`fac = 0` was not a tuning preference but an inconsistency: `CA_ROTOR*_CT` is
-defined as `Thrust = CT · u²` while the effectiveness matrix is linear in the
-actuator variable, so the allocator's variable is `u²` and the mixer's square root
-is what converts it back. Without it the attitude loop ran at exactly 2.00× its
-design gain — flyable, inside PX4's default margin, and invisible in a 5 m square
-(fitting angular acceleration against commanded torque over that flight gives
-R² ≈ 0.15, i.e. noise). The ratio is asserted on the plant instead, in
-`tests/test_vehicle.py`.
-
-**The X8 now reaches SITL.** The model is generated from the first CAD export by
-`scripts/urdf_to_mjcf.py` and passes every self-check (§4); `--rotors` /
-`MUJOCO_SITL_ROTORS` builds its 8-rotor `RotorModel` from the sidecar at startup;
-and its PX4 airframe (`22002_mujoco_x8`, generated from
-`px4/mujoco_x8.airframe.template`) carries the measured allocation. Verified at
-load: 8 rotors, `MPC_THR_HOVER 0.2162`, and **no auto-calibration warning** —
-which is the signal §4 describes, now silent because the measured values arrive.
-
-**The X8 has flown the Phase 5 profile**, arm held at zero, and passes it with
-the quad's numbers: hover 0.117 m horizontal / 0.202 m vertical max against
-ground truth, corners 0.01–0.05 m, `brake=0 timeouts=0`, no failsafe.
-`IMPLEMENTATION_PLAN.md` phase 5 has the table. PX4's own `hover_thrust_estimate`
-settled on 0.2162, exactly the generated `MPC_THR_HOVER`, so the sidecar's thrust
-and the airframe agree through PX4's loop and not only on paper.
-
-Of the three dynamic unknowns that flight was meant to settle:
-
-- **The index→ESC mapping is consistent with the model.** Yaw steps move the
-  commanded way, roll/pitch stay under 2° through them, and hover yaw error is
-  0.2°. A mismatch would have diverged or cross-coupled. Still unconfirmed
-  against the *wiring*, which no simulation can settle.
-- **Coaxial yaw authority is weak, and PX4's default gains do not suit it.**
-  Measured, and the cause is known — see below.
-- **The arm's mass moving in flight** is now flown; see below.
-
-**PX4's rate gains act on a normalized torque**: the allocator scales each axis
-so that ±1 means the vehicle's own authority on that axis. So the physical loop
-gain is the default gain times (authority / inertia), and on this X8 that ratio
-is about 20× below the quad's in yaw, 13× in pitch and 5× in roll. With stock
-`MC_*RATE_*` the yaw-rate loop crosses over *below* the yaw attitude loop
-(`MC_YAW_P 2.8`), and a 20° yaw step overshoots 50–70 % and takes 5–8 s to
-settle. The quad does the same step in 0.6 s with 1–4° overshoot. Pitch is
-marginal (16 % overshoot on a 5° step), roll is fine (≤ 1.4 %). Yaw also runs
-out of authority at hover: on a 90° step a motor sits at zero and yaw
-acceleration tops out near 80°/s², so a 200°/s rate limit cannot be braked in
-time.
-
-**The generated airframe now carries derived gains**, and the X8 has flown them.
-`--emit-airframe` computes each axis's plant gain from the model and the
-sidecar. It raises `MC_*RATE_K` only until the rate loop is 4× faster than the
-attitude loop (capped at PX4's documented 5), and sets `MC_*RATE_MAX` to the
-acceleration left at hover over the attitude P. The airframe template says
-why. For this X8 that is roll stock, pitch 2.18, yaw 5 (the rule asks for 9),
-and yaw limited to 29.6°/s. With those gains a 20° yaw step settles in 0.7 s
-with at most 2° overshoot, a 90° step overshoots at most 0.6°, pitch overshoots
-2 %, and the Phase 5 profile still passes. `IMPLEMENTATION_PLAN.md` phase 5 has
-the tables.
-
-**The first version of the rule was wrong, and flight caught it.** It matched
-the quad's physical loop gain, which put roll at K 4.8. Hover and the
-regression profile were fine, but after the first yaw step drove a motor to
-zero, roll went into a limit cycle that lasted over a minute. At the same loop
-gain this X8 has about 4.5× less acceleration headroom than the quad, so it
-saturates on much smaller signals. The rule now asks only for enough speed.
-This matters for the arm: shoulder pitch and base yaw are exactly what the arm
-disturbs.
-
-Motors are chosen: `c_t`, `km` and `ω_max` are fitted from the manufacturer's
-data and live in the private sidecar (§4). `ω_idle` is not in that data and is
-still a choice, and `vehicle.py`'s placeholders remain the fallback for any model
-that does not supply its own — which is now only the quad.
-
-**The arm is driven** through [arm.py](src/mujoco_px4_sitl/arm.py);
-`README.md` ("Driving the arm") has the interface. Two decisions came with it:
-
-- **A command watchdog on simulated time**, on by default, whose timeout action
-  (`freeze`, `keep`, `limp`) is configurable: it models the arm driver, which a
-  lockstep stall must not trip, and what the arm does when its controller
-  stalls is what the private research studies. A command may carry
-  `state_time`, making its age the age of the data behind it.
-- **Propeller intrusion is checked every frame on the reached pose, never
-  blocked**, against discs drawn from a per-rotor `radius` (§4).
-
-Flown the same day (`IMPLEMENTATION_PLAN.md` phase 7): PX4 held position
-through every arm move within 2° of attitude, **except after a watchdog stall,
-when the first fresh command landed as a step and cost 7.8° of pitch**. Servo
-droop moved reached poses across a disc in both directions, so **the commanded
-pose does not predict an intrusion**.
-
-**The research controller runs in process** ([control.py](src/mujoco_px4_sitl/control.py),
-decided in §3), and has flown the X8. It is called from the lockstep loop at
-chosen sample instants of simulated time; its arm command lands after a chosen
-delay, less a seeded drop schedule, so the command age has a known bound. It
-reads the arm's encoders and PX4's EKF2 estimate over MAVLink
-([px4link.py](src/mujoco_px4_sitl/px4link.py)), the path a companion computer
-uses, and sends PX4 setpoints and commands the same way. Ground truth goes only
-to a recorder. `run_sitl.sh --px4-only` starts PX4 for it.
-
-**The PX4 legs are chosen too, since phase 2 of the topology landed on
-2026-09-26** (§3). Once PX4 answers, the loop is in strict lockstep, and IMU →
-actuator is exactly one frame. The controller's estimate is a chosen age of at
-least one frame, fetched behind a PING barrier after every answer, and its
-setpoints and commands are behind a barrier before a chosen frame. Arming
-included, so a run is armed at a simulated time.
-
-Measured through the real loop (`IMPLEMENTATION_PLAN.md` phase 7), on the quad
-and the X8, idle and with every core busy:
-- Every frame was answered after PX4's first answer.
-- A body-rate setpoint drove its intended frame every time.
-- No estimate was late.
-- Unpaced, the quad ran at 12.6× and the X8 at 7.7× (both about 2× loaded).
-
-Two X8 flights of one schedule, armed on the same sample, gave identical sample
-instants, drops and proven flags, and a bit-identical arm trajectory until
-arming. What stays unchosen: the estimate's age is one of two values, and which
-sample gets which follows EKF2's cadence phase. That phase is set in boot, and
-it was swapped between those two flights. Also unchosen: an attitude
-setpoint's extra frame inside PX4. The quad and the X8 pass the Phase 5 profile
-under the strict loop, and the X8 passes its attitude steps (phase 5).
+- **Quad** (`models/quad_x.xml`) flies the Phase 5 profile inside the GPS-noise band.
+- **X8 + 5-DoF arm** is generated from the CAD export by `scripts/urdf_to_mjcf.py`
+  into the private repo, together with its PX4 airframe (`22002_mujoco_x8`). The
+  airframe carries the measured allocation, `MPC_THR_HOVER` and attitude gains
+  derived from the model (`px4/mujoco_x8.airframe.template` says how). It flies
+  Phase 5 and its attitude steps (plan phase 5).
+- **The arm** is driven through [arm.py](src/mujoco_px4_sitl/arm.py): position
+  servos, a command watchdog on simulated time, propeller intrusion reported on
+  the reached pose and never blocked (`README.md`, "Driving the arm").
+- **The research controller runs in process** ([control.py](src/mujoco_px4_sitl/control.py)),
+  on simulated time, reading the arm's encoders and PX4's EKF2 estimate over
+  MAVLink ([px4link.py](src/mujoco_px4_sitl/px4link.py)) as a companion computer
+  would, and sending PX4 setpoints and commands the same way. Ground truth goes
+  only to a recorder.
+- **Every leg to the vehicle has a chosen delay** since phase 2 of the topology
+  (2026-09-26): strict lockstep with IMU → actuator exactly one frame, estimates
+  at a chosen age, setpoints and commands behind a PING barrier before a chosen
+  frame (plan §3.2, §3.9). Acceptance passed on the quad and the X8, idle and
+  loaded; `scripts/fly_in_process.py acceptance` repeats it in under a minute.
 
 ---
 
@@ -156,267 +40,93 @@ under the strict loop, and the X8 passes its attitude steps (phase 5).
 
 | Gap | Where | Consequence |
 |---|---|---|
-| **`--hold-pose` makes the arm weightless** | `_pin_pose` restores the base only between frames, so within one the vehicle free-falls | no droop, and a `limp` arm does not fall. Phase 3's IMU table is unaffected; testing the arm on a pinned vehicle is not. `tests/test_arm.py` welds the base instead. The fix is a support wrench at the subtree CoM |
-| Propeller clearance is idealized | `PropellerMonitor` in [arm.py](src/mujoco_px4_sitl/arm.py) | flat discs (the real sweep is about ±7 mm thick at the root), capsules and spheres only, once per IMU frame, against collision primitives fitted by eye (§4). The conversion's envelope survey is kinematic, so droop can move its poses across a disc either way. Margin is the consumer's to add |
-| Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle, so a flipped sign drives the real arm the wrong way. The ranges themselves are settled |
-| Arm joint state reaches only an in-process controller | `ground_truth.arm` carries command age, staleness and propeller clearance, not `qpos` | an out-of-process consumer (a ROS 2 bridge, a plot) sees no joints. No longer a controller problem (§3); add it to the side channel when a monitoring consumer needs it |
-| Arm encoders are ideal | `JointReading` in [arm.py](src/mujoco_px4_sitl/arm.py) is MuJoCo's joint state at the sample instant | no quantisation, noise or latency on the controller's joint feedback. Model them from the servo's datasheet once it is chosen |
-| Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `arm.py` refuses any other kind, and rejects `mode: "torque"` | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too, and decide intrusions as well as tracking: their gravity droop moved reached poses across a disc (§1) |
-| Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set in PX4's boot, and PX4's thread race between its attitude and rate loops (`IMPLEMENTATION_PLAN.md` §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs (it did, between two X8 flights). An attitude setpoint reaches the rate loop one frame after a body-rate one on most frames and in the same frame on the rest, 3–98 % depending on load. Body-rate setpoints and the IMU → actuator delay are exact. Accepted 2026-09-26; `EKF2_PREDICT_US 4000` would remove the first, not tried |
-| Two runs of one schedule drift apart | PX4's `sensor_*_sim` draw their noise from one shared `rand()` whose position boot decides (`IMPLEMENTATION_PLAN.md` §3.3), and within a frame PX4's threads race (§3.2 there) | identical until arming, then up to about a metre apart in hover, under any loop (0.34 m for the strict X8 pair of phase 7), so a single pair cannot resolve an effect smaller than that; compare over repeated runs. Seeded simulator-side sensors (strategy B, deferred, §3) brought two strict runs to 2–4 cm. Bit-identical runs would need PX4 changes |
-| Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's home pose | an arm that moves in flight changes the inertia and the gains do not follow. Rigid-arm inertia is what the Phase 7 disturbance test starts from, so it is the right starting point, not the whole answer |
-| IMU has no noise or bias | `sim.py` sends MuJoCo's ideal accel/gyro, and PX4's `simulator_mavlink` only quantizes them (`SimulatorMavlink.cpp:198-270`): under MAVLink HIL the simulator owns IMU noise. Baro, mag and GPS do get noise, from PX4's `sensor_*_sim` | EKF2's bias estimation is never exercised, and estimate errors look better than they will be -- including the estimate an in-process controller is handed. The derived attitude gains were verified on a noiseless gyro, and noise is what the rate D term suffers from, so re-fly the step tests once it lands. Add white noise and a bias random walk on the `HIL_SENSOR` path only, sized from the chosen IMU's datasheet: `SimState.gyro_frd` also feeds ground truth (`HIL_STATE_QUATERNION`, the side channel), which must stay clean. If strategy B lands first, its sensor module is the place (`IMPLEMENTATION_PLAN.md` §3.3) |
-| No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
-| Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck is modelled 15–25 % too strong (`MODELING_CONVENTIONS.md` §5 suggests 0.75–0.85). Deliberately deferred so the first X8 flight introduces one unverified quantity, not two: it moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75, so the sidecar's `c_t` and the airframe must change together |
-| No uXRCE-DDS agent or `px4_msgs` on this machine | PX4's side is ready: `px4_sitl_default` starts `uxrce_dds_client` on UDP 8888, subscribed to `/fmu/in/vehicle_thrust_setpoint` and `/fmu/in/vehicle_torque_setpoint`, and nothing on the host answers | the normalized thrust/torque interface has no MAVLink offboard path in v1.17, so it cannot be flown until an agent and `px4_msgs` are installed. Attitude and body-rate setpoints work over MAVLink today. Environment rather than code: `src/` stays free of ROS imports (§6). DDS setpoints cannot use phase 2's MAVLink barrier (`IMPLEMENTATION_PLAN.md` §9) |
+| **`--hold-pose` makes the arm weightless** | `_pin_pose` restores the base only between frames | no droop, and a `limp` arm does not fall; `tests/test_arm.py` welds the base instead. Fix: a support wrench at the subtree CoM |
+| Propeller clearance is idealized | `PropellerMonitor` in [arm.py](src/mujoco_px4_sitl/arm.py) | flat discs (the real sweep is about ±7 mm thick at the root), capsules and spheres only, once per frame, primitives fitted by eye. Margin is the consumer's to add |
+| Arm joint zero and sign convention | unverified against hardware | `arm_cmd.values[i]` is an absolute angle; a flipped sign drives the real arm the wrong way |
+| Arm joint state reaches only an in-process controller | `ground_truth.arm` has no `qpos` | an out-of-process consumer sees no joints; add it to the side channel when a monitoring consumer needs it |
+| Arm encoders are ideal | `JointReading` | no quantisation, noise or latency; model them once the servo is chosen |
+| Arm has position servos only | one position actuator per joint; `arm.py` refuses others and `mode: "torque"` | no torque or velocity interface. The servo gains are provisional, and their droop decides intrusions as well as tracking |
+| Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set at boot; PX4's attitude/rate thread race (plan §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs. An attitude setpoint is one frame later than a body-rate one on most frames, the same frame on 0–98 %, by load. Accepted; `EKF2_PREDICT_US 4000` would remove the first, not tried |
+| Two runs of one schedule drift apart | PX4's `sensor_*_sim` share one `rand()` whose position boot decides (plan §3.3) | identical until arming, then up to about a metre apart (0.34 m for the strict X8 pair). Compare over repeated runs. Seeded simulator-side sensors (strategy B, §3) brought a pair to 2–4 cm |
+| Attitude gains are sized for the arm at home | `attitude_gains` uses the home-pose inertia | the gains do not follow an arm that moves in flight |
+| IMU has no noise or bias | `sim.py` sends ideal accel/gyro; under MAVLink HIL the simulator owns IMU noise | EKF2's bias estimation is never exercised, and estimates look better than they will be. Add noise on the `HIL_SENSOR` path only (ground truth must stay clean), sized from the IMU's datasheet, then re-fly the step tests |
+| No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
+| Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck 15–25 % too strong. Moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75: sidecar and airframe change together. Next step (§3) |
+| No uXRCE-DDS agent or `px4_msgs` here | PX4 starts `uxrce_dds_client` on UDP 8888; nothing answers | thrust/torque setpoints cannot be flown; their timing is open (plan §9) |
 
-`scripts/manipulability.py` answers the kinematic half of the arm question —
-whether a pose is reachable at all, per voxel, with any subset of joints frozen.
-It needs no PX4 and no physics step, and says nothing about flight: rank is not
-thrust.
-
-One authoring hazard has **no test coverage in `src/`**: rotor sites must be
-direct children of `base_link`, or the lever arm is silently wrong
-(`MODELING_CONVENTIONS.md` §2.2). The conversion script now places them there by
-construction and fails the check otherwise, so a generated model is safe — a
-hand-written one is still exposed.
-
-One more the `spin`-length check does **not** catch: a sidecar whose rotor count
-matches the model but whose coefficients belong to a different vehicle. Both load
-and fly, with the wrong thrust. Keeping the sidecar next to the MJCF it generated
-is the only thing preventing it.
+Two authoring hazards nothing in `src/` catches: rotor sites that are not direct
+children of `base_link` give a silently wrong lever arm (`MODELING_CONVENTIONS.md`
+§2.2; the conversion script places them correctly), and a sidecar from another
+vehicle with the same rotor count flies with the wrong thrust. Keep each sidecar
+next to the MJCF it generated.
 
 ---
 
-## 3. Next steps, in dependency order
+## 3. Next steps
 
-Steps 1 and 2 — the ω-based `RotorModel` and the `MPC_THR_HOVER` / `THR_MDL_FAC`
-recomputation — are **done and flight-verified on the quad** (§1;
-`IMPLEMENTATION_PLAN.md` phase 5 has the numbers). `MODELING_CONVENTIONS.md` §2.5
-records the parametrization and the re-derived `THR_MDL_FAC` argument;
-`px4/22001_mujoco_quad` carries it as a comment block.
+1. **The coaxial `c_t` discount**, as its own step with its own flight. It moves
+   the plant gain as well as the hover point: pick the factor in the sidecar,
+   regenerate MJCF and airframe together (§7), re-fly Phase 5 and
+   `fly_in_process.py steps`, and record both at plan phase 5.
 
-Step 3, the **conversion script and its sidecar schema**, is also done:
-[scripts/urdf_to_mjcf.py](scripts/urdf_to_mjcf.py) plus
-[models/x8_arm.conversion.yaml.template](models/x8_arm.conversion.yaml.template),
-covered by `tests/test_urdf_to_mjcf.py`. It converts the first CAD export
-end-to-end and the generated model passes every self-check (§4 has the numbers).
+**Strategy B** — baro, mag and GPS synthesized by the simulator, seeded — waits
+until a use needs it: single-pair counterfactuals, sensor noise as a controlled
+variable, or the IMU noise gap. Plan §3.3 has the evidence and what it takes.
+**Aerodynamics** come after that, deliberately.
 
-Steps 1 and 3 of the original list — building the `RotorModel` from the sidecar,
-and the X8 airframe — are **done**: `--rotors` / `MUJOCO_SITL_ROTORS` with
-`rotorconfig.py`, and `--emit-airframe` with `install_px4_files.sh --airframe`.
-`RotorSpec` and the rotors-block parser moved into the package so the script and
-the simulator share **one** parser; a second one would drift silently, since a
-model whose rotor count still matches flies with the wrong thrust.
+**The controller topology is decided and built.** In process, because the
+research needs data ages tested at a *chosen* value, counterfactuals under
+identical timing, stalls by design and batches faster than real time; out of
+process all four could only be measured. The earlier reason for out of process,
+"a slow solver cannot stall lockstep", was wrong: under lockstep a stall only
+freezes PX4's clock. Phase 2's decisions, all built: strict lockstep as the only
+regime; IMU → actuator one frame; estimates fetched after each answer at an age
+of at least one frame, no `/proc`, no age 0; setpoints and commands behind a PING
+barrier at least one frame ahead; strategy B later; EKF2's cadence phase left
+unchosen. `sim/run_x8.py` in the private repo exposes the two PX4 delays.
 
-Flying the X8 is **done** (§1): it passes the Phase 5 profile. So are its
-attitude gains: `--emit-airframe` derives them from the model and the sidecar
-the same way it derives `MPC_THR_HOVER`, so they follow the arm and the motors
-when either changes (§1). A private research controller that replaces PX4's
-rate loop needs none of it.
+Traps worth knowing before touching the loop or the API link (plan §3.2, §3.9
+have the sources):
 
-Driving the arm is **done** (§1). A future writer that applies forces to the
-arm owns its own clearing: `clear()` zeros only `base_link`'s `xfrc_applied`.
-The research-controller topology is **decided and built**, both phases (below).
-What remains:
+- **The receive thread blocks on simulated time** behind `SET_MESSAGE_INTERVAL`
+  and `REQUEST_MESSAGE`: a barrier behind one hangs. The link refuses them.
+- **PX4 drops the ACK to a new component's first message** when it races the
+  registration; the silencing request sits between two PINGs for that reason.
+- **No heartbeat of our own**: an `ONBOARD_CONTROLLER` heartbeat that lapses for
+  `COM_OBC_LOSS_T` of PX4's clock raises "mission computer lost".
+- **An answer does not prove the frame's estimate**, and **the barrier looks
+  unnecessary when idle**: both only show under load, so test loaded.
+- **PX4 starts answering 4–78 frames after it connects**; the fallback is needed.
+- **`SET_ATTITUDE_TARGET` publishes its setpoint only in Offboard.**
+- **PX4 cannot exit once simulated time stops** (plan §7): stop it first, or kill
+  it, as `run_sitl.sh` and `fly_in_process.py` do.
+- **A spinner process forked after `run()` inherits its SIGTERM handler**, which
+  only stops a loop: kill load generators with SIGKILL.
+- **Yaw read against the target carries EKF2's heading error**, 1–2° on the X8.
 
-1. **The coaxial `c_t` discount**, as its own step with its own flight, now that
-   phase 2 has flown so the two stay separable. It moves the plant gain as well as
-   the hover point, so regenerate the airframe and fly the attitude steps again
-   (`scripts/fly_in_process.py steps`).
-2. **`sim/run_x8.py` in the private repo** still says the PX4 legs are wall-clock
-   and exposes only the arm schedule. A diff was proposed to the user on
-   2026-09-26; they apply it, since they stage work of their own there.
-
-**Strategy B — baro, mag and GPS synthesized by the simulator, seeded — waits
-until a use needs it,** such as single-pair counterfactuals, sensor noise as a
-controlled variable, or the IMU noise gap (§2). `IMPLEMENTATION_PLAN.md` §3.3 has
-the evidence and what it takes. Until then two runs of one schedule drift apart
-by up to a metre (§2).
-
-Aerodynamic effects are deliberately **not** on this list. They come after Phase 7's
-exit criterion; `RotorState.omega` is what makes them expressible.
-
-### The research-controller boundary
-
-**Decided 2026-09-25: in process.** The research controller is called
-synchronously from the lockstep loop (`control.py`), and `sim/run_x8.py` in the
-private repo starts PX4 with `run_sitl.sh --px4-only` and the simulator with
-`run(cfg, controller=...)`. The controller takes the base state from PX4's EKF2
-over MAVLink, as on the vehicle, not from MuJoCo. The requirements behind it
-are the research's: data-age bounds tested at a *chosen* age, counterfactual
-comparisons under identical timing, stalls injected by design, and batches
-faster than real time. Out of process, all four could only be measured.
-
-**What the earlier out-of-process reasoning got wrong.** It was chosen for
-isolation, "a slow solver cannot stall lockstep". But under lockstep a stall is
-harmless to PX4: its clock only advances with our `HIL_SENSOR`, and
-`SimulatorMavlink`'s 1 s wall-clock `poll` timeout only logs. The real costs of
-a synchronous controller are the sim/wall ratio and the pacer's catch-up burst
-after a slow call, which widens PX4's lead. The loop now removes the
-controller's time from its pacing, so only the ratio remains.
-
-**In process chose only the arm leg.** Three legs stayed wall-clock: which of
-PX4's outputs a frame used (the brake let the loop run ahead), which EKF2
-estimate a sample saw, and when a setpoint the controller sent reached PX4's
-uORB. Phase 2 made all three chosen.
-
-### Phase 2: decided and built 2026-09-26
-
-Probed before designing. The PX4 facts are in `IMPLEMENTATION_PLAN.md` §3.2
-("What an answer proves", "Strict lockstep") and §3.9 ("The legs as built"), the
-measurements in phase 7 ("The PX4 legs", "The in-process controller") and phase
-5 ("Under strict lockstep"). The decisions:
-
-- **Strict lockstep is the only regime.** Once PX4 has answered, every frame
-  waits for the answer stamped with its time. The old loop stays only as the
-  fallback before PX4's first answer and for a frame whose answer times out.
-- **IMU → actuator is exactly one frame.**
-- **Estimates are fetched after each answer, at a chosen age of at least one
-  frame.** No `/proc`, no age 0.
-- **Setpoints and commands go behind a PING barrier, at a chosen delay of at
-  least one frame.**
-- **Strategy B later, when needed** (above).
-- **EKF2's cadence phase stays unchosen** (added once measured): which samples
-  get the shorter estimate age can swap between runs.
-
-Where it lives: [loop.py](src/mujoco_px4_sitl/loop.py) (strict regime,
-`-s 0` unpaced, `--answer-timeout`), [px4link.py](src/mujoco_px4_sitl/px4link.py)
-(`ApiLink`: barrier, silencing, fetch, refusals, setpoint builders),
-[control.py](src/mujoco_px4_sitl/control.py) (`Schedule.estimate_delay` and
-`setpoint_delay`, `ControllerOutput`, `Observation.proven`,
-`Sample.estimate_late`). `tests/test_loop.py` and `tests/test_control.py` cover
-the work list's cases against fake PX4s; `scripts/fly_in_process.py` repeats the
-acceptance measurements, the phase 7 flight and the X8 steps against a real one.
-
-Three things building it found, beyond the probes:
-
-- **PX4 drops the ACK to a new component's first message when it races the
-  component's registration**, and the link then never reached its barriers. The
-  silencing request now goes between two PINGs (plan §3.9).
-- **A sample is proven only after `estimate_delay` + 2 fetched frames**:
-  otherwise the first sample after the link came up had a four-frame-old
-  estimate.
-- **The frame PX4's first answer arrives in waits for its own**: otherwise a
-  first answer a frame late, as under load, left one frame two frames behind.
-
-The probe that produced the design lives in `../phase2_probes/`, next to the PX4
-checkout: local, not versioned, with a README. Its checks became
-`scripts/fly_in_process.py`; it still holds what was declined (the `/proc` idle
-checks, the two-phase frame) and strategy B's seeded simulator-side sensors. The
-plan carries all the facts without it.
-
-Traps the probes and the build hit:
-
-- **The receive thread blocks on simulated time behind `SET_MESSAGE_INTERVAL`**
-  (plan §3.9), so a barrier sent after one hangs until its timeout.
-- **An answer does not prove the frame's estimate** (plan §3.2). It looks as if it
-  does on an idle machine; that is why the age is at least one frame.
-- **The barrier looks unnecessary when idle.** Without it, under load, two thirds
-  of the setpoints missed their frame.
-- **`SET_ATTITUDE_TARGET` publishes its setpoint only in Offboard**; before the
-  switch only `offboard_control_mode` goes through. Semantics, not timing.
-- **PX4 starts answering 4–73 frames after it connects** (67–73 under load
-  through the real loop), so the fallback is needed however early strict mode
-  would like to start.
-- **A probe that starts PX4 itself meets the exit trap** in
-  `IMPLEMENTATION_PLAN.md` §7. `fly_in_process.py` kills PX4 after the run and
-  discards its throw-away rootfs.
-- **An ONBOARD_CONTROLLER heartbeat of our own would bite** once it lapsed for
-  `COM_OBC_LOSS_T` of PX4's clock, which a wall-clocked one does in an unpaced
-  run. The link sends none (plan §3.9).
-- **Yaw overshoot read against the target carries EKF2's heading error**, 1–2°
-  on the X8; the steps report it past the settled value too (plan phase 5).
-
-Leave room for uXRCE-DDS thrust/torque; how to time its setpoints is open
-(plan §9).
+`../phase2_probes/`, next to the PX4 checkout, is the unversioned probe the design
+came from; it keeps what was declined and strategy B's seeded sensors.
 
 ---
 
-## 4. The platform: what is measured, and what is still input
+## 4. The platform
 
-**The first CAD export has landed** — a whole-vehicle SolidWorks export of the
-coaxial X8 plus a 5-DoF arm, in the private repo (the URDF, its STLs, the filled
-sidecar, the generated MJCF and **the generated PX4 airframe** all stay there;
-this repo holds the script, the no-geometry template and the airframe template).
-The airframe joins that list for the same reason as the rest: its `CA_ROTOR*_PX`
-/ `_PY` block *is* the hub geometry. Naming already matched §3.3, so no renaming
-was needed, and the STLs are in metres.
+The X8's CAD export, filled sidecar, generated MJCF and generated airframe are
+**private** and live in `~/DEV/kani_arm`; this repo holds the script, the
+no-geometry sidecar template and the airframe template. Hub coordinates, inertia,
+voxel counts and intrusion figures describe the vehicle as surely as the STLs,
+so none of them goes into this repo — `urdf_to_mjcf.py --check-only` prints them.
 
-The conversion runs clean, and every self-check passes: mass and CoM match the
-CAD figures, the 8 rotor sites are contiguous and on `base_link`, the coaxial
-pairs' spins oppose, and the origin sits on the rotor symmetry centre to sub-mm
-as §3.1 requires. **The numbers themselves live with the filled sidecar in the
-private repo** — hub coordinates and an inertia tensor describe the airframe as
-surely as the STLs do, which is the whole point of keeping the products there.
-Run the script with `--check-only` to see them.
+`MODELING_CONVENTIONS.md` §7 records what the export carried, the motor fit
+(thrust/weight 3.79, `km` 0.43× PX4's default), what is still a choice (`ω_idle`,
+joint zero and sign, ESC wiring) and why the arm can reach into the discs inside
+its mechanical limits. Intrusion is **reported, never blocked**, decided
+2026-09-25: blocking belongs to the real vehicle's arm driver or companion
+computer.
 
-What the export did **not** carry:
-
-- **Arm joint limits: every one is `lower=upper=0`.** Worse than it looks in the
-  export — MuJoCo reads 0/0 as *unlimited*, so the export's default is a free
-  joint, not a locked one. **The sidecar's ranges are not a placeholder for this:
-  they are the mechanical limits, read off each joint's structure rather than out
-  of the export.** What the export withheld was the *encoding*, and the sidecar
-  supplies it. Still unverified is the zero-position and sign convention, since
-  `arm_cmd.values[i]` is an absolute angle.
-- **Spin directions and index→ESC mapping.** The sidecar assumes
-  `MODELING_CONVENTIONS.md` §4's PX4 order. Flight shows it consistent with the
-  model (§1); it still needs confirming against the wiring, since a mismatch
-  there presents as yaw drift on the real vehicle.
-
-**Motors are now chosen and measured**, which removes the largest remaining
-guess. `c_t`, `km` and `ω_max` are fitted from the manufacturer's thrust/RPM/torque
-table by least squares through the origin; the `c_t` fit is R² = 0.9997 with the
-worst point 0.9 % off full thrust. Three consequences worth carrying forward:
-
-- **Thrust/weight is 3.79, measured.** The auto-calibration's 4.0 was a
-  construction; it is now within 5 % of it by coincidence, not by design.
-- **`km` is 0.43× PX4's default.** Left at `CA_ROTOR*_KM 0.05` the allocator
-  expects 2.3× the yaw torque these props make. Flyable, so it does not announce
-  itself — it presents as sluggish yaw.
-- **`MPC_THR_HOVER` moves to 0.2162**, from the quad's 0.2025. It depends only on
-  `ω_idle / ω_max` and thrust-to-weight (§2.5), and `ω_max` is now a real number.
-
-What is still missing from the motor side: `ω_idle`, because the datasheet starts
-at 0.40 throttle, so the armed idle speed is not in it. The sidecar carries
-`ω_max / 11` to match the quad's operating point, which is a choice rather than a
-measurement, and `MPC_THR_HOVER` moves with it — 0.171 to 0.264 across the
-plausible range. Bench-measure the armed idle RPM.
-
-**The arm's envelope and the propeller discs intersect, inside the mechanical
-limits.** Not a near miss: a small fraction of the poses the mechanism genuinely
-permits put an arm collision capsule *inside* a disc, measured on the model with
-the real ranges (the figures are in the private sidecar). So the limits cannot be
-the guard — they are the mechanism's, and the mechanism can do this. Nothing in
-the model stops a commanded angle from doing it either. Only the front rotors
-are reachable, on both decks, and only by the last link.
-
-Decided 2026-09-25: in simulation it is **detected and reported, never
-blocked** (§2). Check the pose the arm actually reaches, its collision capsules
-against the disc volumes each step, rather than the commanded one, since the
-servo lags its command. Blocking is a real-vehicle safety layer and belongs in
-the arm driver or the companion computer, outside this repo. The joint limits
-cannot do it on either side. Implemented the same day (§1).
-
-**Measuring the discs corrected two inputs.** Each rotor's `radius` is the blade
-tip off the base mesh; the earlier hand survey had used a smaller radius of no
-recorded origin. And the rotor sites now sit on the blade planes, which the
-upper deck's did not — harmless while z carried no torque and no `PZ`, but z
-places the disc. The airframe regenerated byte-identical. The conversion's
-self-check now reruns the envelope survey with the simulator's own check, and
-on the old geometry it reproduces the hand survey exactly.
-
-`vehicle.py`'s placeholders and the mass-based auto-calibration of `c_t` (§2.4)
-**stay in place and still warn on every load** — they are what any model without
-measured motor numbers falls back on, which is now only the quad. **The X8 loads
-with no warning at all**, and that silence is the check: if it ever fires for the
-X8, the sidecar's values did not reach `RotorModel`.
-
-The generated airframe and the MJCF are both products of the same sidecar, which
-is what keeps `CA_ROTOR*` and the rotor sites from disagreeing. Regenerate both
-together; `--emit-airframe` runs after the self-check for that reason, so an
-airframe is never derived from a model that failed its own mass check.
+`vehicle.py`'s placeholder motors still warn on every load; that is now only the
+quad. **The X8 loads with no warning**, and that silence is the check that the
+sidecar's values reached `RotorModel`.
 
 ---
 
@@ -426,94 +136,99 @@ airframe is never derived from a model that failed its own mass check.
 |---|---|---|
 | `IMPLEMENTATION_PLAN.md` | PX4 v1.17 interface contract, phase design and exit criteria, troubleshooting, repo conventions, measured baselines | anything crossing the PX4 boundary: lockstep, message encoding, frames (§3.6 is the specification), geodetic origin |
 | `MODELING_CONVENTIONS.md` | CAD → MJCF authoring, rotor parametrization, target platform, aerodynamic plans | anything about a model or a rotor: naming, frames *within* a model, thrust curve, X8 layout |
-| `AGENTS.md` | state, gaps, next steps | "what now" |
-| `README.md` | install, run, health check, side channel, ROS 2 integration | user-facing usage |
+| `AGENTS.md` | state, gaps, next steps, how to work | "what now" |
+| `README.md` | install, run, health check, side channel, in-process controller, ROS 2 integration | user-facing usage |
 
 Where the first two overlap, the rule is scope, not seniority: §3.6's frame
 conventions are the plan's and are binding on every model; the thrust curve is
 `MODELING_CONVENTIONS.md` §2.5's and supersedes Phase 4's.
 
-Progress belongs here, not in `README.md`. Measured results belong in the plan, at
-the phase that produced them.
+Progress belongs here, measured results in the plan at the phase that produced
+them, the reasoning of a change in its commit. **This file stays short**: when a
+step is done, its story leaves and one line of state stays.
 
-Two templates are documents in their own right, and own what no `.md` should
-restate:
-
-| Template | Owns |
-|---|---|
-| [models/x8_arm.conversion.yaml.template](models/x8_arm.conversion.yaml.template) | the sidecar schema, field by field, as comments |
-| [px4/mujoco_x8.airframe.template](px4/mujoco_x8.airframe.template) | why a non-quad airframe is shaped the way it is; the boilerplate every generated one inherits |
-
-Both are the no-geometry halves of files whose filled forms are private. Edit the
-template, regenerate; never hand-edit a generated product.
+Two templates own what no `.md` should restate:
+[models/x8_arm.conversion.yaml.template](models/x8_arm.conversion.yaml.template)
+(the sidecar schema, as comments) and
+[px4/mujoco_x8.airframe.template](px4/mujoco_x8.airframe.template) (why a non-quad
+airframe is shaped the way it is). Both are the no-geometry halves of private
+files: edit the template, regenerate, never hand-edit a product.
 
 ---
 
-## 6. Working conventions worth knowing up front
+## 6. Working conventions
 
-- **All repository text in English**, code comments included
-  (`IMPLEMENTATION_PLAN.md` §8) — including documents drafted from a
-  non-English conversation.
-- **`source ../.venv/bin/activate` before any PX4 build.** PX4's cmake resolves its
-  interpreter via `PATH` and configure aborts without it. See `README.md`.
-- **No `rclpy` / `ament` / `ros` imports in `src/`.** The ROS 2 bridge is a separate
-  package talking to the side channel over UDP.
-- **Frame conversions live only in `frames.py`.** A rotation anywhere else is a bug.
-- **`unproven` should stay 0 in healthy flight, and `brake` and `timeouts` flat
-  after the boot**, and `ratio` alone will not tell you otherwise. The brake acts
-  only before PX4's first answer and after a timeout. `IMPLEMENTATION_PLAN.md` §7
-  diagnoses all three.
-- **Commit messages: 10–20 lines of body.** The history runs to 53 lines and 640
-  words because it restates derivations the documents already own. State a
-  constraint once, in the document that owns it per §5, and have the commit point
-  there. Worth a sentence in the commit and nowhere else: what an earlier version
-  of the reasoning got wrong, since that is what a reader may already believe.
+- **All repository text in English**, code comments included — also when the
+  conversation is not.
+- **`source ../.venv/bin/activate` before any PX4 build**; PX4's cmake resolves its
+  interpreter via `PATH`.
+- **No `rclpy` / `ament` / `ros` imports in `src/`.**
+- **Frame conversions live only in `frames.py`.**
+- **Status line**: `unproven` stays 0, `brake` and `timeouts` flat after the boot;
+  `ratio` alone proves nothing. Plan §7 diagnoses each.
+- **Commit messages: short.** A title and a few lines saying what changed and where
+  the numbers are; the documents own derivations. Worth a sentence in the commit
+  and nowhere else: what an earlier version of the reasoning got wrong.
+- **Never touch the private repo's git state**; propose changes there, and apply
+  them only when asked.
+
+### Keeping a session small
+
+Past sessions reached 400–500K tokens of context. Most of it was not testing but
+reading, rewriting and raw output. So:
+
+- **Read by section, not by file.** `grep -n '^#' IMPLEMENTATION_PLAN.md`, then
+  read the section that owns the question (§5). The plan is 1800 lines; nothing
+  needs all of it.
+- **Delegate lookups that return a conclusion.** PX4 source spelunking ("which
+  paths end in `configure_stream_threadsafe()`?") and wide searches go to a
+  subagent that reports file:line and the answer, not the files.
+- **Flights print their report, nothing else.** `fly_in_process.py` is quiet by
+  default; `acceptance` prints one table with PASS/FAIL. Never paste the
+  simulator's log or PX4's into the session; grep it for the line that matters.
+  For `run_sitl.sh` flights, keep the log in a file and read its last status line.
+- **Settle the code on the cheapest check before the full matrix.** Unit tests,
+  then `fly_in_process.py acceptance` on the quad, and only then the X8, the
+  Phase 5 profiles and the steps. Re-running the whole matrix after a late code
+  change is what doubled the flights last time.
+- **Edit, do not rewrite.** Small exact-string edits keep a file out of the
+  context; rewrite a file only when most of it changes.
+- **Run tests quietly** (`python -m pytest -q | tail -3`), and read a failure's
+  assertion, not its traceback.
 
 ---
 
 ## 7. Running each vehicle
 
-The quad needs nothing beyond `README.md`. The X8 spans two repositories, so its
-launch line is worth stating once:
+The quad needs nothing beyond `README.md`. The X8 spans two repositories:
 
 ```sh
 # Public repo, once per PX4 checkout:
 ./scripts/install_px4_files.sh --airframe ~/DEV/kani_arm/model/px4/22002_mujoco_x8
 source ../.venv/bin/activate && make -C ../PX4-Autopilot px4_sitl_default
 
-# Then, from the private repo:
-python sim/run_x8.py            # PX4 via run_sitl.sh --px4-only; simulator and
-                                # research controller in this process
-```
+# From the private repo: PX4 via run_sitl.sh --px4-only, simulator and research
+# controller in this process
+python sim/run_x8.py
 
-The phase 7 flight and the attitude steps, on simulated time and from the public
-repo (PX4 in a throw-away rootfs, so nothing to start first):
-
-```sh
+# From the public repo, on simulated time, PX4 in a throw-away rootfs:
 X8="--model $HOME/DEV/kani_arm/model/mjcf/x8_arm.xml --rotors $HOME/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml --airframe 22002 --hover 0.2162"
-python scripts/fly_in_process.py arm-sweep $X8 --out /tmp/sweep_a.npz
+python scripts/fly_in_process.py acceptance $X8
 python scripts/fly_in_process.py steps $X8 --out /tmp/steps.npz
+python scripts/fly_in_process.py arm-sweep $X8 --out /tmp/sweep_a.npz
+
+# Without a controller, the arm over the side channel:
+MUJOCO_SITL_ROTORS=$HOME/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml \
+PX4_SYS_AUTOSTART=22002 ./scripts/run_sitl.sh -m $HOME/DEV/kani_arm/model/mjcf/x8_arm.xml
 ```
 
-Without a controller, driving the arm over the side channel instead:
+**The sidecar has no default.** Omitting it raises `RotorModel.spin has 4 entries
+for 8 rotors`, so there is no silent fall back to the quad's motors.
 
-```sh
-MUJOCO_SITL_ROTORS=~/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml \
-PX4_SYS_AUTOSTART=22002 ./scripts/run_sitl.sh -m ~/DEV/kani_arm/model/mjcf/x8_arm.xml
-```
-
-**The sidecar is not optional and has no default.** Omitting it raises
-`RotorModel.spin has 4 entries for 8 rotors` — deliberately, so there is no silent
-fall back to the quad's placeholder motors. Conversely, the placeholder warning
-firing on the X8 means the sidecar's values did not arrive.
-
-Regenerating after a sidecar edit does both products at once, which is what keeps
+After a sidecar edit, regenerate both products at once, which is what keeps
 `CA_ROTOR*` and the rotor sites from disagreeing:
 
 ```sh
 python scripts/urdf_to_mjcf.py ~/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml \
     --emit-airframe ~/DEV/kani_arm/model/px4/22002_mujoco_x8
 ```
-
-`--check-only` reports the measured numbers without writing anything, and is how
-to read hub coordinates, mass and CoM without copying them into this repo.

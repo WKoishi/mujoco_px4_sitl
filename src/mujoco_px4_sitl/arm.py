@@ -1,6 +1,6 @@
 """The arm: joint commands into ``data.ctrl``, and propeller clearance.
 
-Two jobs, both added with the first arm writer (AGENTS.md section 3):
+Two jobs (AGENTS.md sections 1 and 4):
 
 * :class:`ArmServos` maps ``arm_cmd`` onto the ``arm_act0..N`` position servos
   and owns what happens when commands stop arriving. That behaviour belongs to

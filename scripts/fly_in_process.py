@@ -24,7 +24,11 @@ Profiles:
                position setpoints, 15 s each, then roll and pitch +-5 degrees
                through attitude setpoints for 3 s each, from level, with thrust
                at hover plus an altitude PD on the estimate. Read from truth.
+``acceptance`` ``legs`` idle and with every core busy, then one table of the
+               acceptance checks, each marked PASS or FAIL. The exit status is 0
+               only if all pass. This is the one to run after touching the loop.
 
+    python scripts/fly_in_process.py acceptance                # quad, about 40 s
     python scripts/fly_in_process.py legs --out /tmp/quad.npz
     python scripts/fly_in_process.py legs --load 16 --out /tmp/quad_load.npz
     python scripts/fly_in_process.py legs --model x8.xml --rotors x8.yaml \\
@@ -33,6 +37,9 @@ Profiles:
 
 ``--load N`` keeps N processes spinning for the whole run: "with every core
 busy" is where the probes found the barrier and the estimate delay necessary.
+
+Output is the report only, plus the simulator's warnings: an unproven frame or
+a barrier timeout still shows. ``--verbose`` brings back the simulator's log.
 
 PX4 cannot finish exiting once simulated time has stopped (plan section 7), so
 this kills it after the run; the rootfs is discarded, and the newest ulog is
@@ -47,6 +54,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -314,6 +322,10 @@ class SummaryCatcher(logging.Handler):
 
 
 def spin() -> None:
+    # Forked after an earlier run() installed its SIGTERM handler, which only
+    # stops a loop; this process has none to stop, and must die on terminate().
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     while True:
         pass
 
@@ -346,23 +358,32 @@ class Px4:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
-def fly(args) -> int:
+def setup_logging(verbose: bool) -> None:
+    """The simulator's log goes to the console at WARNING, or everything with
+    ``verbose``; the loop's final status line is caught either way."""
+    configure_logging("INFO")
+    root = logging.getLogger()
+    for handler in root.handlers:
+        handler.setLevel(logging.INFO if verbose else logging.WARNING)
+    root.addHandler(SummaryCatcher())
+    # The quad's placeholder-motor warning: known, and on every quad run.
+    logging.getLogger("mujoco_px4_sitl.vehicle").setLevel(logging.ERROR)
+
+
+def fly(args) -> Path | None:
+    """One run; returns the .npz it wrote."""
     if subprocess.run(["pgrep", "-x", "px4"], capture_output=True).returncode == 0:
         print("a px4 process is already running; stop it first", file=sys.stderr)
-        return 1
+        return None
     sim_args = ["--model", str(args.model), "--no-sidechannel", "-s", str(args.speed),
                 "--instance", str(args.instance), "--status-interval", "10"]
     if args.rotors is not None:
         sim_args += ["--rotors", str(args.rotors)]
     cfg = config_from_args(sim_args)
-    configure_logging("INFO")
-    logging.getLogger().addHandler(SummaryCatcher())
-    for noisy in ("mujoco_px4_sitl.vehicle",):
-        logging.getLogger(noisy).setLevel(logging.ERROR)
     n_rotors = 4 if args.rotors is None else len(load_rotors(args.rotors).spin)
     dt = cfg.imu_dt
 
-    if args.profile == "legs":
+    if args.profile in ("legs", "acceptance"):
         mission = Legs(dt, args.hover, args.seed)
         schedule = Schedule(period=dt)
     elif args.profile == "arm-sweep":
@@ -386,7 +407,8 @@ def fly(args) -> int:
     finally:
         px4.stop(out.with_suffix(".ulg"))
         for p in spinners:
-            p.terminate()
+            p.kill()
+            p.join()
     data = recorder.arrays()
     meta = dict(vars(args), model=str(args.model), rotors=str(args.rotors), out=str(out),
                 imu_dt=dt, n_rotors=n_rotors, wall=time.monotonic() - wall0,
@@ -394,9 +416,8 @@ def fly(args) -> int:
                 kind={str(k): v for k, v in mission.kind.items()},
                 thrust={str(k): v for k, v in mission.thrust.items()})
     np.savez_compressed(out, meta=json.dumps(meta), **data)
-    print(f"\nsaved {len(data['t'])} samples to {out}")
-    report(out)
-    return 0
+    print(f"saved {len(data['t'])} samples to {out}", flush=True)
+    return out
 
 
 # --- reports -------------------------------------------------------------------
@@ -408,58 +429,78 @@ def load(path) -> dict:
     return d
 
 
-def frames_of(d, seconds):
-    return np.round(np.asarray(seconds) / d["meta"]["imu_dt"]).astype(np.int64)
+def counters(summary: str) -> dict[str, int]:
+    """The integer counters of the loop's final status line. It carries two
+    ``unproven``: the loop's frames first, then the controller's samples."""
+    out: dict[str, int] = {}
+    for key, value in re.findall(r"(\w+)=(-?\d+)(?=\s|$)", summary):
+        if key == "unproven" and key in out:
+            key = "samples_unproven"
+        out.setdefault(key, int(value))
+    return out
+
+
+def timing(d) -> dict | None:
+    """What every profile's report shares: PX4's legs, measured per sample."""
+    m, t, act_time = d["meta"], d["t"], d["act_time"]
+    dt = m["imu_dt"]
+    answered = np.flatnonzero(act_time >= 0)
+    if len(answered) == 0:
+        return None
+    first = answered[0]
+    # A sample's actuators are the answer that drives its frame: one frame old
+    # when PX4 answered the previous frame in time.
+    lag = np.round((t - act_time * 1e-6) / dt).astype(int)[first:]
+    out = dict(first_answer=int(act_time[first] // round(dt * 1e6)),
+               lags=Counter(lag.tolist()), samples=len(lag), proven_from=None)
+    proven = d["proven"].astype(bool)
+    if proven.any():
+        p0 = np.flatnonzero(proven)[0]
+        after = proven[p0:]
+        known = after & np.isfinite(d["est_time"][p0:])
+        late = d["late"].astype(bool)
+        span_t, span_w = t[-1] - t[p0], d["wall"][-1] - d["wall"][p0]
+        out.update(
+            proven_from=float(t[p0]), proven=int(after.sum()), after=len(after),
+            ages=Counter(np.round((t - d["est_time"]) / dt)[p0:][known].astype(int).tolist()),
+            late_proven=int((late & proven).sum()), late_unproven=int((late & ~proven).sum()),
+            speed=span_t / span_w if m["period_frames"] == 1 and span_w > 0 else None,
+        )
+    return out
 
 
 def report(path) -> None:
     d = load(path)
     m = d["meta"]
-    dt = m["imu_dt"]
+    t = d["t"]
+    c = counters(m["summary"])
     print(f"\n### {path}: {m['profile']}, {Path(m['model']).name}, load {m['load']}")
-    print(f"loop: {m['summary']}")
-    t, act_time = d["t"], d["act_time"]
-    answered = np.flatnonzero(act_time >= 0)
-    if len(answered) == 0:
+    print("loop: " + " ".join(f"{k}={c[k]}" for k in (
+        "frames", "answered", "unproven", "brake", "timeouts", "samples_unproven",
+        "late", "over_age", "px4_unproven", "barrier_timeouts") if k in c))
+    tm = timing(d)
+    if tm is None:
         print("PX4 never answered")
         return
-    first = answered[0]
-    lag = np.round((t - act_time * 1e-6) / dt).astype(int)[first:]
-    one = int((lag == 1).sum())
-    # A sample's actuators are the answer that drives its frame: one frame old
-    # when PX4 answered the previous frame in time.
-    print(f"IMU -> actuator, samples from PX4's first answer: one frame on {one} of "
-          f"{len(lag)}; lags {dict(Counter(lag.tolist()))}")
-    proven = d["proven"].astype(bool)
-    if proven.any():
-        p0 = np.flatnonzero(proven)[0]
-        after = proven[p0:]
-        print(f"proven samples: {int(after.sum())} of {len(after)} from the first "
-              f"(t={t[p0]:.2f} s); before it {p0} samples")
-        ages = np.round((t - d["est_time"]) / dt)[p0:][after & np.isfinite(d["est_time"][p0:])]
-        print(f"estimate age at proven samples (frames): {dict(Counter(ages.astype(int).tolist()))}")
-        late = d["late"].astype(bool)
-        print(f"late estimates: {int((late & proven).sum())} proven, "
-              f"{int((late & ~proven).sum())} unproven")
-        wall = d["wall"]
-        span_t, span_w = t[-1] - t[p0], wall[-1] - wall[p0]
-        if m["period_frames"] == 1 and span_w > 0:
-            print(f"speed from the first proven sample: {span_t:.1f} sim s in {span_w:.2f} "
-                  f"wall s = x{span_t / span_w:.2f}")
+    print(f"IMU -> actuator from PX4's first answer (frame {tm['first_answer']}): one frame "
+          f"on {tm['lags'][1]} of {tm['samples']} samples; lags {dict(tm['lags'])}")
+    if tm["proven_from"] is not None:
+        print(f"proven: {tm['proven']} of {tm['after']} samples from t={tm['proven_from']:.2f} s; "
+              f"estimate age {dict(tm['ages'])} frames; late {tm['late_proven']} proven, "
+              f"{tm['late_unproven']} unproven"
+              + (f"; speed x{tm['speed']:.2f}" if tm["speed"] else ""))
     armed = np.flatnonzero(d["act_armed"])
     if len(armed):
         print(f"first armed sample {armed[0]} (t={t[armed[0]]:.3f} s)")
     print(f"max altitude {-d['truth_pos'][:, 2].min():.2f} m")
-    if m["profile"] == "legs":
+    if m["profile"] in ("legs", "acceptance"):
         for kind, label in ((KIND_RATE, "body-rate"), (KIND_ATTITUDE, "attitude")):
             fit = setpoint_lags(d, kind)
             if fit is not None:
                 coef, worst, per_frame = fit
-                print(f"{label} window: S ~ " + " + ".join(
-                    f"thr(k-{L})*{c:.3f}" for L, c in enumerate(coef[1:])) +
-                    "; worst residual in PRBS flips if every sample had lag "
-                    + ", ".join(f"{L}: {w:.3f}" for L, w in enumerate(worst)))
-                print(f"   per sample, where the two likeliest lags differ: {per_frame}")
+                best = int(np.argmin(worst))
+                print(f"{label} window: thrust reaches the rotors at lag {per_frame} "
+                      f"(samples; worst residual {worst[best]:.3f} flips at lag {best})")
     if m["profile"] == "steps":
         step_report(d)
     if m["profile"] == "arm-sweep":
@@ -572,9 +613,71 @@ def compare(a_path, b_path) -> None:
     print(f"position apart, max {pos.max():.3f} m")
 
 
+def acceptance(args) -> int:
+    """``legs`` at each load, then the checks of AGENTS.md section 3 in one table.
+    The thresholds are the decided design: every frame answered after PX4's first
+    answer, IMU -> actuator one frame, a body-rate setpoint on its frame (lag 2:
+    the setpoint delay plus IMU -> actuator), no late estimate."""
+    stem = Path(args.out).with_suffix("")
+    loads = [int(x) for x in args.loads.split(",")]
+    columns = []
+    for load in loads:
+        args.load, args.out = load, f"{stem}_load{load}.npz"
+        print(f"legs, load {load} ...", flush=True)
+        path = fly(args)
+        if path is None:
+            return 1
+        columns.append(load_run(path))
+    rows: list[tuple[str, list[str], list[bool | None]]] = []
+
+    def row(label, cells, oks=None):
+        rows.append((label, cells, oks or [None] * len(cells)))
+
+    tms = [c["timing"] for c in columns]
+    cs = [c["counters"] for c in columns]
+    row("PX4's first answer, frame", [str(tm["first_answer"]) for tm in tms])
+    row("frames unproven after it", [str(c.get("unproven")) for c in cs],
+        [c.get("unproven") == 0 for c in cs])
+    row("IMU -> actuator one frame", [f"{tm['lags'][1]}/{tm['samples']}" for tm in tms],
+        [tm["lags"][1] == tm["samples"] for tm in tms])
+    rate = [c["rate"] for c in columns]
+    row("body-rate setpoint on its frame",
+        [f"{r.get('lag 2', 0)}/{r['of']}" if r else "-" for r in rate],
+        [bool(r) and r["of"] > 0 and r.get("lag 2", 0) == r["of"] for r in rate])
+    row("late estimates, proven", [str(tm.get("late_proven")) for tm in tms],
+        [tm.get("late_proven") == 0 for tm in tms])
+    row("estimate age, frames", [",".join(map(str, sorted(tm.get("ages", {})))) for tm in tms])
+    att = [c["attitude"] for c in columns]
+    row("attitude setpoint, same frame", [f"{a.get('lag 2', 0)}/{a['of']}" if a else "-"
+                                          for a in att])
+    row("barrier timeouts", [str(c.get("barrier_timeouts")) for c in cs],
+        [c.get("barrier_timeouts") == 0 for c in cs])
+    row("speed", [f"x{tm['speed']:.1f}" if tm.get("speed") else "-" for tm in tms])
+
+    print(f"\n### acceptance: {Path(args.model).name}")
+    print("| | " + " | ".join(f"load {n}" for n in loads) + " |")
+    print("|---|" + "---|" * len(loads))
+    failed = []
+    for label, cells, oks in rows:
+        marks = [cell + ("" if ok is None else " PASS" if ok else " FAIL")
+                 for cell, ok in zip(cells, oks)]
+        print(f"| {label} | " + " | ".join(marks) + " |")
+        failed += [label for ok in oks if ok is False]
+    print("acceptance: " + ("PASS" if not failed else "FAIL: " + ", ".join(sorted(set(failed)))))
+    return 0 if not failed else 1
+
+
+def load_run(path) -> dict:
+    d = load(path)
+    rate, att = (setpoint_lags(d, k) for k in (KIND_RATE, KIND_ATTITUDE))
+    return dict(timing=timing(d), counters=counters(d["meta"]["summary"]),
+                rate=rate[2] if rate else None, attitude=att[2] if att else None)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("profile", nargs="?", choices=["legs", "arm-sweep", "steps"], default="legs")
+    p.add_argument("profile", nargs="?", choices=["legs", "arm-sweep", "steps", "acceptance"],
+                   default="legs")
     p.add_argument("--model", type=Path, default=REPO / "models" / "quad_x.xml")
     p.add_argument("--rotors", type=Path, default=None)
     p.add_argument("--airframe", default="22001")
@@ -584,6 +687,9 @@ def main() -> int:
                    help="speed factor; 0, the default, is unpaced")
     p.add_argument("-i", "--instance", type=int, default=0)
     p.add_argument("--load", type=int, default=0, help="processes kept spinning")
+    p.add_argument("--loads", default=f"0,{os.cpu_count()}",
+                   help="acceptance: the loads to run, comma-separated (default: %(default)s)")
+    p.add_argument("-v", "--verbose", action="store_true", help="the simulator's full log")
     p.add_argument("--seed", type=int, default=1, help="thrust PRBS seed")
     p.add_argument("--out", default="/tmp/fly_in_process.npz")
     p.add_argument("--compare", nargs=2, metavar="NPZ")
@@ -596,7 +702,14 @@ def main() -> int:
         report(args.report)
         return 0
     args.period_frames = 1 if args.profile != "arm-sweep" else 5
-    return fly(args)
+    setup_logging(args.verbose)
+    if args.profile == "acceptance":
+        return acceptance(args)
+    out = fly(args)
+    if out is None:
+        return 1
+    report(out)
+    return 0
 
 
 if __name__ == "__main__":

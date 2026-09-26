@@ -235,10 +235,11 @@ wrong silently: `MAV_CMD_NAV_TAKEOFF` param7 is AMSL rather than relative, and
 the estimate and ground-truth topics latch separate datums.
 
 `scripts/fly_in_process.py` flies the rest on simulated time, with the
-controller in process and PX4 in a throw-away rootfs, and prints its own report:
-`legs` for the strict loop's acceptance checks, `steps` for the X8's attitude
-steps, `arm-sweep` for phase 7's flight, and `--compare` for two runs of one
-schedule. It takes a private model with `--model`, `--rotors`, `--airframe` and
+controller in process and PX4 in a throw-away rootfs, and prints only its own
+report (`--verbose` for the simulator's log): `acceptance` runs the strict loop's
+checks idle and loaded and prints one PASS/FAIL table, `legs` one such run in
+detail, `steps` the X8's attitude steps, `arm-sweep` phase 7's flight, and
+`--compare` two runs of one schedule. It takes a private model with `--model`, `--rotors`, `--airframe` and
 `--hover`.
 
 ## Frames
@@ -313,7 +314,7 @@ For a model with an arm, `ground_truth` carries an `arm` block:
 **Propeller intrusion is reported, never blocked**: logged when it starts and
 ends, and counted on the status line. Keeping clear is the controller's job.
 Joint state is not on the side channel; an in-process controller reads it
-(`AGENTS.md` §3).
+(`AGENTS.md` §2).
 
 ### An in-process controller
 
