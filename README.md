@@ -132,12 +132,13 @@ and §7.
 
 **`brake` and `timeouts` should both be 0 in healthy flight, and `ratio` alone
 will not tell you otherwise.** `act` sitting a little below `frames` is normal —
-PX4 publishes actuators at ~97 % of the IMU rate, since `HIL_ACTUATOR_CONTROLS`
-is not an acknowledgement of `HIL_SENSOR` (§3.2) — and that shortfall on its own
-must not cause any braking. If `brake` instead tracks `frames` divided by
-`--max-lead-frames`, the loop is braking on a cadence rather than in response to
-PX4, and at `--speed-factor 1.0` the pacer's sleep will absorb the cost so
-`ratio` still reads 1.000. The line above is a real 3 s run against PX4 v1.17.0.
+PX4 computes an output for every frame, but while the loop runs ahead its sender
+sends one message for however many outputs are waiting (§3.2) — and that
+shortfall on its own must not cause any braking. If `brake` instead tracks
+`frames` divided by `--max-lead-frames`, the loop is braking on a cadence rather
+than in response to PX4, and at `--speed-factor 1.0` the pacer's sleep will
+absorb the cost so `ratio` still reads 1.000. The line above is a real 3 s run
+against PX4 v1.17.0.
 
 The line now ends with `px4_lag`: how many IMU frames old PX4's controls were
 when a frame used them, read from `HIL_ACTUATOR_CONTROLS.time_usec`, which is

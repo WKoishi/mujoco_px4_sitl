@@ -294,6 +294,12 @@ Why this shape rather than a startup/steady-state latch:
   cannot outrun PX4 while real-time paced, so the FIFO-drop hazard does not apply
   there; the brake exists for when PX4 is *slow*, not when it is *quiet*.
 
+The second bullet's premise did not survive measurement: once PX4 has answered
+once, it answers every frame of a loop that waits for it, so the ratio never
+slips. That is what the decided regime below rests on. The first and third
+bullets still hold, and are why this loop stays as its fallback before PX4's
+first answer and after a timeout.
+
 `MAX_LEAD_FRAMES` and the timeout are both tunables, not contract. If physics is
 slower than real time (contact-rich manipulation), the `sleep` never fires and the
 bounded lead becomes the binding constraint, which is the correct degradation.
@@ -327,7 +333,9 @@ the next person looks.
 > publishes at ~86 % of the IMU rate while disarmed and ~98 % once warm, and its
 > sender thread batches, so a lead of 8 brakes constantly."*
 >
-> The publish rates are real. The conclusion drawn from them was not: the table was
+> The rates are real as rates of messages *received* while the loop runs ahead;
+> PX4 itself computes an output for every frame (below, "What an answer proves").
+> The conclusion drawn from them was not: the table was
 > measured against an implementation that violated the invariant above, so the lead
 > sensitivity it shows is that defect, not PX4's jitter. With the invariant held, a
 > PX4 answering every frame does not brake at *any* lead — measured `brake=0` at
@@ -381,6 +389,72 @@ Beyond the two unsolicited startup messages in §3.1, there is no handshake and 
 loudly if it is clear: a `nolockstep` build does not take its clock from us, so
 the IMU cadence must then be paced against wall clock instead.
 
+#### What an answer proves, and what it does not
+
+Read from source and measured with the Phase 2 probes (phase 7, "The PX4 legs"),
+which ran a loop that sends frame k+1 only once PX4's answer to frame k is in:
+
+- **PX4 computes an output for every frame.** After PX4's first answer, every
+  frame got one: 447,811 of 447,811 frames over 40 runs, disarmed included, on
+  the quad and the X8, idle and with every CPU core busy. The first answer came
+  4–53 frames after PX4 connected. The shortfall the loop above sees (`act` below
+  `frames`) is therefore the lead's: the sender wakes once, `orb_copy`s the newest
+  output and sends one message (`SimulatorMavlink.cpp:170-176`, `:1044-1066`),
+  however many were published while we ran ahead. That reading fits the source
+  and the measurement; it was not isolated separately.
+- **Under that loop, the stamp proves the frame.** `time_usec` is PX4's clock when
+  it sends (`SimulatorMavlink.cpp:120`), which only our `HIL_SENSOR` moves. An
+  answer stamped `t_k` was sent during frame k, and frame k was sent only after
+  frame k−1's answer arrived, so it was computed from frame k. After the first
+  answer, none carried another frame's stamp.
+- **`px4_lockstep_wait_for_components()` covers the work queues, but does not
+  prove the estimator finished.** A work queue registers as a lockstep component
+  when work is queued and unregisters once drained (`WorkQueue.cpp:129-140`,
+  `:195-197`), and the sender waits on the components before answering
+  (`SimulatorMavlink.cpp:1064`). Yet with every core busy, EKF2's output fetched
+  right after an answer was one frame old on every frame; idle, on none. An
+  answer says nothing about that frame's estimate (§3.9). Why the wait misses it
+  is not established. The semaphore holds at most one pending post
+  (`lockstep_components.cpp`), which could leave it a post ahead, but that is a
+  hypothesis: no observation has separated it from others.
+- **Within a frame, PX4's threads race.** `WorkQueueManager.cpp:283-320` asks for
+  `SCHED_FIFO` but never sets `PTHREAD_EXPLICIT_SCHED`, so on Linux the attribute
+  is ignored: every PX4 thread runs `SCHED_OTHER` (policy 0 in
+  `/proc/<pid>/task/*/stat` of a live PX4, `wq:rate_ctrl` included). The
+  priorities that would run the rate loop ahead of the attitude loop do not exist
+  in SITL. Measured consequence: an attitude setpoint reaches the rate loop one
+  frame after a body-rate setpoint sent at the same time on 95–100 % of frames,
+  and in the same frame on the rest (28 % with every core busy). Commander,
+  navigator, the MAVLink main threads and the logger (started without `-p`, as
+  `rc.logging` does) are plain threads sleeping on simulated time, not lockstep
+  components; they run whenever their deadline
+  falls and race the frame's chain.
+
+#### Decided 2026-09-26: strict lockstep, the only regime — not yet implemented
+
+The loop above is what `loop.py` does today. It is to be replaced; `AGENTS.md` §3
+has the work list.
+
+- **Once PX4 answers, frame k+1's `HIL_SENSOR` waits for the answer stamped
+  `t_k`.** The lead is zero, and the brake has nothing to do in steady state.
+- **IMU → actuator is exactly one frame.** The frame `[t_k, t_{k+1})` is driven
+  by the answer to the `HIL_SENSOR` stamped `t_{k−1}`. One frame rather than zero:
+  the loop above gave one frame on 64–90 % of frames, and the Phase 5 baselines
+  and the derived attitude gains were flown on that.
+- **The loop above stays, as the fallback**, pacer and brake with its invariant:
+  before PX4's first answer, when PX4's chain is silent and blocking would
+  deadlock, and for any frame whose answer does not arrive within a wall-clock
+  timeout. Such a frame is counted as unproven, never silently, and is never
+  fatal.
+- **The pacer stays as a ceiling.** `speed_factor` still holds a run to real time
+  for QGroundControl; an unpaced setting lets a batch run as fast as PX4 answers.
+  Probed: about 12× on the quad and 7.7× on the X8 with 16 idle cores, about 2.5×
+  with every core busy.
+- **`px4_lag` becomes constant by construction**, and gives way on the status line
+  to counts of answered and unproven frames.
+
+The estimate and setpoint legs of an in-process controller build on this (§3.9).
+
 ### 3.3 Sensor split (strategy A)
 
 `CONFIG_COMMON_SIMULATION=y` compiles `sensor_baro_sim`, `sensor_mag_sim`,
@@ -416,6 +490,36 @@ baro/mag/GPS ourselves.
   unconditionally (§5), setting these parameters is *not* required for the modules
   to run. We set them anyway so that `param show SENS_EN_*` reflects reality and so
   the airframe stays consistent with how sihsim and gzsim express the same intent.
+
+**Strategy B — the simulator synthesizing baro, mag and GPS — was probed on
+2026-09-26 and deferred until a use needs it** (`AGENTS.md` §3). What it would
+buy is reproducibility and control of sensor noise:
+
+- **Strategy A's noise cannot be repeated or tuned.** The three modules draw from
+  one shared libc `rand()`, seeded once in `SensorBaroSim`'s constructor
+  (`SensorBaroSim.cpp:44`), so the noise a sample gets depends on how many draws
+  every module made before it — decided by boot, which runs on wall clock (§3.2).
+  The amplitudes are hard-coded, not parameters: GPS 0.2 m horizontal and 0.5 m
+  vertical white noise plus velocity noise (`SensorGpsSim.cpp:117-121`), baro
+  1 Pa plus drift (`SensorBaroSim.cpp:156`), mag 0.02/0.02/0.03 G
+  (`SensorMagSim.cpp:133`).
+- **That noise dominates how far two identical runs drift apart.** Two runs under
+  the decided regime (§3.2) held position 0.9–101 cm apart, depending on whether
+  their draws happened to line up; with the same three sensors synthesized by the
+  simulator from a seeded generator, 2–4 cm (phase 7, "The PX4 legs"). EKF2's
+  states already differed 0.84 s into a run under strategy A.
+
+What taking it over needs, all measured to work in the probe: set the `MAG` and
+`BARO` bits of `HIL_SENSOR` (§3.4; `abs_pressure` is hPa, `SimulatorMavlink.cpp:307`),
+send `HIL_GPS` (`SimulatorMavlink.cpp:408`), and stop the `.post` starting the
+three modules — a configuration change. The mag field must agree with PX4's own
+world magnetic model at the GPS position, or preflight checks object: evaluate
+`geo_magnetic_tables.hpp` with PX4's bilinear lookup
+(`geo_mag_declination.cpp:69-101`). The probe's sampling was mag 50 Hz, baro
+25 Hz, GPS 10 Hz, PX4's amplitudes by default, one seeded stream per sensor. The
+IMU noise gap (`AGENTS.md` §2) belongs in the same module when it lands. Phase 3
+and Phase 5 would then need re-flying, since their baselines were measured under
+strategy A.
 
 ### 3.4 `HIL_SENSOR.fields_updated` bitmask
 
@@ -610,6 +714,82 @@ consequences for bring-up:
   `estimator_*` ones to inspect a specific instance. Confusing the two wastes time
   in phases 1, 3 and 5.
 
+### 3.9 The API link under lockstep
+
+An in-process controller (`control.py`) talks to PX4 over its API/offboard MAVLink
+link: UDP 14540 + instance, onboard mode, 4 MB/s (`px4-rc.mavlink`). What it can
+rely on, read from source and measured with the Phase 2 probes (phase 7, "The PX4
+legs"):
+
+- **The receive thread runs on wall clock.** It polls the socket with a 10 ms
+  wall-clock timeout (`mavlink_receiver.cpp:3180`), so it handles our datagrams
+  while PX4's clock is frozen: in order, each message to completion before the
+  next.
+- **Handling is synchronous.** `SET_ATTITUDE_TARGET` publishes its setpoint and
+  `offboard_control_mode` to uORB before returning (`mavlink_receiver.cpp:1616`;
+  the setpoint itself only in the Offboard nav state), as do
+  `SET_POSITION_TARGET_LOCAL_NED` (`:1034`) and the commands commander acts on
+  (published as `vehicle_command`).
+- **PING is answered from that same thread** (`:1728-1738`), through the link's
+  immediate send path (`mavlink_main.cpp:754`). So a PING at the end of a
+  datagram, once echoed, proves that everything before it is in uORB: a
+  **barrier** that works while the clock is frozen. Measured: a body-rate setpoint
+  sent behind it before frame k's `HIL_SENSOR` was used by frame k's rate loop on
+  every frame, idle and with every core busy; without it, on every frame idle but
+  only about a third under load. An echo takes 15–35 µs idle.
+- **`COMMAND_ACK` is no barrier.** The receive thread publishes it to uORB
+  (`mavlink_receiver.cpp:122-134`) and the main thread sends it on simulated time.
+- **Two requests block the receive thread on simulated time:**
+  `SET_MESSAGE_INTERVAL` (`:2245`), and `REQUEST_MESSAGE` for a stream the link
+  does not have yet (`:762-790`). Both end in `configure_stream_threadsafe()`,
+  which sleeps in `px4_usleep` until the main thread takes the request
+  (`mavlink_main.cpp:1207-1230`). With the clock held, a barrier sent after one
+  never echoes — measured: nothing in 2 s, then the echo 2 frames after the clock
+  moved again. Send them only while frames advance without barriers, and wait for
+  their `COMMAND_ACK` first.
+- **Periodic streams race the estimator.** The main thread sleeps 1.5 ms of
+  simulated time per iteration at this data rate (`mavlink_main.cpp:2301-2362`),
+  so it runs once per frame and sends whatever is newest; whether the frame's
+  estimate is out yet is a race.
+- **`REQUEST_MESSAGE` sends from the receive thread, but only what is new.** It
+  calls the stream's `send()` (`mavlink_receiver.cpp:762-790`), and `ODOMETRY`
+  sends only on a new `vehicle_odometry` (`streams/ODOMETRY.hpp:64`). A stream
+  given a very long interval (2·10⁹ µs) never sends on its own and becomes a pure
+  on-request stream. Not −1: that deletes the stream (`mavlink_main.cpp:1176`),
+  and the next request would re-create it through the blocking path above.
+- **EKF2's output comes every other frame.** At the default `EKF2_PREDICT_US`
+  its filter updates every 8 ms, and `ODOMETRY.time_usec` is the IMU sample time
+  (`EKF2.cpp:1684`, `streams/ODOMETRY.hpp:66`); `ekf2_selector` republishes it as
+  `vehicle_odometry` (§3.8). Its attitude comes every frame, but carries its
+  publish time (`EKF2.cpp:1045`), so it cannot mark EKF2's progress.
+- **Nothing proves a frame's estimate complete** (§3.2). Fetched right after the
+  frame's answer, the frame's own output was there on every frame idle and on none
+  with every core busy; the output one frame older was there on every frame of
+  every run.
+- **uXRCE-DDS shares none of this.** `uxrce_dds_client` handles inbound samples
+  only after a `px4_poll` on uORB returns, with a 10 ms simulated-time timeout
+  (`uxrce_dds_client.cpp:648-678`), so a sample sent while the clock is frozen
+  waits for the next frame. The PING barrier does not carry over (§9).
+
+**Decided 2026-09-26 — not yet implemented (`AGENTS.md` §3):**
+
+- **Estimates are fetched, at a chosen age of at least one frame.** After every
+  frame's answer, `REQUEST_MESSAGE(ODOMETRY)` behind a barrier, with the periodic
+  stream silenced as above. The controller at `t_k` gets the newest output with
+  sample time ≤ `t_k − d`, `d` ≥ 1 frame; its age is `d` or `d` + 1 frame, set by
+  EKF2's 8 ms cadence. An output with sample time ≤ `t_k − d` that arrives only
+  after `t_k` marks that sample late in the record, never silently. Age 0 would
+  need PX4's thread states from `/proc` — Linux-only, and it slowed a loaded
+  machine to real time — and was declined.
+- **Setpoints and commands are sent on simulated time.** What the controller
+  returns at `t_k` is sent behind a barrier before the `HIL_SENSOR` of
+  `t_k + d_sp`, `d_sp` ≥ 1 frame, so PX4 processes that frame with it. A body-rate
+  setpoint is then used by that frame's rate loop exactly, and moves the rotors
+  one frame later (§3.2); an attitude setpoint one frame later again on most
+  frames (§3.2). Arming, mode and takeoff commands take the same path, so a run
+  can be armed at a simulated time; commander's 10 ms loop still picks the frame,
+  within 1–2.
+
 ---
 
 ## 4. Repository layout
@@ -626,7 +806,9 @@ mujoco_px4_sitl/
 ├── pyproject.toml              deps: mujoco>=3.13, numpy, pymavlink
 ├── src/mujoco_px4_sitl/
 │   ├── __init__.py
-│   ├── main.py                 CLI entry point (script-launchable)
+│   ├── main.py                 CLI entry point (script-launchable), and
+│   │                           run() for an in-process caller
+│   ├── __main__.py             python -m mujoco_px4_sitl
 │   ├── config.py               dataclass config, CLI + file override
 │   ├── transport.py            TCP server, MAVLink framing, reconnect
 │   ├── hil.py                  HIL_SENSOR / HIL_STATE_QUATERNION encode,
@@ -640,6 +822,10 @@ mujoco_px4_sitl/
 │   ├── sidechannel.py          UDP arm-command / ground-truth server
 │   ├── arm.py                  arm_cmd -> data.ctrl with its watchdog;
 │   │                           propeller clearance, reported not blocked
+│   ├── control.py              in-process research controller: schedule,
+│   │                           drops, observation, recorder
+│   ├── px4link.py              PX4's API link: EKF2's ODOMETRY, as a
+│   │                           companion computer reads it
 │   └── viewer.py               optional mujoco.viewer, off by default
 ├── models/
 │   ├── quad_x.xml              phase 3-5 airframe (FLU body frame, §3.6)
@@ -664,6 +850,8 @@ mujoco_px4_sitl/
 │   ├── fly_regression.py       flies the phase 5 profile over MAVLink;
 │   │                           reports corner errors only, not hover accuracy
 │   ├── hover_error.py          hover accuracy from a ulog, datum-corrected
+│   ├── manipulability.py       per-voxel reachability point cloud, any joints
+│   │                           frozen; kinematic only
 │   └── sidechannel_example.py  reference side-channel client, imports nothing
 │                               from this package
 └── tests/
@@ -674,6 +862,8 @@ mujoco_px4_sitl/
     ├── test_rotorconfig.py     sidecar parsing; the silent-at-runtime errors
     ├── test_urdf_to_mjcf.py    conversion + generated airframe, own fixtures
     ├── test_arm.py             arm writer, watchdog, exact disc clearance
+    ├── test_control.py         controller schedule, drops, command-age bound
+    ├── test_manipulability.py  Jacobian metric on analytic fixtures
     └── test_loop.py            lockstep loop against a fake PX4
 ```
 
@@ -1333,6 +1523,77 @@ What is worth keeping from it:
   alignment in the first 3 s and once at takeoff (t = 12.4 s). A controller that
   differentiates the estimate has to watch it.
 
+#### The PX4 legs (Phase 2 probes)
+
+**Measured 2026-09-26**, to decide phase 2 of the controller topology
+(`AGENTS.md` §3); the facts drawn from them are in §3.2, §3.3 and §3.9. A probe
+outside this repository (local, unversioned) started a fresh PX4 per run in a
+throw-away rootfs, ran a lockstep loop built from this package's physics and HIL
+transport, owned PX4's API link, and flew a mission on simulated time: Offboard
+position hold at 3 m (setpoints from 18 s, armed at 20 s), a 3 s body-rate window
+at 30 s with a host attitude loop on the fetched estimate, and a 3 s attitude
+window at 38 s, both with a seeded ±0.015 thrust PRBS per frame. Which frame's
+thrust reached the rotors is read from Σu² of the answer, linear in collective
+thrust at `THR_MDL_FAC 1` and blind to torque: the right lag leaves a worst
+residual of 0.9–1.5 % of one PRBS flip over a window, a wrong one a full flip.
+Quad unless stated. "Strict" is the regime §3.2 decides, except that the probe
+applied each answer to its own frame; the decided one-frame delay does not change
+which setpoint an answer carries. "Loaded" is all 16 cores kept busy.
+
+| Quantity | Measured |
+|---|---|
+| answers stamped with their own frame, after PX4's first | 447,811 of 447,811 frames over 40 runs: disarmed and armed, quad and X8, idle and loaded |
+| PX4's first answer | 4–53 frames after it connected |
+| wait for the answer | median 0.05 ms, p99 0.11 ms idle; median 0.5–1.1 ms, p99 about 4 ms loaded |
+| body-rate setpoint behind the PING barrier | used by its frame on every frame: idle and loaded, quad and X8 |
+| the same without the barrier | every frame idle; about a third loaded, the rest one frame late |
+| attitude setpoint behind the barrier | one frame after a body-rate one on 95–100 % of frames, the same frame on the rest; 28 % the same frame loaded |
+| EKF2 output of the frame itself, fetched after the answer | every frame idle; no frame loaded (5,498 of 5,498 one frame old) |
+| EKF2 output one frame older | every frame of every run |
+| `SET_MESSAGE_INTERVAL`, then a barrier, clock held | no echo in 2 s; the echo came 2 frames after the clock moved |
+| bounded-lead loop, for comparison | body-rate setpoint one frame late on about 90 % of frames, the same frame on 8 %, two late on 2 %; attitude two late on 81–84 %, else one; `px4_lag` 1 frame on 90–92 %, 0 on the rest |
+
+How far two runs of one schedule drift apart, position against ground truth,
+fresh PX4 each:
+
+| Loop | Baro, mag, GPS | Pairs | First difference | Hover 22–30 s, max | Whole flight, max |
+|---|---|---|---|---|---|
+| bounded lead (today) | PX4's `sensor_*_sim` | 1 | the arming frame | 61 cm | 83 cm |
+| strict, and variants | PX4's `sensor_*_sim` | 10 | the arming frame | 0.9–101 cm | 1.4–124 cm |
+| bounded lead | simulator, seeded | 1 | the arming frame | 19 cm | 21 cm |
+| strict | simulator, seeded | 1 quad, 1 X8 | the arming frame | 3.6 cm, X8 0.9 cm | 3.6 cm, X8 2.1 cm |
+
+The strict variants: ground truth sent before the IMU sample; PX4 pinned to one
+core; strict from PX4's first frame, a frame with no answer ending when no thread
+of PX4 or of the processes it starts is runnable (`rcS` runs as `/bin/sh` plus
+`px4-*` clients); and a two-phase frame, in which a `HIL_SENSOR` with no fields
+advances the clock, the loop waits until PX4 is idle, and the IMU sample follows
+at the same timestamp.
+
+Speed, strict and unpaced, simulated seconds per wall second: quad 11.4–12.7 and
+X8 7.7–7.9 idle; quad 2.3–2.6 loaded. The `/proc` checks cost the variants half
+of that or more.
+
+What is worth keeping from it:
+
+- **The legs as §3.2 and §3.9 decide them are what these numbers support.** The
+  barrier looks unnecessary on an idle machine and is not: load is exactly when a
+  setpoint misses its frame. Likewise, an estimate fetched after the answer looks
+  complete until the machine is busy.
+- **Runs match bit for bit until arming only because nothing moves before it.**
+  The first armed output already differs.
+- **PX4's sensor noise dominates the drift** (§3.3): in one pair's ulogs EKF2's
+  states differ from 0.84 s, and seeded simulator-side sensors cut the spread by
+  one to two orders of magnitude.
+- **Arming lands 1–2 frames apart** even with the command in uORB at the same
+  simulated instant: commander's 10 ms loop keeps a phase set during boot.
+- **A deterministic boot was tried and declined.** With the process-tree idle
+  check and the two-phase frame, one pair got its first answer (frame 4), first
+  estimate (frame 78) and EKF2's cadence identical, the next pair its first
+  estimate two frames apart; the estimate's content differed in both. With seeded
+  sensors added, hover still differed by 0.6 cm, at half the speed. Bit-identical
+  runs would need PX4 changes (§1).
+
 ---
 
 ## 7. Bring-up troubleshooting
@@ -1487,3 +1748,9 @@ model, the platform or the rotor parametrization belong in
 - Whether the aerial manipulator eventually needs a custom `CA_*` allocation or
   benefits from PX4's existing disturbance rejection alone. Still open, and the
   move to X8 does not settle it.
+- How to put a uXRCE-DDS thrust/torque setpoint in place before a frame. The
+  client reads inbound samples only when its simulated-time `px4_poll` returns
+  (§3.9), so the MAVLink PING barrier does not apply, and in thrust/torque mode
+  the allocator runs only on those samples, so a late one also delays that
+  frame's answer. Needs evidence that a sample reached the client before the
+  frame; design it once an agent and `px4_msgs` are installed.
