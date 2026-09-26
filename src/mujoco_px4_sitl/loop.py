@@ -1,18 +1,28 @@
-"""Lockstep orchestration: the plan section 3.2 loop, complete.
+"""Lockstep orchestration: strict lockstep, and the plan section 3.2 fallback.
 
-One regime, not two. **Wall clock paces the loop; the actuator stream only bounds
-how far ahead of PX4 we may get.** Both halves are mandatory:
+**Once PX4 has answered, every frame waits for the answer stamped with its
+time.** The frame ``[t_k, t_k+1)`` is driven by PX4's answer to the
+``HIL_SENSOR`` stamped ``t_k-1``, so IMU -> actuator is exactly one frame, and
+``HIL_SENSOR(t_k+1)`` is not sent before the answer stamped ``t_k`` has arrived.
+The stamp is PX4's clock when it sent the answer, which only our ``HIL_SENSOR``
+moves, so with no frame outstanding it proves which frame the answer was
+computed from (plan 3.2, "What an answer proves").
+
+**Before PX4's first answer, and after a frame whose answer timed out, the
+bounded-lead loop runs**: wall clock paces it, and the actuator stream only
+bounds how far ahead of PX4 it may get. Both halves are mandatory there:
 
 * Without the pacer, nothing bounds us during PX4's boot -- which happens
   entirely inside this loop's first frames, because ``simulator_mavlink start``
   blocks ``rcS`` until our first ``HIL_SENSOR``. Running ahead drops IMU FIFO
   samples and presents as estimator divergence.
-* Without the brake, we can outrun PX4's pipeline in flight the same way.
-* Blocking on ``HIL_ACTUATOR_CONTROLS`` *per frame* deadlocks at startup:
-  PX4 publishes none before Commander is up, and its escape hatches are either
-  measured in simulated time or compiled out under lockstep.
+* Without the brake, a PX4 that fell behind is outrun the same way.
+* Blocking on ``HIL_ACTUATOR_CONTROLS`` *from the first frame* deadlocks at
+  startup: PX4 publishes none before Commander is up, and its escape hatches are
+  either measured in simulated time or compiled out under lockstep.
 
-The brake's timeout is therefore **wall clock**, and its expiry is never fatal.
+Every timeout here is **wall clock**, and none is fatal. A frame whose answer
+timed out is counted as unproven, never silently.
 """
 
 from __future__ import annotations
@@ -39,10 +49,16 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class LoopStats:
-    """Counters that make the two section 7 loop faults visible."""
+    """Counters that make the regime and the section 7 loop faults visible."""
 
     frames: int = 0
     actuator_messages: int = 0
+    # Of the frames from the one PX4's first answer arrived in: those whose own
+    # answer, the one stamped with their time, arrived before the next frame
+    # was sent, and those it did not arrive for within answer_timeout_s. The
+    # two add up to every frame after the boot, frames - answered - unproven.
+    answered: int = 0
+    unproven: int = 0
     brake_waits: int = 0
     brake_timeouts: int = 0
     discarded_messages: int = 0
@@ -53,29 +69,21 @@ class LoopStats:
     sim_time: float = 0.0
     wall_time: float = 0.0
     # How many IMU frames old PX4's controls were when a frame used them, from
-    # HIL_ACTUATOR_CONTROLS.time_usec -- PX4's clock when it sent them, which is
-    # the IMU time that triggered them unless we had already sent the next frame.
-    # So a lower bound on the IMU -> actuator delay, exact when PX4 kept up. The
-    # lead the brake allows makes this wall-clock dependent; this is the measure.
+    # HIL_ACTUATOR_CONTROLS.time_usec -- PX4's clock when it sent them. One on
+    # every frame after an answered one, by construction; more only after an
+    # unproven frame or in the boot.
     px4_lag: Counter = field(default_factory=Counter)
 
     @property
     def ratio(self) -> float:
         return (self.sim_time / self.wall_time) if self.wall_time > 0.0 else 0.0
 
-    def lag_summary(self) -> str:
-        total = sum(self.px4_lag.values())
-        if not total:
-            return "px4_lag=-"
-        mode, count = self.px4_lag.most_common(1)[0]
-        return f"px4_lag={mode}fr({100.0 * count / total:.1f}%) max={max(self.px4_lag)}fr"
-
     def summary(self) -> str:
         return (
             f"t_sim={self.sim_time:8.2f}s ratio={self.ratio:5.3f} "
             f"frames={self.frames} act={self.actuator_messages} "
-            f"brake={self.brake_waits} timeouts={self.brake_timeouts} "
-            f"{self.lag_summary()}"
+            f"answered={self.answered} unproven={self.unproven} "
+            f"brake={self.brake_waits} timeouts={self.brake_timeouts}"
         )
 
 
@@ -104,9 +112,19 @@ class LockstepLoop:
         self.controller = controller
         self._refused_arm_cmds = 0
         self.stats = LoopStats()
+        # The newest answer received, whatever its stamp; for the flags.
         self.controls = hil.ActuatorControls()
         self.running = False
 
+        # What drives the frame being stepped: the newest answer stamped at or
+        # before the previous frame's time, or none yet (stamp -1: an answer to
+        # the frame at t = 0 is stamped 0). And the current frame's own answer,
+        # which drives the next one.
+        self._held = hil.ActuatorControls(time_usec=-1)
+        self._own: hil.ActuatorControls | None = None
+        # Strict once any answer has arrived, until a frame's answer times out.
+        self._strict = False
+        self.first_answer_frame: int | None = None
         self._frames_since_ack = 0
         self._imu_time_us = 0
         self._last_imu_time_us = -1
@@ -123,6 +141,7 @@ class LockstepLoop:
         if msg_type == "HIL_ACTUATOR_CONTROLS":
             self.controls = hil.decode_actuator_controls(msg)
             self.stats.actuator_messages += 1
+            self._take(self.controls)
             if not self._lockstep_checked:
                 self._lockstep_checked = True
                 if self.controls.lockstep:
@@ -142,6 +161,40 @@ class LockstepLoop:
         if msg_type == "BAD_DATA":
             _log.debug("discarding malformed frame")
         return False
+
+    def _take(self, controls: hil.ActuatorControls) -> None:
+        """Route an answer by its stamp. Every answer, on every path, zeroes the
+        lead (plan 3.2's invariant) and makes the next frame strict."""
+        self._frames_since_ack = 0
+        if not self._strict:
+            self._strict = True
+            if self.first_answer_frame is None:
+                self.first_answer_frame = self.stats.frames
+                _log.info("PX4's first answer, frame %d: strict lockstep from here",
+                          self.stats.frames)
+            elif self.stats.unproven <= 3 or self.stats.unproven % 100 == 0:
+                _log.info("PX4 answering again, frame %d: strict lockstep resumes",
+                          self.stats.frames)
+        stamp = controls.time_usec
+        if stamp == self._imu_time_us:
+            self._own = controls
+        elif self._held.time_usec < stamp < self._imu_time_us:
+            # Another frame's answer is never this frame's. An older one late
+            # after a timeout, or one the boot's lead left behind, is still the
+            # newest at or before the previous frame, so it drives this frame.
+            self._held = controls
+        # A stamp ahead of our clock cannot come from PX4, whose clock is ours.
+
+    def _await_answer(self) -> bool:
+        """Strict: wait, wall clock, for the answer stamped with this frame."""
+        deadline = time.monotonic() + self.cfg.answer_timeout_s
+        while self._own is None and self.server.connected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            for msg in self.server.wait(remaining):
+                self._handle(msg)
+        return self._own is not None
 
     def _drain(self) -> None:
         """Take everything readable and, on a fresh actuator message, clear the
@@ -226,7 +279,7 @@ class LockstepLoop:
                 _log.info("stopped before PX4 connected")
                 return
 
-        frame_wall_dt = cfg.imu_dt / cfg.speed_factor
+        frame_wall_dt = cfg.imu_dt / cfg.speed_factor if cfg.speed_factor > 0.0 else None
         t_wall_start = time.monotonic()
         t_sim_start = self.physics.time
         t_wall_next = t_wall_start
@@ -234,21 +287,49 @@ class LockstepLoop:
         controls = np.zeros(self.physics.num_actuators)
 
         _log.info(
-            "loop start: IMU %.0f Hz, speed x%.2f, max_lead=%d frames, "
-            "brake timeout %.0f ms",
-            cfg.imu_rate_hz, cfg.speed_factor, cfg.max_lead_frames,
-            cfg.brake_timeout_s * 1e3,
+            "loop start: IMU %.0f Hz, speed %s, answer timeout %.0f ms; fallback "
+            "max_lead=%d frames, brake timeout %.0f ms",
+            cfg.imu_rate_hz,
+            f"x{cfg.speed_factor:.2f}" if frame_wall_dt else "unpaced",
+            cfg.answer_timeout_s * 1e3, cfg.max_lead_frames, cfg.brake_timeout_s * 1e3,
         )
 
         while self.running:
+            if self.controller is not None:
+                # Setpoints due at this frame go in before its HIL_SENSOR, so
+                # PX4 processes the frame with them.
+                self.controller.before_sensor(self.physics.time)
             if not self._send_frame():
                 _log.warning("PX4 link lost, stopping loop")
                 break
             self._frames_since_ack += 1
 
-            self._drain()
-            if self._frames_since_ack >= cfg.max_lead_frames:
-                self._brake()
+            if not self._strict:
+                self._drain()
+                if self._frames_since_ack >= cfg.max_lead_frames:
+                    self._brake()
+            # Strict already, or an answer has just arrived -- PX4's first, or
+            # one after a timeout. Either way PX4 now answers every frame
+            # (plan 3.2), so this one waits for its own too.
+            answered = False
+            if self._strict:
+                answered = self._await_answer()
+                if not answered:
+                    # Never fatal: the loop falls back to the pacer and the
+                    # brake, and the next answer makes it strict again.
+                    self._strict = False
+                    if self.stats.unproven < 3 or self.stats.unproven % 100 == 99:
+                        _log.warning(
+                            "no answer stamped %d us within %.0f ms wall clock: "
+                            "frame unproven (%d so far), falling back until PX4 "
+                            "answers again", self._imu_time_us,
+                            cfg.answer_timeout_s * 1e3, self.stats.unproven + 1,
+                        )
+            if self.first_answer_frame is not None:
+                if answered:
+                    self.stats.answered += 1
+                else:
+                    self.stats.unproven += 1
 
             # Every frame and just before stepping, so an arm_cmd drives the
             # first frame after it arrives rather than waiting for a publish.
@@ -261,15 +342,20 @@ class LockstepLoop:
             if self.controller is not None:
                 # The loop was stopped while the controller ran, and PX4's clock
                 # with it. Not counting that time keeps the pacer from following
-                # a slow call with a catch-up burst that widens PX4's lead.
-                t_wall_next += self.controller.before_step(self.physics)
+                # a slow call with a catch-up burst.
+                t_wall_next += self.controller.before_step(
+                    self.physics, answered=answered,
+                    actuators=self._held if self._held.time_usec >= 0 else None,
+                )
 
-            if self.controls.time_usec > 0:
-                lag = (self.physics.time - self.controls.time_usec * 1e-6) / cfg.imu_dt
+            if self._held.time_usec >= 0:
+                lag = (self._imu_time_us - self._held.time_usec) * 1e-6 / cfg.imu_dt
                 self.stats.px4_lag[int(round(lag))] += 1
-            controls = self.controls.effective(self.physics.num_actuators)
+            controls = self._held.effective(self.physics.num_actuators)
             self.physics.step_frame(controls)
             self.stats.frames += 1
+            if self._own is not None:
+                self._held, self._own = self._own, None
 
             if self.sidechannel is not None and self.stats.frames % self._sidechannel_decimation == 0:
                 self.sidechannel.publish(
@@ -291,7 +377,11 @@ class LockstepLoop:
                 break
 
             # Pacer: independent of PX4, so it also governs the boot window.
-            t_wall_next += frame_wall_dt
+            # Unpaced, it still holds the fallback to real time.
+            if frame_wall_dt is None and self._strict:
+                t_wall_next = time.monotonic()
+                continue
+            t_wall_next += frame_wall_dt or cfg.imu_dt
             sleep_for = t_wall_next - time.monotonic()
             if sleep_for > 0.0:
                 time.sleep(sleep_for)
@@ -301,6 +391,8 @@ class LockstepLoop:
                 t_wall_next = time.monotonic()
 
         self.running = False
+        if self.controller is not None:
+            self.controller.close()
         self.stats.sim_time = self.physics.time - t_sim_start
         self.stats.wall_time = time.monotonic() - t_wall_start
         _log.info("loop stopped: %s", self._summary())

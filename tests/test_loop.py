@@ -1,8 +1,9 @@
 """Lockstep loop tests against a fake PX4. No PX4 build, no MuJoCo model.
 
-These cover the two section 3.2 failure modes directly, because both are
-invisible in a phase-1 smoke test: a loop that blocks per frame deadlocks at
-startup, and a loop with no pacer runs away during PX4's boot window.
+These cover the strict regime and the two section 3.2 failure modes of its
+fallback directly, because all are invisible in a phase-1 smoke test: an answer
+applied a frame early or late, a loop that blocks from the first frame deadlocks
+at startup, and a loop with no pacer runs away during PX4's boot window.
 """
 
 from __future__ import annotations
@@ -26,14 +27,26 @@ from mujoco_px4_sitl.transport import HilServer
 class FakePX4:
     """A PX4 stand-in: TCP client that sends the two unsolicited startup
     messages and, optionally, HIL_ACTUATOR_CONTROLS in reply to HIL_SENSOR.
+
+    ``silent_after`` stops replying after that many frames. ``stamp_offset``
+    stamps each reply that many frames off the frame it answers. The reply's
+    first control is the answered frame's index times ``FRAME_CODE``, so a test
+    can tell which answer drove which frame.
     """
 
+    FRAME_CODE = 1e-4
+
     def __init__(self, port: int, *, reply: bool = True, lockstep: bool = True,
-                 armed: bool = True) -> None:
+                 armed: bool = True, silent_after: int | None = None,
+                 stamp_offset: int = 0) -> None:
         self.port = port
         self.reply = reply
         self.lockstep = lockstep
         self.armed = armed
+        self.silent_after = silent_after
+        self.stamp_offset = stamp_offset
+        # PX4's clock: the newest HIL_SENSOR stamp, set before replying to it.
+        self.clock_us = -1
         self.sensor_frames = 0
         self.state_frames = 0
         self.imu_timestamps: list[int] = []
@@ -64,8 +77,12 @@ class FakePX4:
             mavlink_version=3,
         ).pack(self._mav))
 
-    def _actuator_message(self, time_usec: int) -> bytes:
-        controls = [0.5] * 4 + [0.0] * (hil.NUM_ACTUATOR_OUTPUTS - 4)
+    def _actuator_message(self, time_usec: int) -> bytes | None:
+        frame = time_usec // 4000
+        controls = [frame * self.FRAME_CODE] + [0.5] * 3 + [0.0] * (hil.NUM_ACTUATOR_OUTPUTS - 4)
+        time_usec += self.stamp_offset * 4000
+        if time_usec < 0:
+            return None  # no frame before the first to stamp it with
         mode = hil.MODE_FLAG_CUSTOM | (hil.MODE_FLAG_ARMED if self.armed else 0)
         return mavlink.MAVLink_hil_actuator_controls_message(
             time_usec=time_usec, controls=controls, mode=mode,
@@ -89,9 +106,13 @@ class FakePX4:
                     kind = msg.get_type()
                     if kind == "HIL_SENSOR":
                         self.sensor_frames += 1
+                        self.clock_us = int(msg.time_usec)
                         self.imu_timestamps.append(int(msg.time_usec))
-                        if self.reply:
-                            sock.sendall(self._actuator_message(int(msg.time_usec)))
+                        silent = (self.silent_after is not None
+                                  and self.sensor_frames > self.silent_after)
+                        reply = self._actuator_message(int(msg.time_usec))
+                        if self.reply and not silent and reply is not None:
+                            sock.sendall(reply)
                     elif kind == "HIL_STATE_QUATERNION":
                         self.state_frames += 1
         finally:
@@ -139,10 +160,11 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def run_loop(cfg: Config, *, reply: bool, lockstep: bool = True) -> tuple[LockstepLoop, FakePX4]:
+def run_loop(cfg: Config, *, reply: bool, lockstep: bool = True, physics=None,
+             **fake_options) -> tuple[LockstepLoop, FakePX4]:
     server = HilServer(cfg.hil_bind_host, cfg.hil_port)
-    fake = FakePX4(cfg.hil_port, reply=reply, lockstep=lockstep)
-    loop = LockstepLoop(cfg, StubPhysics(cfg), server, None)
+    fake = FakePX4(cfg.hil_port, reply=reply, lockstep=lockstep, **fake_options)
+    loop = LockstepLoop(cfg, physics or StubPhysics(cfg), server, None)
     try:
         fake.start()
         loop.run()
@@ -268,6 +290,87 @@ def test_a_responsive_px4_is_never_braked():
     assert loop.stats.brake_timeouts == 0
 
 
+# --- the strict regime ------------------------------------------------------
+
+
+class StepLog(StubPhysics):
+    """The stub, noting which answer drove each frame."""
+
+    def __init__(self, cfg: Config) -> None:
+        super().__init__(cfg)
+        self.driven: list[tuple[int, int]] = []  # (frame, frame of the answer)
+
+    def step_frame(self, controls) -> None:
+        frame = int(round(self.time / self.cfg.imu_dt))
+        answer = int(round(controls[0] / FakePX4.FRAME_CODE)) if controls[1] else -1
+        self.driven.append((frame, answer))
+        super().step_frame(controls)
+
+
+def test_a_px4_answering_every_frame_drives_each_frame_with_the_previous_answer():
+    """The decided regime: from PX4's first answer, every frame is answered, no
+    brake and no timeout, and the frame [t_k, t_k+1) runs on the answer to
+    t_k-1 -- exactly one frame, never zero and never two."""
+    cfg = make_config(max_sim_time=0.4, speed_factor=5.0)
+    physics = StepLog(cfg)
+    loop, _ = run_loop(cfg, reply=True, physics=physics)
+    stats = loop.stats
+    first = loop.first_answer_frame
+    assert first is not None and first < 5
+    assert stats.brake_waits == 0 and stats.brake_timeouts == 0
+    assert stats.unproven == 0
+    assert stats.answered == stats.frames - first
+    strict = [(k, a) for k, a in physics.driven if k > first]
+    assert len(strict) > 80
+    assert all(a == k - 1 for k, a in strict), strict[:5]
+    assert stats.px4_lag[1] >= len(strict)
+
+
+def test_unpaced_runs_as_fast_as_px4_answers():
+    cfg = make_config(max_sim_time=0.4, speed_factor=0.0)
+    start = time.monotonic()
+    loop, _ = run_loop(cfg, reply=True)
+    assert loop.stats.answered > 80 and loop.stats.unproven == 0
+    # 0.4 s simulated; paced at real time it could not finish in under 0.4 s.
+    assert time.monotonic() - start < 0.3
+
+
+def test_unpaced_still_paces_a_silent_px4_at_real_time():
+    """Unpaced means PX4 sets the pace; before it answers, nothing else would
+    bound the boot window."""
+    cfg = make_config(max_sim_time=0.3, speed_factor=0.0, brake_timeout_s=0.02)
+    loop, _ = run_loop(cfg, reply=False)
+    assert loop.stats.ratio <= 1.1
+    assert loop.stats.answered == 0 and loop.stats.unproven == 0
+
+
+def test_a_px4_falling_silent_gives_unproven_frames_not_a_fatal_error():
+    """After a timeout the fallback takes over: the run completes on the pacer
+    and the brake, and every frame after the silence is counted unproven."""
+    cfg = make_config(max_sim_time=0.4, speed_factor=5.0, answer_timeout_s=0.03,
+                      brake_timeout_s=0.02)
+    loop, fake = run_loop(cfg, reply=True, silent_after=30)
+    stats = loop.stats
+    assert stats.frames == pytest.approx(int(0.4 * cfg.imu_rate_hz), abs=2)
+    assert stats.unproven > 50
+    assert stats.answered + stats.unproven == stats.frames - loop.first_answer_frame
+    assert stats.answered <= 30  # the fake answered 30 frames
+    assert stats.brake_timeouts > 0  # the fallback, not the strict wait, ran on
+
+
+def test_an_answer_stamped_for_another_frame_is_not_taken_as_this_frames():
+    """PX4 cannot send another frame's answer for this one, but a late answer
+    after a timeout looks like one. It may drive a frame -- it is the newest
+    older answer -- but never makes the frame answered."""
+    cfg = make_config(max_sim_time=0.12, speed_factor=5.0, answer_timeout_s=0.02,
+                      brake_timeout_s=0.02)
+    loop, _ = run_loop(cfg, reply=True, stamp_offset=-1)
+    stats = loop.stats
+    assert stats.actuator_messages > 10
+    assert stats.answered == 0
+    assert stats.unproven == stats.frames - loop.first_answer_frame
+
+
 # --- the section 3.2 failure modes ---------------------------------------
 
 def test_silent_px4_does_not_deadlock_the_loop():
@@ -280,6 +383,9 @@ def test_silent_px4_does_not_deadlock_the_loop():
     assert loop.stats.frames == pytest.approx(int(0.2 * cfg.imu_rate_hz), rel=0.05)
     assert loop.stats.actuator_messages == 0
     assert loop.stats.brake_timeouts > 0
+    # All boot: nothing is answered, and nothing is unproven either.
+    assert loop.first_answer_frame is None
+    assert loop.stats.answered == loop.stats.unproven == 0
     # Timing out must hand pacing back to the wall clock, not stall the loop.
     assert fake.sensor_frames > 0
 

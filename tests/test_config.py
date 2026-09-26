@@ -66,6 +66,19 @@ def test_a_non_integer_rate_ratio_is_rejected():
         cfg.validate()
 
 
+def test_speed_factor_zero_is_unpaced_and_negative_is_rejected():
+    """0 runs as fast as PX4 answers (the loop still paces its fallback)."""
+    assert config_from_args(["--stub-physics", "-s", "0"]).speed_factor == 0.0
+    with pytest.raises(ValueError, match="speed_factor"):
+        config_from_args(["--stub-physics", "-s", "-1"])
+
+
+def test_the_answer_timeout_reaches_the_config_and_must_be_positive():
+    assert config_from_args(["--stub-physics", "--answer-timeout", "0.5"]).answer_timeout_s == 0.5
+    with pytest.raises(ValueError, match="answer_timeout_s"):
+        config_from_args(["--stub-physics", "--answer-timeout", "0"])
+
+
 @pytest.mark.parametrize("argv", [
     ["--stub-physics", "--inject-attitude", "30,0,0"],
     ["--model", "/nonexistent/model.xml"],

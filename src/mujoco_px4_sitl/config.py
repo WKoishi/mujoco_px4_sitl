@@ -39,6 +39,9 @@ class Config:
     imu_rate_hz: float = 250.0
     # Physics rate must be an integer multiple of the IMU rate (plan phase 3).
     physics_rate_hz: float = 1000.0
+    # Simulated seconds per wall second, a ceiling. 0 is unpaced: frames PX4
+    # has answered run as fast as it answers. The fallback before PX4's first
+    # answer is paced at real time then, since nothing else bounds it (plan 3.2).
     speed_factor: float = 1.0
 
     # --- Lockstep loop tunables (plan section 3.2) -------------------------
@@ -48,6 +51,12 @@ class Config:
     # large enough to make braking rare. See the table in the plan's 3.2.
     max_lead_frames: int = 32
     brake_timeout_s: float = 0.05
+    # Strict regime: how long a frame waits for PX4's answer stamped with its
+    # time, wall clock, before it is counted unproven and the fallback takes
+    # over. Unlike the brake's, this is only spent when PX4 has gone silent, so
+    # it is long enough never to fire under load (probed: p99 about 4 ms with
+    # every core busy).
+    answer_timeout_s: float = 0.2
     status_interval_s: float = 5.0
 
     # --- Model -------------------------------------------------------------
@@ -88,13 +97,14 @@ class Config:
     sidechannel_port_base: int = 14650
     sidechannel_rate_hz: float = 50.0
 
-    # --- PX4 estimate, for an in-process controller (control.py) ------------
+    # --- PX4's API link, for an in-process controller (control.py) ---------
     # PX4's API/offboard MAVLink link: PX4 sends to 14540 + instance
     # (px4-rc.mavlink). No CLI flags: only an in-process caller reads these.
     px4_api_port_base: int = 14540
-    # ODOMETRY rate to ask PX4 for. EKF2 publishes once per IMU sample, and the
-    # onboard-mode default of 30 Hz would make most samples see an old estimate.
-    px4_estimate_rate_hz: float = 250.0
+    # Wall clock to wait for a PING barrier's echo (plan 3.9). Idle an echo
+    # takes 15-35 us; one that does not come is logged and counted, and later
+    # sends go unbarriered until an echo shows PX4's receive thread is back.
+    api_barrier_timeout_s: float = 0.2
 
     # --- Misc --------------------------------------------------------------
     viewer: bool = False
@@ -136,12 +146,16 @@ class Config:
 
     def validate(self) -> None:
         self.steps_per_imu_frame  # raises on a bad rate ratio
-        if self.speed_factor <= 0.0:
-            raise ValueError("speed_factor must be > 0")
+        if self.speed_factor < 0.0:
+            raise ValueError("speed_factor must be >= 0 (0 is unpaced)")
         if self.max_lead_frames < 1:
             raise ValueError("max_lead_frames must be >= 1")
         if self.brake_timeout_s <= 0.0:
             raise ValueError("brake_timeout_s must be > 0 (wall clock)")
+        if self.answer_timeout_s <= 0.0:
+            raise ValueError("answer_timeout_s must be > 0 (wall clock)")
+        if self.api_barrier_timeout_s <= 0.0:
+            raise ValueError("api_barrier_timeout_s must be > 0 (wall clock)")
         if self.arm_timeout_s < 0.0:
             raise ValueError("arm_timeout_s must be >= 0 (0 disables the watchdog)")
         if self.arm_on_timeout not in TIMEOUT_ACTIONS:
@@ -221,11 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--physics-rate", dest="physics_rate_hz", type=float, default=1000.0,
                    help="integer multiple of --imu-rate (default: %(default)s)")
     p.add_argument("-s", "--speed-factor", type=float, default=1.0,
-                   help="simulated seconds per wall second (default: %(default)s)")
+                   help=("simulated seconds per wall second, a ceiling; 0 runs as "
+                         "fast as PX4 answers (default: %(default)s)"))
     p.add_argument("--max-lead-frames", type=int, default=32,
                    help="IMU frames outstanding before braking (default: %(default)s)")
     p.add_argument("--brake-timeout", dest="brake_timeout_s", type=float, default=0.05,
                    help="wall-clock brake timeout in seconds (default: %(default)s)")
+    p.add_argument("--answer-timeout", dest="answer_timeout_s", type=float, default=0.2,
+                   help=("wall-clock seconds a frame waits for PX4's answer before "
+                         "it is counted unproven (default: %(default)s)"))
     p.add_argument("--status-interval", dest="status_interval_s", type=float, default=5.0,
                    help="seconds between sim/wall ratio log lines (default: %(default)s)")
     p.add_argument(

@@ -125,18 +125,30 @@ chosen sample instants of simulated time; its arm command lands after a chosen
 delay, less a seeded drop schedule, so the command age has a known bound. It
 reads the arm's encoders and PX4's EKF2 estimate over MAVLink
 ([px4link.py](src/mujoco_px4_sitl/px4link.py)), the path a companion computer
-uses. Ground truth goes only to a recorder. `run_sitl.sh --px4-only` starts PX4
-for it. Two flights under one schedule (`IMPLEMENTATION_PLAN.md` phase 7) gave
-identical sample instants and drops and a bit-identical arm trajectory until
-arming, while the median estimate age went from 8 ms to 4 ms. **The arm leg is
-chosen; the PX4 legs are only measured.**
+uses, and sends PX4 setpoints and commands the same way. Ground truth goes only
+to a recorder. `run_sitl.sh --px4-only` starts PX4 for it.
 
-**Making the PX4 legs chosen is the next step, and it is decided but not built.**
-Phase 2 of the topology was probed and decided on 2026-09-26: strict lockstep
-as the only regime, IMU → actuator exactly one frame, estimates fetched at a
-chosen age of at least one frame, setpoints behind a barrier (§3 has the
-decisions and the work list). Until it lands, everything above about the loop
-and the status line describes today's code.
+**The PX4 legs are chosen too, since phase 2 of the topology landed on
+2026-09-26** (§3). Once PX4 answers, the loop is in strict lockstep, and IMU →
+actuator is exactly one frame. The controller's estimate is a chosen age of at
+least one frame, fetched behind a PING barrier after every answer, and its
+setpoints and commands are behind a barrier before a chosen frame. Arming
+included, so a run is armed at a simulated time.
+
+Measured through the real loop (`IMPLEMENTATION_PLAN.md` phase 7), on the quad
+and the X8, idle and with every core busy:
+- Every frame was answered after PX4's first answer.
+- A body-rate setpoint drove its intended frame every time.
+- No estimate was late.
+- Unpaced, the quad ran at 12.6× and the X8 at 7.7× (both about 2× loaded).
+
+Two X8 flights of one schedule, armed on the same sample, gave identical sample
+instants, drops and proven flags, and a bit-identical arm trajectory until
+arming. What stays unchosen: the estimate's age is one of two values, and which
+sample gets which follows EKF2's cadence phase. That phase is set in boot, and
+it was swapped between those two flights. Also unchosen: an attitude
+setpoint's extra frame inside PX4. The quad and the X8 pass the Phase 5 profile
+under the strict loop, and the X8 passes its attitude steps (phase 5).
 
 ---
 
@@ -150,8 +162,8 @@ and the status line describes today's code.
 | Arm joint state reaches only an in-process controller | `ground_truth.arm` carries command age, staleness and propeller clearance, not `qpos` | an out-of-process consumer (a ROS 2 bridge, a plot) sees no joints. No longer a controller problem (§3); add it to the side channel when a monitoring consumer needs it |
 | Arm encoders are ideal | `JointReading` in [arm.py](src/mujoco_px4_sitl/arm.py) is MuJoCo's joint state at the sample instant | no quantisation, noise or latency on the controller's joint feedback. Model them from the servo's datasheet once it is chosen |
 | Arm has position servos only | the generated MJCF has one position actuator per joint (`arm_act*`); `arm.py` refuses any other kind, and rejects `mode: "torque"` | a torque or velocity joint interface cannot be simulated yet. MuJoCo fixes the actuator type at compile time, so either the conversion script emits more actuators or the writer applies `qfrc_applied`. The servo gains are provisional too, and decide intrusions as well as tracking: their gravity droop moved reached poses across a disc (§1) |
-| Only the arm leg's delay is chosen | `control.py` schedules sample, delay and drops on simulated time. Which EKF2 estimate has arrived by a sample, PX4's IMU → actuator response, and setpoints the controller sends PX4 are wall-clock (§3) | a data-age argument can be tested at a chosen age on the arm. On the base, `estimate_age` and `px4_lag` measure the age exactly but cannot set it, so runs differ (median estimate age 8 ms, then 4 ms, under one schedule). Decided, not implemented: phase 2 in §3 |
-| Two runs of one schedule drift apart | PX4's `sensor_*_sim` draw their noise from one shared `rand()` whose position boot decides (`IMPLEMENTATION_PLAN.md` §3.3), and within a frame PX4's threads race (§3.2 there) | identical until arming, then up to about a metre apart in hover, under any loop, so a single pair cannot resolve an effect smaller than that; compare over repeated runs. Seeded simulator-side sensors (strategy B, deferred, §3) brought two strict runs to 2–4 cm. Bit-identical runs would need PX4 changes |
+| Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set in PX4's boot, and PX4's thread race between its attitude and rate loops (`IMPLEMENTATION_PLAN.md` §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs (it did, between two X8 flights). An attitude setpoint reaches the rate loop one frame after a body-rate one on most frames and in the same frame on the rest, 3–98 % depending on load. Body-rate setpoints and the IMU → actuator delay are exact. Accepted 2026-09-26; `EKF2_PREDICT_US 4000` would remove the first, not tried |
+| Two runs of one schedule drift apart | PX4's `sensor_*_sim` draw their noise from one shared `rand()` whose position boot decides (`IMPLEMENTATION_PLAN.md` §3.3), and within a frame PX4's threads race (§3.2 there) | identical until arming, then up to about a metre apart in hover, under any loop (0.34 m for the strict X8 pair of phase 7), so a single pair cannot resolve an effect smaller than that; compare over repeated runs. Seeded simulator-side sensors (strategy B, deferred, §3) brought two strict runs to 2–4 cm. Bit-identical runs would need PX4 changes |
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's home pose | an arm that moves in flight changes the inertia and the gains do not follow. Rigid-arm inertia is what the Phase 7 disturbance test starts from, so it is the right starting point, not the whole answer |
 | IMU has no noise or bias | `sim.py` sends MuJoCo's ideal accel/gyro, and PX4's `simulator_mavlink` only quantizes them (`SimulatorMavlink.cpp:198-270`): under MAVLink HIL the simulator owns IMU noise. Baro, mag and GPS do get noise, from PX4's `sensor_*_sim` | EKF2's bias estimation is never exercised, and estimate errors look better than they will be -- including the estimate an in-process controller is handed. The derived attitude gains were verified on a noiseless gyro, and noise is what the rate D term suffers from, so re-fly the step tests once it lands. Add white noise and a bias random walk on the `HIL_SENSOR` path only, sized from the chosen IMU's datasheet: `SimState.gyro_frd` also feeds ground truth (`HIL_STATE_QUATERNION`, the side channel), which must stay clean. If strategy B lands first, its sensor module is the place (`IMPLEMENTATION_PLAN.md` §3.3) |
 | No aerodynamics | ω is available but nothing reads it | the effects `MODELING_CONVENTIONS.md` §5 lists are expressible, none are expressed |
@@ -205,14 +217,16 @@ rate loop needs none of it.
 
 Driving the arm is **done** (§1). A future writer that applies forces to the
 arm owns its own clearing: `clear()` zeros only `base_link`'s `xfrc_applied`.
-The research-controller topology is **decided**; its first phase is built and
-its second decided (below). What remains:
+The research-controller topology is **decided and built**, both phases (below).
+What remains:
 
-1. **Phase 2 of the topology: strict lockstep and the PX4 legs.** Decided
-   2026-09-26, not implemented. The work list is below; this is the next step.
-2. **The coaxial `c_t` discount**, as its own step with its own flight, after
-   phase 2 so the two stay separable. It moves the plant gain as well as the hover
-   point, so regenerate the airframe and fly the attitude steps again.
+1. **The coaxial `c_t` discount**, as its own step with its own flight, now that
+   phase 2 has flown so the two stay separable. It moves the plant gain as well as
+   the hover point, so regenerate the airframe and fly the attitude steps again
+   (`scripts/fly_in_process.py steps`).
+2. **`sim/run_x8.py` in the private repo** still says the PX4 legs are wall-clock
+   and exposes only the arm schedule. A diff was proposed to the user on
+   2026-09-26; they apply it, since they stage work of their own there.
 
 **Strategy B — baro, mag and GPS synthesized by the simulator, seeded — waits
 until a use needs it,** such as single-pair counterfactuals, sensor noise as a
@@ -242,19 +256,20 @@ a synchronous controller are the sim/wall ratio and the pacer's catch-up burst
 after a slow call, which widens PX4's lead. The loop now removes the
 controller's time from its pacing, so only the ratio remains.
 
-**In process chose only the arm leg.** In today's loop three legs are still
-wall-clock: which of PX4's outputs a frame uses (the brake lets the loop run
-ahead), which EKF2 estimate a sample sees, and when a setpoint the controller
-sends reaches PX4's uORB. Phase 2 makes all three chosen.
+**In process chose only the arm leg.** Three legs stayed wall-clock: which of
+PX4's outputs a frame used (the brake let the loop run ahead), which EKF2
+estimate a sample saw, and when a setpoint the controller sent reached PX4's
+uORB. Phase 2 made all three chosen.
 
-### Phase 2: decided 2026-09-26, not implemented
+### Phase 2: decided and built 2026-09-26
 
 Probed before designing. The PX4 facts are in `IMPLEMENTATION_PLAN.md` §3.2
-("What an answer proves") and §3.9, the measurements in phase 7 ("The PX4
-legs"), and the decided design at the end of §3.2 and of §3.9. The decisions:
+("What an answer proves", "Strict lockstep") and §3.9 ("The legs as built"), the
+measurements in phase 7 ("The PX4 legs", "The in-process controller") and phase
+5 ("Under strict lockstep"). The decisions:
 
 - **Strict lockstep is the only regime.** Once PX4 has answered, every frame
-  waits for the answer stamped with its time. Today's loop stays only as the
+  waits for the answer stamped with its time. The old loop stays only as the
   fallback before PX4's first answer and for a frame whose answer times out.
 - **IMU → actuator is exactly one frame.**
 - **Estimates are fetched after each answer, at a chosen age of at least one
@@ -262,72 +277,36 @@ legs"), and the decided design at the end of §3.2 and of §3.9. The decisions:
 - **Setpoints and commands go behind a PING barrier, at a chosen delay of at
   least one frame.**
 - **Strategy B later, when needed** (above).
+- **EKF2's cadence phase stays unchosen** (added once measured): which samples
+  get the shorter estimate age can swap between runs.
 
-What that buys, per leg: IMU → actuator chosen and proven by the stamp;
-estimates chosen, aged `d` or `d` + 1 frame by EKF2's 8 ms cadence, completeness
-checked after the fact; body-rate setpoints chosen exactly, attitude setpoints
-chosen plus PX4's own 0–1 frame, a race inside PX4 that can be measured but not
-chosen. Two runs share their timing, not their state (§2). Probed speed, unpaced:
-quad about 12×, X8 about 8×.
+Where it lives: [loop.py](src/mujoco_px4_sitl/loop.py) (strict regime,
+`-s 0` unpaced, `--answer-timeout`), [px4link.py](src/mujoco_px4_sitl/px4link.py)
+(`ApiLink`: barrier, silencing, fetch, refusals, setpoint builders),
+[control.py](src/mujoco_px4_sitl/control.py) (`Schedule.estimate_delay` and
+`setpoint_delay`, `ControllerOutput`, `Observation.proven`,
+`Sample.estimate_late`). `tests/test_loop.py` and `tests/test_control.py` cover
+the work list's cases against fake PX4s; `scripts/fly_in_process.py` repeats the
+acceptance measurements, the phase 7 flight and the X8 steps against a real one.
 
-Work list, in order:
+Three things building it found, beyond the probes:
 
-1. **`loop.py`: the strict regime.** The frame `[t_k, t_{k+1})` is driven by the
-   answer stamped `t_{k−1}`, and `HIL_SENSOR(t_{k+1})` is not sent before the
-   answer stamped `t_k` or its wall-clock timeout. Today's pacer and brake, with
-   the invariant of plan §3.2, run until PX4's first answer and for timed-out
-   frames, which are counted as unproven. The pacer stays as a ceiling; add an
-   unpaced setting (`Config.validate` rejects `speed_factor <= 0` today). On the
-   status line, answered and unproven counts replace `px4_lag`.
-   `tests/test_loop.py`, against fake PX4s: one answering every frame with the
-   right stamp gives zero brakes, zero timeouts and each answer applied exactly
-   one frame later; one silent through boot does not deadlock; one falling
-   silent mid-run gives unproven frames, never a fatal error; an answer with
-   another frame's stamp is not taken as this frame's.
-2. **`px4link.py`: the host's API link.** Send with a PING barrier, whose
-   wall-clock timeout is loud and recorded. After every answer, not only at
-   samples, `REQUEST_MESSAGE(ODOMETRY)` behind a barrier: the stream sends only
-   the newest output, and the one a sample needs is older. Before the first
-   barrier, silence the periodic `ODOMETRY` with an interval of 2·10⁹ µs, not
-   −1, and wait for its `COMMAND_ACK` while frames advance without barriers.
-   Refuse on the barrier path anything that ends in
-   `configure_stream_threadsafe()` (plan §3.9). Keep the origin handling. Tests:
-   a fake peer that echoes PING in order, and one that stalls the way PX4's
-   blocked receive thread does.
-3. **`control.py`: the schedule and the controller's outputs.** `Schedule` gains
-   an estimate delay and a setpoint delay, whole IMU frames, at least one. The
-   observation's estimate is the newest output with sample time ≤ `t_k − d`,
-   with an age bound; a sample whose estimate turns out late is flagged in the
-   record. A setpoint returned at `t_k` is in uORB before PX4 processes the
-   frame at `t_k + d_sp` (plan §3.9). `Controller.step` may return PX4 setpoints
-   and commands besides the arm targets; the shape is the implementer's, and
-   `src/` stays free of ROS. Arming and takeoff at simulated times go the same
-   way, which replaces the wall-clocked GCS script for runs meant to be
-   compared.
-4. **Documents.** Plan §3.2: the decided regime becomes the description, today's
-   loop the fallback; plan §3.9's decision paragraph likewise; plan §7 for the
-   new status line. `README.md`'s health check and in-process controller
-   sections. This file. `sim/run_x8.py` in the private repo says the PX4 legs
-   are wall-clock and exposes only the arm schedule; update it with the user,
-   who stages work of their own in that repo.
-5. **Flights**, each recorded at the phase it belongs to: the Phase 5 profile on
-   the quad and the X8 against their baselines; the X8's yaw and pitch steps,
-   since IMU → actuator moves from mostly one frame to exactly one; the Phase 7
-   in-process controller twice under one schedule, armed at a simulated time,
-   where sample instants, drops and estimate ages should now all match.
-6. **Acceptance: repeat the probe's measurements through the real loop.** Every
-   frame answered after PX4's first answer; a body-rate setpoint used by its
-   intended frame on every frame, idle and with every core busy; no late
-   estimate at an age of one frame, idle and loaded; speed of the order above.
+- **PX4 drops the ACK to a new component's first message when it races the
+  component's registration**, and the link then never reached its barriers. The
+  silencing request now goes between two PINGs (plan §3.9).
+- **A sample is proven only after `estimate_delay` + 2 fetched frames**:
+  otherwise the first sample after the link came up had a four-frame-old
+  estimate.
+- **The frame PX4's first answer arrives in waits for its own**: otherwise a
+  first answer a frame late, as under load, left one frame two frames behind.
 
-The probe that produced the numbers lives in `../phase2_probes/`, next to the
-PX4 checkout: local, not versioned, with a README. It has a working strict loop,
-the barrier, the estimate fetch, the thrust-PRBS lag measurement, and seeded
-simulator-side sensors for strategy B. Use it as a reference; whether its checks
-become a script in this repo is the implementer's call. The plan carries all the
-facts without it.
+The probe that produced the design lives in `../phase2_probes/`, next to the PX4
+checkout: local, not versioned, with a README. Its checks became
+`scripts/fly_in_process.py`; it still holds what was declined (the `/proc` idle
+checks, the two-phase frame) and strategy B's seeded simulator-side sensors. The
+plan carries all the facts without it.
 
-Traps the probes hit:
+Traps the probes and the build hit:
 
 - **The receive thread blocks on simulated time behind `SET_MESSAGE_INTERVAL`**
   (plan §3.9), so a barrier sent after one hangs until its timeout.
@@ -337,10 +316,17 @@ Traps the probes hit:
   of the setpoints missed their frame.
 - **`SET_ATTITUDE_TARGET` publishes its setpoint only in Offboard**; before the
   switch only `offboard_control_mode` goes through. Semantics, not timing.
-- **PX4 starts answering 4–53 frames after it connects**, so the fallback is
-  needed however early strict mode would like to start.
+- **PX4 starts answering 4–73 frames after it connects** (67–73 under load
+  through the real loop), so the fallback is needed however early strict mode
+  would like to start.
 - **A probe that starts PX4 itself meets the exit trap** in
-  `IMPLEMENTATION_PLAN.md` §7.
+  `IMPLEMENTATION_PLAN.md` §7. `fly_in_process.py` kills PX4 after the run and
+  discards its throw-away rootfs.
+- **An ONBOARD_CONTROLLER heartbeat of our own would bite** once it lapsed for
+  `COM_OBC_LOSS_T` of PX4's clock, which a wall-clocked one does in an unpaced
+  run. The link sends none (plan §3.9).
+- **Yaw overshoot read against the target carries EKF2's heading error**, 1–2°
+  on the X8; the steps report it past the settled value too (plan phase 5).
 
 Leave room for uXRCE-DDS thrust/torque; how to time its setpoints is open
 (plan §9).
@@ -473,10 +459,10 @@ template, regenerate; never hand-edit a generated product.
 - **No `rclpy` / `ament` / `ros` imports in `src/`.** The ROS 2 bridge is a separate
   package talking to the side channel over UDP.
 - **Frame conversions live only in `frames.py`.** A rotation anywhere else is a bug.
-- **`brake` and `timeouts` should both be 0 in healthy flight**, and `ratio` alone
-  will not tell you otherwise. `IMPLEMENTATION_PLAN.md` §7 diagnoses both. Once
-  phase 2 lands (§3), the brake acts only before PX4's first answer, and the
-  count to watch in flight is unproven frames.
+- **`unproven` should stay 0 in healthy flight, and `brake` and `timeouts` flat
+  after the boot**, and `ratio` alone will not tell you otherwise. The brake acts
+  only before PX4's first answer and after a timeout. `IMPLEMENTATION_PLAN.md` §7
+  diagnoses all three.
 - **Commit messages: 10–20 lines of body.** The history runs to 53 lines and 640
   words because it restates derivations the documents already own. State a
   constraint once, in the document that owns it per §5, and have the commit point
@@ -498,6 +484,15 @@ source ../.venv/bin/activate && make -C ../PX4-Autopilot px4_sitl_default
 # Then, from the private repo:
 python sim/run_x8.py            # PX4 via run_sitl.sh --px4-only; simulator and
                                 # research controller in this process
+```
+
+The phase 7 flight and the attitude steps, on simulated time and from the public
+repo (PX4 in a throw-away rootfs, so nothing to start first):
+
+```sh
+X8="--model $HOME/DEV/kani_arm/model/mjcf/x8_arm.xml --rotors $HOME/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml --airframe 22002 --hover 0.2162"
+python scripts/fly_in_process.py arm-sweep $X8 --out /tmp/sweep_a.npz
+python scripts/fly_in_process.py steps $X8 --out /tmp/steps.npz
 ```
 
 Without a controller, driving the arm over the side channel instead:

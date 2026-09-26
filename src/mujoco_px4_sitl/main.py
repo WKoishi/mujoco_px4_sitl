@@ -18,7 +18,7 @@ from .config import Config, config_from_args
 from .control import Controller, ControllerHost, Sample, Schedule
 from .frames import GeodeticProjection
 from .loop import LockstepLoop
-from .px4link import EstimateLink
+from .px4link import ApiLink
 from .rotorconfig import load_rotors
 from .sidechannel import SideChannel
 from .sim import MujocoPhysics, build_physics
@@ -54,8 +54,9 @@ def run(
     precedence question, so it raises.
 
     ``controller`` runs in this process, synchronously, on ``schedule``; it reads
-    PX4's estimate over MAVLink and drives the arm. ``recorder`` receives each
-    sample with ground truth attached (:mod:`control`).
+    PX4's estimate over MAVLink, drives the arm, and may send PX4 setpoints and
+    commands. ``recorder`` receives each sample with ground truth attached
+    (:mod:`control`).
     """
     if controller is None and (schedule is not None or recorder is not None):
         raise ValueError("a schedule or recorder without a controller does nothing")
@@ -85,16 +86,16 @@ def run(
     # collision is reported immediately rather than after MuJoCo has loaded.
     server = HilServer(cfg.hil_bind_host, cfg.hil_port)
     sidechannel = None
-    estimates = None
+    link = None
     host = None
     try:
         physics = build_physics(cfg, rotors)
         if cfg.sidechannel_enabled:
             sidechannel = SideChannel(cfg.sidechannel_bind_host, cfg.sidechannel_port)
         if controller is not None:
-            estimates = EstimateLink("127.0.0.1", cfg.px4_api_port, cfg.px4_estimate_rate_hz)
+            link = ApiLink("127.0.0.1", cfg.px4_api_port, cfg.api_barrier_timeout_s)
             host = ControllerHost(
-                controller, schedule, cfg.imu_dt, estimates=estimates,
+                controller, schedule, cfg.imu_dt, link=link,
                 home=GeodeticProjection(cfg.home_lat, cfg.home_lon, cfg.home_alt),
                 recorder=recorder,
             )
@@ -102,7 +103,7 @@ def run(
     except BaseException:
         # Nothing is running yet, but the listening sockets are already bound and
         # would outlive us as leaked fds, holding the ports against a retry.
-        for sock in (estimates, sidechannel):
+        for sock in (link, sidechannel):
             if sock is not None:
                 sock.close()
         server.close()
@@ -135,8 +136,8 @@ def run(
     finally:
         if view is not None:
             view.close()
-        if estimates is not None:
-            estimates.close()
+        if link is not None:
+            link.close()
         if sidechannel is not None:
             sidechannel.close()
         server.close()
