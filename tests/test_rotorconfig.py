@@ -153,6 +153,29 @@ def test_coefficients_are_per_rotor_tuples():
     assert rotors.c_t == (_CT, _CT, 0.8 * _CT, 0.8 * _CT)
 
 
+def test_ct_factor_scales_the_plant_c_t(tmp_path):
+    """The coaxial discount (section 5): c_t stays the datasheet's, the plant
+    flies c_t * ct_factor."""
+    rotors = load_rotors(_write(tmp_path, {"rotors": [
+        _rotor("CCW"), _rotor("CW", ct_factor=0.8),
+    ]}))
+    assert rotors.c_t == (_CT, pytest.approx(0.8 * _CT))
+    spec = parse_rotor_entry(_rotor("CW", ct_factor=0.8), 0, "x", "rotor")
+    assert spec.c_t == _CT
+
+
+@pytest.mark.parametrize("factor", [0.0, 1.2, -0.5])
+def test_ct_factor_outside_0_1_is_rejected(tmp_path, factor):
+    with pytest.raises(ValueError, match="ct_factor must be in"):
+        load_rotors(_write(tmp_path, {"rotors": [_rotor(1, ct_factor=factor)]}))
+
+
+def test_ct_factor_needs_a_measured_c_t():
+    """Discounting the mass-based fallback would discount a fabricated number."""
+    with pytest.raises(ValueError, match="needs a measured c_t"):
+        parse_rotor_entry({"pos": [0, 0, 0], "spin": 1, "ct_factor": 0.8}, 0, "x", "r")
+
+
 def test_empty_rotors_block_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="no 'rotors' block"):
         load_rotors(_write(tmp_path, {"rotors": []}))

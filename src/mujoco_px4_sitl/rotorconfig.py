@@ -27,7 +27,7 @@ from .vehicle import RotorModel
 # rotors block where it means a dropped coefficient.
 _ROTOR_KEYS = {
     "pos", "spin", "c_t", "km", "omega_max", "omega_min", "zaxis", "deck", "label",
-    "radius",
+    "radius", "ct_factor",
 }
 
 
@@ -50,6 +50,12 @@ class RotorSpec:
     rotor site's disc, which is what the simulator's propeller clearance check
     reads (``arm.PropellerMonitor``). Geometry, like ``pos``: it reaches the
     simulator through the generated MJCF, not through ``--rotors``.
+
+    ``ct_factor`` scales ``c_t`` for aerodynamic interference, the coaxial
+    lower deck's discount (MODELING_CONVENTIONS.md section 5). It reaches the
+    plant only: ``c_t`` stays the datasheet's isolated-rotor fit, and that is
+    what the PX4 airframe's ``CA_ROTOR*_CT`` carries (the airframe template
+    says why).
     """
 
     pos: tuple[float, float, float]
@@ -62,6 +68,12 @@ class RotorSpec:
     deck: str = ""
     label: str = ""
     radius: float | None = None
+    ct_factor: float = 1.0
+
+    @property
+    def plant_c_t(self) -> float | None:
+        """``c_t`` as the plant flies it, after ``ct_factor``."""
+        return None if self.c_t is None else self.c_t * self.ct_factor
 
     def __post_init__(self) -> None:
         if self.spin not in (1, -1):
@@ -85,6 +97,17 @@ class RotorSpec:
                 f"Thrust is c_t * omega^2, so a measured c_t against the "
                 f"placeholder omega_max silently rescales every thrust in the "
                 f"model. Give both, from the same datasheet"
+            )
+        if not 0.0 < self.ct_factor <= 1.0:
+            raise ValueError(
+                f"rotor {self.label or '?'}: ct_factor must be in (0, 1], got "
+                f"{self.ct_factor!r}. It is a loss against the isolated rotor"
+            )
+        if self.ct_factor != 1.0 and self.c_t is None:
+            # The fallback calibrates c_t from mass across every rotor, so a
+            # discount on it would discount a fabricated number.
+            raise ValueError(
+                f"rotor {self.label or '?'}: ct_factor needs a measured c_t"
             )
 
 
@@ -126,6 +149,7 @@ def parse_rotor_entry(entry: Any, index: int, where: str, prefix: str) -> RotorS
         deck=str(entry.get("deck", "")),
         label=str(entry.get("label", f"{prefix}{index}")),
         radius=None if entry.get("radius") is None else float(entry["radius"]),
+        ct_factor=float(entry.get("ct_factor", 1.0)),
     )
 
 
@@ -136,7 +160,7 @@ def rotors_from_specs(
 
     Every coefficient is passed as a per-rotor tuple even when uniform, so the
     coaxial lower-deck ``c_t`` discount (MODELING_CONVENTIONS.md section 5) is a
-    sidecar edit and not a code change.
+    sidecar edit and not a code change. The plant gets ``c_t * ct_factor``.
 
     ``c_t`` is all-or-nothing: a partial set would mean mixing measured rotors
     with mass-calibrated ones on one vehicle, and the calibration divides the
@@ -156,7 +180,7 @@ def rotors_from_specs(
 
     kwargs: dict[str, Any] = {"spin": tuple(int(s.spin) for s in specs)}
     if all(measured):
-        kwargs["c_t"] = tuple(float(s.c_t) for s in specs)  # type: ignore[arg-type]
+        kwargs["c_t"] = tuple(float(s.plant_c_t) for s in specs)  # type: ignore[arg-type]
         # RotorSpec guarantees omega_max alongside c_t.
         kwargs["omega_max"] = tuple(float(s.omega_max) for s in specs)  # type: ignore[arg-type]
     kwargs["km"] = tuple(float(s.km) for s in specs)

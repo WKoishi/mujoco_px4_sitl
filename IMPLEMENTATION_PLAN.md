@@ -450,6 +450,9 @@ Measured through the real loop in phase 7, "The PX4 legs".
   frame. One frame rather than zero: the fallback as it was gave one frame on
   64–90 % of frames, and the Phase 5 baselines and the derived attitude gains were
   flown on that.
+  One loaded X8 acceptance run broke this on one sample of 11432, with every
+  frame answered in time and no barrier timeout (2026-09-26, phase 5, "With the
+  coaxial `c_t` discount"); unexplained, and not seen on the rerun.
 - **A frame whose answer does not arrive within `answer_timeout_s` is unproven,
   counted, never fatal**, and the fallback runs until an answer arrives. Another
   frame's stamp never counts as this frame's answer; an older answer that arrives
@@ -1463,6 +1466,62 @@ controls the estimate: 1.0–1.8° on the 20° steps of this flight, which past 
 target read as 0.00° and 2.94°. The earlier column was taken past the target and
 carries whatever offset its flight had. It was also flown from a wall-clocked
 GCS script, so read the table as no regression, not as an effect of the delay.
+
+#### With the coaxial `c_t` discount
+
+**Flown 2026-09-26 with the lower deck at `ct_factor` 0.80**, chosen, not
+measured (`MODELING_CONVENTIONS.md` §8). The plant flies `c_t × 0.80` on rotors
+4–7; the airframe's `CA_ROTOR*_CT` keeps the isolated value, so PX4 still splits
+thrust evenly and the derivations stay exact. Regenerated together, the airframe
+changed in three parameters: `MPC_THR_HOVER` 0.2162 → 0.2455, `MC_PITCHRATE_K`
+2.18 → 2.45 and `MC_YAWRATE_MAX` 29.6 → 29.8. Thrust/weight as flown fell from
+3.79 to 3.41, and the plant gain by 11 % on every axis. Roll K stays at its floor
+of 1 and yaw K at PX4's cap of 5, where yaw now needs 10.1: its rate/attitude
+separation fell from 2.2× to 2.0×.
+
+`fly_in_process.py acceptance` passed on the quad. On the X8 the first run failed
+one row: under load 16, IMU → actuator was one frame on 11431 of 11432 samples,
+with `unproven 0` and `barrier timeouts 0`. A rerun passed every row. The
+recording was overwritten, so which frame and which lag is unknown; `AGENTS.md`
+§2 carries it as a gap. Nothing in a thrust coefficient reaches the loop's timing.
+
+Phase 5, `fly_regression.py` against `run_sitl.sh`, then `hover_error.py` (163 s of
+settled hover): `ratio=1.000 unproven=0 brake=0 timeouts=0`, `Disarmed by landing`,
+no failsafe.
+
+| | X8, strict | X8, strict, `ct_factor` 0.80 |
+|---|---|---|
+| altitude error | 0.204 max / 0.053 median | 0.136 / 0.033 |
+| horizontal error | 0.167 / 0.057 | 0.150 / 0.054 |
+| square corner error | 0.03–0.07 m | 0.03–0.10 m |
+| allocator torque achieved | 99.7 % | 99.5 % of airborne samples |
+
+`hover_thrust_estimate` settled on **0.2454 against the generated 0.2455**, as
+0.2162 did before, so the discount moved PX4's hover point exactly where the
+derivation put it. The five airborne samples that missed the torque setpoint sit
+at 68.5 s and in the 0.6 s before landing was detected, each with rotor 3 (and at
+touchdown rotor 6) at its lower limit.
+
+`fly_in_process.py steps`, two runs, since the first carried a large heading
+offset:
+
+| step | X8 derived, strict | `ct_factor` 0.80, run 1 | run 2 |
+|---|---|---|---|
+| yaw 20° | 0.7–1.9° / 0.67–0.80 s | 0.93–2.30° / 1.30–1.92 s | 1.90–2.08° / 0.70–0.76 s |
+| yaw 90° | 0.15–0.30° / 3.1 s | 0.43–0.87° / 2.98–3.18 s | 0.32–0.72° / 3.04–3.09 s |
+| pitch 5° | 0.3–1.1 % / 0.42–0.43 s | 0.1–1.4 % / 0.42–0.43 s | 0.5–1.2 % / 0.42–0.43 s |
+| roll 5° | 0.5–0.9 % / 0.44 s | 1.2–1.3 % / 0.43–0.44 s | 1.0–1.4 % / 0.43 s |
+
+**Run 1's slow yaw settling is heading error, not dynamics.** Its yaw steps
+settled 4.35, 3.16, 2.56 and 1.86° short of the target, shrinking step by step as
+a converging estimate would, and settling is the last exit from a 5° band around
+the target, which a 4.35° offset nearly fills. Run 2 settled 0.17–1.95° off and
+matches the strict column. Measured around each step's own settled value, the two
+runs agree: 0.9–2.4° past it on the 20° steps, 0.4–1.0° on the 90° steps, within
+10 % after 0.85–1.31 s and 2.9 s. The recording holds no estimated attitude, so
+the offset is attributed by that pattern, not measured. Roll and pitch are
+unchanged within run-to-run spread, as the 11 % plant loss against unchanged or
+raised K predicts. Read the whole as no regression.
 
 ### Phase 6 — External API and launch story
 

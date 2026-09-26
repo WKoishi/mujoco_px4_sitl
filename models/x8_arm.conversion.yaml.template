@@ -93,6 +93,14 @@ collision_meshes_off: true
 #         way. Real props are often far from PX4's 0.05 default, and the airframe
 #         file must then carry the fitted value or the allocator expects the wrong
 #         yaw authority -- flyable, so it does not announce itself.
+#   ct_factor: optional, (0, 1], default 1. Scales c_t for aerodynamic
+#         interference -- the coaxial lower deck, in the upper rotor's wake
+#         (MODELING_CONVENTIONS.md section 5). Keep c_t the isolated datasheet
+#         fit and put the loss here: the plant flies c_t * ct_factor, while the
+#         airframe's CA_ROTOR*_CT keeps the isolated value, so PX4 allocates the
+#         decks evenly and MPC_THR_HOVER stays exact (the airframe template says
+#         why). Needs a measured c_t. Changes hover and the derived gains:
+#         regenerate the airframe with the MJCF.
 rotors:
   - {label: front-right upper, deck: upper, spin: CCW, km: 0.05, pos: [REPLACE_X, REPLACE_-Y, REPLACE_Z_UPPER]}
   - {label: front-left  upper, deck: upper, spin: CW,  km: 0.05, pos: [REPLACE_X, REPLACE_+Y, REPLACE_Z_UPPER]}
@@ -104,8 +112,8 @@ rotors:
   - {label: rear-left   lower, deck: lower, spin: CW,  km: 0.05, pos: [REPLACE_-X, REPLACE_+Y, REPLACE_Z_LOWER]}
 # With motor data, each entry gains c_t / omega_max / a fitted km, e.g.
 #   - {label: ..., spin: CCW, km: 0.0215, c_t: 1.02e-04, omega_max: 633.4, radius: REPLACE_R, pos: [...]}
-# The lower four can carry a reduced c_t for coaxial interference (section 5
-# suggests 0.75-0.85 of the isolated value); a datasheet is for an isolated rotor.
+# and the lower four add a ct_factor for coaxial interference (section 5
+# suggests 0.75-0.85); a datasheet is for an isolated rotor.
 
 # Armed-but-idle rotor speed, rad/s. Shared: it is an ESC setting, not a
 # per-rotor one. Omit to keep vehicle.py's placeholder (100) and its warning.

@@ -731,6 +731,33 @@ def test_airframe_hover_matches_the_vehicle_the_simulator_builds(rig, tmp_path):
     assert f"MPC_THR_HOVER {expected:.4f}" in out.read_text()
 
 
+def test_ct_factor_reaches_the_plant_and_not_ca_rotor_ct(rig, tmp_path):
+    """The coaxial discount is a plant property. PX4 splits collective thrust in
+    proportion to CA_ROTOR*_CT, so a discounted CT there would move PX4's hover
+    point off the MPC_THR_HOVER derived here (the airframe template)."""
+    from mujoco_px4_sitl.rotorconfig import load_rotors
+    from mujoco_px4_sitl.vehicle import Vehicle
+
+    path, data = rig
+    for r in data["rotors"]:
+        r["c_t"] = 1.0e-04
+        r["omega_max"] = 600.0
+        r["ct_factor"] = 0.8
+    data["omega_idle"] = 55.0
+    _write(path, data)
+    model, result = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    text = out.read_text()
+
+    assert "CA_ROTOR0_CT 36.0000" in text
+    vehicle = Vehicle(model, load_rotors(path))
+    assert vehicle.c_t[0] == pytest.approx(0.8e-04)
+    assert f"MPC_THR_HOVER {vehicle.hover_command() ** 2:.4f}" in text
+    reported = next(line for line in result.lines if "hover command" in line)
+    assert f"{vehicle.hover_command():.4f}" in reported
+
+
 def test_airframe_leaves_no_unfilled_placeholder(rig, tmp_path):
     path, _ = rig
     model, _ = _convert(path)

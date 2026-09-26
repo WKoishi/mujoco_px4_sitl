@@ -25,9 +25,20 @@
 # here is the negation of the model's py. KM is positive for CCW.
 #
 # PZ is omitted throughout, and that is not an oversight: thrust is along body
-# +z, so r x [0,0,T] uses only x and y. The 128 mm between the decks contributes
-# nothing to roll or pitch, in our model and in PX4's allocator alike
+# +z, so r x [0,0,T] uses only x and y. The spacing between the decks
+# contributes nothing to roll or pitch, in our model and in PX4's allocator alike
 # (MODELING_CONVENTIONS.md section 4). The decks differ in KM sign, not geometry.
+#
+# CT is the isolated rotor's thrust at full command on every rotor, including
+# the lower deck the sidecar discounts with ct_factor for coaxial interference.
+# PX4's pseudo-inverse splits collective thrust in proportion to CT and then
+# normalizes by the mean (ControlAllocationPseudoInverse::
+# updateControlAllocationMatrixScale), so a discounted lower-deck CT would drive
+# the upper deck harder and move the hover point below the MPC_THR_HOVER
+# derived here: 0.2427 against 0.2455 on the first X8 at 0.80. Equal CT keeps
+# the allocation even, which is what the hover and gain derivations assume, and
+# it is how a real vehicle is configured: from the datasheet, with the
+# interference a plant property the controller has to absorb.
 
 . ${R}etc/init.d/rc.mc_defaults
 

@@ -18,8 +18,9 @@ them when the platform changes.**
 - **X8 + 5-DoF arm** is generated from the CAD export by `scripts/urdf_to_mjcf.py`
   into the private repo, together with its PX4 airframe (`22002_mujoco_x8`). The
   airframe carries the measured allocation, `MPC_THR_HOVER` and attitude gains
-  derived from the model (`px4/mujoco_x8.airframe.template` says how). It flies
-  Phase 5 and its attitude steps (plan phase 5).
+  derived from the model (`px4/mujoco_x8.airframe.template` says how). The lower
+  deck flies `c_t × 0.80` for coaxial interference, while the airframe's `CT` stays
+  isolated. It flies Phase 5 and its attitude steps (plan phase 5).
 - **The arm** is driven through [arm.py](src/mujoco_px4_sitl/arm.py): position
   servos, a command watchdog on simulated time, propeller intrusion reported on
   the reached pose and never blocked (`README.md`, "Driving the arm").
@@ -51,7 +52,8 @@ them when the platform changes.**
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the home-pose inertia | the gains do not follow an arm that moves in flight |
 | IMU has no noise or bias | `sim.py` sends ideal accel/gyro; under MAVLink HIL the simulator owns IMU noise | EKF2's bias estimation is never exercised, and estimates look better than they will be. Add noise on the `HIL_SENSOR` path only (ground truth must stay clean), sized from the IMU's datasheet, then re-fly the step tests |
 | No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
-| Coaxial `c_t` discount | all 8 rotors carry the isolated-rotor value | lower deck 15–25 % too strong. Moves `MPC_THR_HOVER` to 0.2377 / 0.2456 / 0.2541 at 0.85 / 0.80 / 0.75: sidecar and airframe change together. Next step (§3) |
+| Coaxial interference is a chosen constant | `ct_factor` 0.80 on the lower deck, unmeasured (`MODELING_CONVENTIONS.md` §8) | hover and plant gain rest on a chosen number; the upper deck's own loss and any speed dependence are not modelled. A bench test of a coaxial pair replaces the number |
+| IMU → actuator missed one frame once | one loaded X8 `acceptance` run, 11431/11432, every frame answered, no barrier timeout (plan phase 5) | the one-frame guarantee is not yet unconditional; the rerun passed and the recording was overwritten. Next step (§3) |
 | No uXRCE-DDS agent or `px4_msgs` here | PX4 starts `uxrce_dds_client` on UDP 8888; nothing answers | thrust/torque setpoints cannot be flown; their timing is open (plan §9) |
 
 Two authoring hazards nothing in `src/` catches: rotor sites that are not direct
@@ -64,10 +66,10 @@ next to the MJCF it generated.
 
 ## 3. Next steps
 
-1. **The coaxial `c_t` discount**, as its own step with its own flight. It moves
-   the plant gain as well as the hover point: pick the factor in the sidecar,
-   regenerate MJCF and airframe together (§7), re-fly Phase 5 and
-   `fly_in_process.py steps`, and record both at plan phase 5.
+1. **The one-frame IMU → actuator miss** (§2): repeat `fly_in_process.py
+   acceptance --loads 16` on the X8 with a separate `--out` per run until it
+   misses again, then locate the frame and its lag. A miss at PX4's first answer
+   would point at the fix plan §3.2 records.
 
 **Strategy B** — baro, mag and GPS synthesized by the simulator, seeded — waits
 until a use needs it: single-pair counterfactuals, sensor noise as a controlled
@@ -102,7 +104,7 @@ have the sources):
   it, as `run_sitl.sh` and `fly_in_process.py` do.
 - **A spinner process forked after `run()` inherits its SIGTERM handler**, which
   only stops a loop: kill load generators with SIGKILL.
-- **Yaw read against the target carries EKF2's heading error**, 1–2° on the X8.
+- **Yaw read against the target carries EKF2's heading error**, 1–4° on the X8.
 
 `../phase2_probes/`, next to the PX4 checkout, is the unversioned probe the design
 came from; it keeps what was declined and strategy B's seeded sensors.
@@ -212,7 +214,7 @@ source ../.venv/bin/activate && make -C ../PX4-Autopilot px4_sitl_default
 python sim/run_x8.py
 
 # From the public repo, on simulated time, PX4 in a throw-away rootfs:
-X8="--model $HOME/DEV/kani_arm/model/mjcf/x8_arm.xml --rotors $HOME/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml --airframe 22002 --hover 0.2162"
+X8="--model $HOME/DEV/kani_arm/model/mjcf/x8_arm.xml --rotors $HOME/DEV/kani_arm/model/mjcf/x8_arm.conversion.yaml --airframe 22002 --hover 0.2455"
 python scripts/fly_in_process.py acceptance $X8
 python scripts/fly_in_process.py steps $X8 --out /tmp/steps.npz
 python scripts/fly_in_process.py arm-sweep $X8 --out /tmp/sweep_a.npz

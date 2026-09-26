@@ -444,12 +444,12 @@ later. It costs nothing now.
 
 - Blade rotational inertia and gyroscopic effects are not modelled. Fast yaw
   manoeuvres will be missing the precession torque. §2.5 supplies the ω this needs.
-- Coaxial aerodynamic interference is not modelled. The lower rotor sits in the
-  upper rotor's downwash and typically makes only 75–85 % of an isolated rotor's
-  thrust; the current model treats all 8 as identical. Auto-calibration still puts
-  total hover thrust at command 0.5, but the upper/lower asymmetry is lost. **The
-  per-rotor `c_t` array of §2.5 is the mechanism; the discount value is still
-  undecided (§7).**
+- Coaxial aerodynamic interference is modelled as a constant. The lower rotor
+  sits in the upper rotor's downwash and typically makes only 75–85 % of an
+  isolated rotor's thrust. A sidecar's per-rotor `ct_factor` scales the plant's
+  `c_t` (§8 has the value and why the airframe's `CA_ROTOR*_CT` does not follow
+  it). Not modelled: the upper rotor's own loss at small spacing, and any
+  dependence on the two rotors' speeds or on the freestream.
 
 ---
 
@@ -578,9 +578,11 @@ manufacturer's table, `c_t` at R² = 0.9997 with the worst point 0.9 % off full
 thrust. Thrust/weight is **3.79, measured**; the auto-calibration's 4.0 was a
 construction and is within 5 % by coincidence. `km` is **0.43× PX4's default**,
 so at `CA_ROTOR*_KM 0.05` the allocator would expect 2.3× the yaw torque these
-props make. `MPC_THR_HOVER` is 0.2162, against the quad's 0.2025. The sidecar's
-`ω_idle` is `ω_max / 11`, chosen to match the quad's operating point, and
-`MPC_THR_HOVER` moves with it: 0.171 to 0.264 across the plausible range.
+props make. `MPC_THR_HOVER` is 0.2455 with the lower deck at `ct_factor` 0.80
+(§8; 0.2162 on isolated rotors), against the quad's 0.2025, and thrust/weight as
+flown is 3.41. The sidecar's `ω_idle` is `ω_max / 11`, chosen to match the quad's
+operating point, and `MPC_THR_HOVER` moves with it: 0.200 to 0.293 across the
+plausible range.
 
 **Measuring the propeller discs corrected two inputs.** Each rotor's `radius` is
 the blade tip off the base mesh, where an earlier hand survey had used a smaller
@@ -626,7 +628,7 @@ km  per rotor              [m]           fitted from the torque column
                                     throttle, so armed idle is not in them.
                                     Bench-measure it rather than extrapolating
                                     the curve to zero, which overestimates badly
-lower-deck c_t discount    = still not modelled   (§5 suggests 0.75–0.85)
+lower-deck c_t discount    = CHOSEN, ct_factor 0.80 (§8); not measured
 ```
 
 `c_t` and `ω_max` must come from the same sheet: thrust is `c_t · ω²`, so only the
@@ -659,10 +661,19 @@ later and reworking nothing.
 
 ## 8. Open questions
 
-**The lower-deck `c_t` discount.** §2.5 provides the per-rotor array and the sidecar
-now carries per-rotor `c_t`, so the mechanism is in place and this is only a number
-to pick. Undecided, and currently **not applied**: the datasheet is for an isolated
-rotor, so all 8 carry the same value and the lower deck is modelled too strong.
+**~~The lower-deck `c_t` discount.~~ Chosen 2026-09-26: `ct_factor` 0.80 on the
+lower deck, not measured.** The middle of §5's 0.75–0.85, and nothing argues for
+either end: the X8's blade planes sit about 0.22 D apart, past the spacing where
+small-scale coaxial tests stop improving, and those tests put the lower rotor near
+0.81 of isolated at equal speed (with the upper near 0.90, which is not modelled).
+The factor is a per-rotor sidecar key, applied to the plant only; `c_t` stays the
+datasheet's isolated fit. **The airframe's `CA_ROTOR*_CT` keeps the isolated value
+on purpose**: PX4 splits collective thrust in proportion to `CT`, so a discounted
+lower deck there drives the upper deck harder and moves PX4's hover point off the
+derived `MPC_THR_HOVER` (0.2427 against 0.2455), while equal `CT` keeps the
+allocation even, which the hover and gain derivations assume
+(`px4/mujoco_x8.airframe.template`). A bench measurement of a coaxial pair would
+replace the number, not the mechanism. Flown at plan phase 5.
 
 **Whether end-effector pose joins the side channel.** An `ee` site plus end-effector
 pose in `ground_truth` makes visual servoing or impedance control on the ROS 2 side

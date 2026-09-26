@@ -1113,7 +1113,8 @@ def _check_thrust(
     mass = float(model.body_subtreemass[base_id])
     gravity = float(abs(model.opt.gravity[2]))
     weight = mass * gravity
-    c_t = np.array([float(r.c_t) for r in sidecar.rotors])
+    # The plant's c_t, after any interference ct_factor: that is what hovers.
+    c_t = np.array([float(r.plant_c_t) for r in sidecar.rotors])
     # omega_max is mandatory alongside c_t (RotorSpec enforces it).
     omega_max = np.array([float(r.omega_max) for r in sidecar.rotors])
     full = float(np.sum(c_t * omega_max ** 2))
@@ -1448,6 +1449,13 @@ def rotor_table(sidecar: Sidecar) -> str:
             f"{rotor.deck or '-':<6s}  {'CCW' if rotor.spin > 0 else 'CW':<4s}  "
             f"{rotor.km:<7.5f}  {c_t}  {omega_max:>5s}  {rotor.label}"
         )
+    factored = [i for i, r in enumerate(sidecar.rotors) if r.ct_factor != 1.0]
+    if factored:
+        factors = sorted({sidecar.rotors[i].ct_factor for i in factored})
+        lines.append(
+            f"  rotors {factored} fly c_t x {', '.join(f'{f:g}' for f in factors)} "
+            f"(ct_factor); CA_ROTOR*_CT keeps the isolated c_t above."
+        )
     spin = ", ".join(f"{r.spin:+d}" for r in sidecar.rotors)
     lines.append("")
     lines.append(f"  RotorModel(spin=({spin}))")
@@ -1697,7 +1705,8 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
         rotors.append(f"param set-default CA_ROTOR{i}_KM {r.spin * r.km:+.5f}")
         if r.c_t is not None and r.omega_max is not None:
             # CA_ROTOR*_CT is Thrust = CT * u^2, so it is the thrust at full
-            # command: c_t * omega_max^2, not c_t itself.
+            # command: c_t * omega_max^2, not c_t itself. The isolated c_t,
+            # never the plant's after ct_factor (the airframe template says why).
             rotors.append(
                 f"param set-default CA_ROTOR{i}_CT {r.c_t * r.omega_max ** 2:.4f}"
             )
