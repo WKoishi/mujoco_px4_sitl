@@ -126,7 +126,8 @@ t_sim=    5.00s ratio=1.001 frames=1251 act=1230 answered=1228 unproven=0 brake=
 
 **Once PX4 has answered, every frame waits for PX4's answer stamped with its
 time**, and the frame after it runs on that answer: IMU → actuator is exactly one
-frame (`IMPLEMENTATION_PLAN.md` §3.2). `answered` counts the frames whose answer
+frame, except for the one boot frame the first answer arrives in, which runs on
+it at the age it arrived (`IMPLEMENTATION_PLAN.md` §3.2). `answered` counts the frames whose answer
 arrived in time; `unproven` those PX4 did not answer within `--answer-timeout`
 (0.2 s of wall clock), each of which falls back to the loop below until PX4
 answers again. The two add up to every frame from PX4's first answer, so

@@ -443,16 +443,25 @@ Measured through the real loop in phase 7, "The PX4 legs".
   the first answer arrives already waits for its own: without that, a first answer
   that came a frame late left the next frame on a two-frame-old output (measured
   once, loaded).
-- **IMU → actuator is exactly one frame.** The frame `[t_k, t_{k+1})` is driven by
-  the newest answer stamped at or before `t_{k−1}`, which is the answer to
+- **IMU → actuator is exactly one frame from the frame after the first answer
+  arrives.** The frame `[t_k, t_{k+1})` is driven by the newest answer stamped at or before `t_{k−1}`, which is the answer to
   `t_{k−1}` whenever PX4 answered in time. The fallback applies the same rule
   rather than the pseudo-code's newest answer, so an answer never drives its own
   frame. One frame rather than zero: the fallback as it was gave one frame on
   64–90 % of frames, and the Phase 5 baselines and the derived attitude gains were
   flown on that.
-  One loaded X8 acceptance run broke this on one sample of 11432, with every
-  frame answered in time and no barrier timeout (2026-09-26, phase 5, "With the
-  coaxial `c_t` discount"); unexplained, and not seen on the rerun.
+  **The frame the first answer arrives in is the exception.** Its predecessor
+  was a fallback frame nothing waited on, so it runs on the first answer at the
+  age that answer arrived: when it comes two or more frames late, PX4 answers
+  none of the frames in between (one send per wake, above), and that one frame
+  runs two or three frames old. Measured twice under load, both in the boot and
+  disarmed (phase 5, "With the coaxial `c_t` discount"). **Accepted, reported
+  apart** (decided 2026-09-26): nothing can wait for a first answer no one
+  knows is coming, the frame falls in the boot before arming, and holding it at
+  the fallback's controls instead would hide its age rather than remove it.
+  `acceptance` shows it as "its arrival frame, lag" and counts one frame from
+  the next frame; a frame after a timeout is not exempted, since `unproven`
+  already fails it.
 - **A frame whose answer does not arrive within `answer_timeout_s` is unproven,
   counted, never fatal**, and the fallback runs until an answer arrives. Another
   frame's stamp never counts as this frame's answer; an older answer that arrives
@@ -1482,8 +1491,18 @@ separation fell from 2.2× to 2.0×.
 `fly_in_process.py acceptance` passed on the quad. On the X8 the first run failed
 one row: under load 16, IMU → actuator was one frame on 11431 of 11432 samples,
 with `unproven 0` and `barrier timeouts 0`. A rerun passed every row. The
-recording was overwritten, so which frame and which lag is unknown; `AGENTS.md`
-§2 carries it as a gap. Nothing in a thrust coefficient reaches the loop's timing.
+recording was overwritten, but the table places the miss: `acceptance` counts
+from the first sample carrying an answer, 11501 − 11432 = sample 69, and that
+sample carries the first answer, stamped 66, so it ran three frames old. Twenty
+more runs at load 16 and five at load 8 passed; at load 32 one of eight missed
+the same way, recorded: the first answer, stamped 82, arrived after `HIL_SENSOR`
+84 was sent, 83 was never answered (`act=11418 answered=11417`), frame 84 ran on
+82 (lag 2) and every frame from 85 on one frame; that load-32 set also had a
+first answer at frame 95. Both misses fell at PX4's first answer, disarmed, with
+`unproven 0` and `barrier timeouts 0`; §3.2 has the mechanism, and the frame is
+now reported apart from the check. Re-run after that change, `acceptance` passed
+on both vehicles, idle and at load 16, with the arrival frame at lag 1 in all
+four columns. Nothing in a thrust coefficient reaches the loop's timing.
 
 Phase 5, `fly_regression.py` against `run_sitl.sh`, then `hover_error.py` (163 s of
 settled hover): `ratio=1.000 unproven=0 brake=0 timeouts=0`, `Disarmed by landing`,

@@ -6,7 +6,9 @@ time.** The frame ``[t_k, t_k+1)`` is driven by PX4's answer to the
 ``HIL_SENSOR(t_k+1)`` is not sent before the answer stamped ``t_k`` has arrived.
 The stamp is PX4's clock when it sent the answer, which only our ``HIL_SENSOR``
 moves, so with no frame outstanding it proves which frame the answer was
-computed from (plan 3.2, "What an answer proves").
+computed from (plan 3.2, "What an answer proves"). The one exception is the
+frame the first answer arrives in: the fallback frame before it waited on
+nothing, so it runs on that answer at whatever age it arrived (plan 3.2).
 
 **Before PX4's first answer, and after a frame whose answer timed out, the
 bounded-lead loop runs**: wall clock paces it, and the actuator stream only

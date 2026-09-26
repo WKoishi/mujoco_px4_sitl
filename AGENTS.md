@@ -30,8 +30,8 @@ them when the platform changes.**
   would, and sending PX4 setpoints and commands the same way. Ground truth goes
   only to a recorder.
 - **Every leg to the vehicle has a chosen delay** since phase 2 of the topology
-  (2026-09-26): strict lockstep with IMU → actuator exactly one frame, estimates
-  at a chosen age, setpoints and commands behind a PING barrier before a chosen
+  (2026-09-26): strict lockstep with IMU → actuator exactly one frame (from the
+  frame after the first answer's), estimates at a chosen age, setpoints and commands behind a PING barrier before a chosen
   frame (plan §3.2, §3.9). Acceptance passed on the quad and the X8, idle and
   loaded; `scripts/fly_in_process.py acceptance` repeats it in under a minute.
 
@@ -53,7 +53,7 @@ them when the platform changes.**
 | IMU has no noise or bias | `sim.py` sends ideal accel/gyro; under MAVLink HIL the simulator owns IMU noise | EKF2's bias estimation is never exercised, and estimates look better than they will be. Add noise on the `HIL_SENSOR` path only (ground truth must stay clean), sized from the IMU's datasheet, then re-fly the step tests |
 | No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
 | Coaxial interference is a chosen constant | `ct_factor` 0.80 on the lower deck, unmeasured (`MODELING_CONVENTIONS.md` §8) | hover and plant gain rest on a chosen number; the upper deck's own loss and any speed dependence are not modelled. A bench test of a coaxial pair replaces the number |
-| IMU → actuator missed one frame once | one loaded X8 `acceptance` run, 11431/11432, every frame answered, no barrier timeout (plan phase 5) | the one-frame guarantee is not yet unconditional; the rerun passed and the recording was overwritten. Next step (§3) |
+| The frame PX4's first answer arrives in can run 2–3 frames old | strict lockstep starts on arrival (`loop.py`, plan §3.2) | one boot frame, disarmed, when that answer comes ≥ 2 frames late (about 1 run in 20 at load 16–32). Accepted: `acceptance` reports its lag apart and checks one frame from the next frame |
 | No uXRCE-DDS agent or `px4_msgs` here | PX4 starts `uxrce_dds_client` on UDP 8888; nothing answers | thrust/torque setpoints cannot be flown; their timing is open (plan §9) |
 
 Two authoring hazards nothing in `src/` catches: rotor sites that are not direct
@@ -65,11 +65,6 @@ next to the MJCF it generated.
 ---
 
 ## 3. Next steps
-
-1. **The one-frame IMU → actuator miss** (§2): repeat `fly_in_process.py
-   acceptance --loads 16` on the X8 with a separate `--out` per run until it
-   misses again, then locate the frame and its lag. A miss at PX4's first answer
-   would point at the fix plan §3.2 records.
 
 **Strategy B** — baro, mag and GPS synthesized by the simulator, seeded — waits
 until a use needs it: single-pair counterfactuals, sensor noise as a controlled
@@ -98,7 +93,8 @@ have the sources):
   `COM_OBC_LOSS_T` of PX4's clock raises "mission computer lost".
 - **An answer does not prove the frame's estimate**, and **the barrier looks
   unnecessary when idle**: both only show under load, so test loaded.
-- **PX4 starts answering 4–78 frames after it connects**; the fallback is needed.
+- **PX4 starts answering 4–95 frames after it connects** (95 at load 32); the fallback
+  is needed, and a late first answer drives its arrival frame stale (plan §3.2).
 - **`SET_ATTITUDE_TARGET` publishes its setpoint only in Offboard.**
 - **PX4 cannot exit once simulated time stops** (plan §7): stop it first, or kill
   it, as `run_sitl.sh` and `fly_in_process.py` do.

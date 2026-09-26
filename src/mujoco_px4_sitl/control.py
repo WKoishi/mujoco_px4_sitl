@@ -18,7 +18,8 @@ section 3 has why it sits here):
   uORB before PX4 processes the frame at ``t_k + setpoint_delay``, at least one
   frame, behind a barrier. Arming and mode changes too, so a run is armed at a
   simulated time.
-* **PX4's own IMU -> actuator response** is one frame, by the loop (:mod:`loop`).
+* **PX4's own IMU -> actuator response** is one frame, by the loop (:mod:`loop`),
+  except on the boot frame PX4's first answer arrives in.
 
 Those guarantees hold on frames PX4 answered in time. A sample on any other
 frame is marked unproven (:attr:`Observation.proven`), never silently.

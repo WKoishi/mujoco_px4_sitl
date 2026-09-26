@@ -141,7 +141,7 @@ class ScriptedServer:
         pending, self.queued = self.queued, []
         yield from pending
 
-    def wait(self, timeout: float):  # noqa: ARG002 - never reached in these tests
+    def wait(self, timeout: float):  # noqa: ARG002 - nothing arrives later than queued
         yield from self.drain()
 
 
@@ -324,6 +324,49 @@ def test_a_px4_answering_every_frame_drives_each_frame_with_the_previous_answer(
     assert len(strict) > 80
     assert all(a == k - 1 for k, a in strict), strict[:5]
     assert stats.px4_lag[1] >= len(strict)
+
+
+class LateFirstAnswer(ScriptedServer):
+    """PX4 as the loaded X8 run met it, without socket timing: silent through
+    frame 7; the answer to 6 is in as soon as HIL_SENSOR 8 has been sent,
+    together with 8's own, and 7 never gets one -- PX4 sends one message per
+    wake, the newest output (plan 3.2). Every frame from 9 on is answered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parser = mavlink.MAVLink(None)
+
+    def send(self, payload: bytes) -> bool:
+        for msg in self._parser.parse_buffer(payload) or []:
+            if msg.get_type() == "HIL_SENSOR":
+                frame = int(msg.time_usec) // 4000
+                self.queued += [self._answer(k) for k in
+                                ((6, 8) if frame == 8 else (frame,) if frame > 8 else ())]
+        return super().send(payload)
+
+    @staticmethod
+    def _answer(frame: int) -> mavlink.MAVLink_message:
+        controls = [frame * FakePX4.FRAME_CODE] + [0.5] * 3 + [0.0] * (hil.NUM_ACTUATOR_OUTPUTS - 4)
+        return mavlink.MAVLink_hil_actuator_controls_message(
+            time_usec=frame * 4000, controls=controls,
+            mode=hil.MODE_FLAG_CUSTOM | hil.MODE_FLAG_ARMED, flags=hil.FLAG_LOCKSTEP,
+        )
+
+
+def test_a_late_first_answer_drives_only_its_arrival_frame_stale():
+    """The frame a first answer arrives in runs on it at the age it arrived:
+    the fallback frame before it waited on nothing. It is the one exception;
+    from the frame after it, IMU -> actuator is one frame."""
+    cfg = make_config(max_sim_time=0.2)
+    physics = StepLog(cfg)
+    loop = LockstepLoop(cfg, physics, LateFirstAnswer(), None)
+    loop.run()
+    driven = [(k, a) for k, a in physics.driven if a >= 0]
+    assert loop.first_answer_frame == 8
+    assert driven[0] == (8, 6)
+    assert len(driven[1:]) > 30
+    assert all(a == k - 1 for k, a in driven[1:]), driven[:5]
+    assert loop.stats.unproven == 0 and loop.stats.answered == loop.stats.frames - 8
 
 
 def test_unpaced_runs_as_fast_as_px4_answers():

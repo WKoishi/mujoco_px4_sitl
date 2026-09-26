@@ -449,10 +449,14 @@ def timing(d) -> dict | None:
         return None
     first = answered[0]
     # A sample's actuators are the answer that drives its frame: one frame old
-    # when PX4 answered the previous frame in time.
+    # when PX4 answered the previous frame in time. The frame the first answer
+    # arrives in runs on it at whatever age it arrived, since nothing waited on
+    # the fallback frame before it (plan 3.2); it is reported apart, and the
+    # one-frame guarantee counts from the frame after it.
     lag = np.round((t - act_time * 1e-6) / dt).astype(int)[first:]
     out = dict(first_answer=int(act_time[first] // round(dt * 1e6)),
-               lags=Counter(lag.tolist()), samples=len(lag), proven_from=None)
+               arrival_lag=int(lag[0]), lags=Counter(lag[1:].tolist()),
+               samples=len(lag) - 1, proven_from=None)
     proven = d["proven"].astype(bool)
     if proven.any():
         p0 = np.flatnonzero(proven)[0]
@@ -482,8 +486,9 @@ def report(path) -> None:
     if tm is None:
         print("PX4 never answered")
         return
-    print(f"IMU -> actuator from PX4's first answer (frame {tm['first_answer']}): one frame "
-          f"on {tm['lags'][1]} of {tm['samples']} samples; lags {dict(tm['lags'])}")
+    print(f"PX4's first answer (frame {tm['first_answer']}) drove its arrival frame at lag "
+          f"{tm['arrival_lag']}; IMU -> actuator one frame after it on {tm['lags'][1]} of "
+          f"{tm['samples']} samples; lags {dict(tm['lags'])}")
     if tm["proven_from"] is not None:
         print(f"proven: {tm['proven']} of {tm['after']} samples from t={tm['proven_from']:.2f} s; "
               f"estimate age {dict(tm['ages'])} frames; late {tm['late_proven']} proven, "
@@ -616,8 +621,9 @@ def compare(a_path, b_path) -> None:
 def acceptance(args) -> int:
     """``legs`` at each load, then the checks of AGENTS.md section 3 in one table.
     The thresholds are the decided design: every frame answered after PX4's first
-    answer, IMU -> actuator one frame, a body-rate setpoint on its frame (lag 2:
-    the setpoint delay plus IMU -> actuator), no late estimate."""
+    answer, IMU -> actuator one frame from the frame after the one it arrives in,
+    a body-rate setpoint on its frame (lag 2: the setpoint delay plus IMU ->
+    actuator), no late estimate."""
     stem = Path(args.out).with_suffix("")
     loads = [int(x) for x in args.loads.split(",")]
     columns = []
@@ -636,6 +642,7 @@ def acceptance(args) -> int:
     tms = [c["timing"] for c in columns]
     cs = [c["counters"] for c in columns]
     row("PX4's first answer, frame", [str(tm["first_answer"]) for tm in tms])
+    row("its arrival frame, lag", [str(tm["arrival_lag"]) for tm in tms])
     row("frames unproven after it", [str(c.get("unproven")) for c in cs],
         [c.get("unproven") == 0 for c in cs])
     row("IMU -> actuator one frame", [f"{tm['lags'][1]}/{tm['samples']}" for tm in tms],
