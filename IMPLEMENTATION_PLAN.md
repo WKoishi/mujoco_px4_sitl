@@ -30,6 +30,8 @@ rest, and win inside their own scope:
 - A launch entry point usable from a shell script or from a ROS 2 launch file
   via `ExecuteProcess`.
 - A simulator-private side channel for arm commands and ground-truth state.
+- An optional research controller run in this process on simulated time, talking
+  to PX4 over its API link as a companion computer would (§3.9).
 
 **Out of scope**
 
@@ -75,14 +77,17 @@ moved to C++ behind the same socket boundary without protocol changes.
                                           ┌── HIL_ACTUATOR_CONTROLS ─┘
 ```
 
-Two independent transports, deliberately kept separate:
+Independent transports, deliberately kept separate:
 
 | Channel | Direction | Transport | Payload |
 |---|---|---|---|
 | PX4 HIL | bidirectional | TCP `:4560`, we listen | out: `HIL_SENSOR`, `HIL_STATE_QUATERNION`; in: `HIL_ACTUATOR_CONTROLS`, plus `HEARTBEAT` / `COMMAND_LONG` we discard (§3.1) |
-| Side channel | bidirectional | UDP (configurable port) | arm joint commands, arm state, full ground truth |
+| Side channel | bidirectional | UDP (configurable port) | in: arm joint commands; out: ground truth, arm command status and propeller clearance (no joint positions, `AGENTS.md` §2) |
+| PX4 API link | bidirectional | UDP 14540 + instance, only with an in-process controller | in: `ODOMETRY`; out: setpoints, commands, `PING` barriers (§3.9) |
 
 The side channel is our own schema. It is not MAVLink and PX4 never sees it.
+While an in-process controller runs it owns the arm, and the side channel refuses
+`arm_cmd`.
 
 ---
 
@@ -242,17 +247,18 @@ loop:
   frames_since_ack += 1
 
   drain the socket non-blocking
-  on each HIL_ACTUATOR_CONTROLS: latch controls, frames_since_ack = 0
+  on each HIL_ACTUATOR_CONTROLS: route it by stamp, frames_since_ack = 0
 
   if frames_since_ack >= MAX_LEAD_FRAMES:
       # brake: PX4's pipeline is behind, or silent. Wait, but never forever.
       block for a fresh HIL_ACTUATOR_CONTROLS with a WALL-CLOCK timeout
-      on arrival: latch controls, frames_since_ack = 0
+      on arrival: route it by stamp, frames_since_ack = 0
       on timeout:  log once per N, keep previous controls,
                    frames_since_ack = 0 and continue
                    # never fatal, never expressed in simulated time
 
-  apply the latched controls to MuJoCo   # last-known-good on a quiet frame
+  apply the newest answer stamped at or before the previous frame
+                                   # last-known-good on a quiet frame
 
   # pacer: independent of PX4, so it also governs the boot window above
   t_wall_next += imu_dt / speed_factor
@@ -268,7 +274,7 @@ a description; this is the property that must hold however they are factored:
 
 Write the invariant into the implementation, not just the step sequence. A step
 sequence does not survive refactoring: the reset above appears in two branches,
-and pulling the shared "latch controls" part into one helper is the obvious
+and pulling the shared "route it by stamp" part into one helper is the obvious
 tidy-up, at which point the reset can travel with only one of the two callers.
 That leaves a brake that fires every `MAX_LEAD_FRAMES` frames on a fixed cadence
 regardless of how promptly PX4 replies, which is §7's "brake is pacing the loop"
@@ -286,36 +292,25 @@ Why this shape rather than a startup/steady-state latch:
 - **The pacer works before PX4 exists.** During the boot window it is the *only*
   thing bounding us, and a latch that free-runs until the first actuator message
   leaves exactly that window unbounded (§3.2 above).
-- **The brake does not depend on a 1:1 actuator/sensor ratio.** As established
-  above, `HIL_ACTUATOR_CONTROLS` is not an acknowledgement, so "wait for a fresh
-  one every frame" degrades to one frame per timeout whenever the ratio slips.
-  With a hundreds-of-ms timeout on a 250 Hz loop that is a ~100× slowdown that
-  logs as "non-fatal" — a silent failure, and the worst kind. Allowing a few
-  outstanding frames decouples back-pressure from PX4's publish rate.
 - **Resetting `frames_since_ack` on timeout is deliberate.** It hands pacing back
   to the wall clock during a genuine PX4 silence (disarm, mode transition). We
   cannot outrun PX4 while real-time paced, so the FIFO-drop hazard does not apply
   there; the brake exists for when PX4 is *slow*, not when it is *quiet*.
 
-The second bullet's premise did not survive measurement: once PX4 has answered
-once, it answers every frame of a loop that waits for it, so the ratio never
-slips. That is what the strict regime below rests on. The first and third
-bullets still hold, and are why this loop stays as the fallback before PX4's
-first answer and after a timeout.
+Both are why this loop stays as the fallback before PX4's first answer and after
+a timeout. Once PX4 has answered, it answers every frame of a loop that waits for
+it, which is what the strict regime below rests on.
 
 `MAX_LEAD_FRAMES` and the timeout are both tunables, not contract. If physics is
 slower than real time (contact-rich manipulation), the `sleep` never fires and the
 bounded lead becomes the binding constraint, which is the correct degradation.
 
-**Measured values, and why a generous timeout is wrong.** An earlier revision of
-this plan said to set the timeout generously — hundreds of milliseconds — on the
-grounds that its only job is to break a deadlock. That reasoning is incorrect, and
-measuring it makes the mechanism plain. **While we are blocked in the brake, PX4's
-clock is frozen, because only our `HIL_SENSOR` advances it. So the brake can only
-ever be satisfied by an actuator message PX4 had already produced.** When that bet
-fails, the entire timeout is wall clock burned for nothing, and the ratio collapses
-exactly as §7 predicts. Measured with the phase-1 stub against a live PX4 (250 Hz,
-`speed_factor = 1.0`):
+**Measured values, and why the timeout must be short.** **While we are blocked in
+the brake, PX4's clock is frozen, because only our `HIL_SENSOR` advances it. So
+the brake can only ever be satisfied by an actuator message PX4 had already
+produced.** When that bet fails, the entire timeout is wall clock burned for
+nothing, and the ratio collapses exactly as §7 predicts. Measured with the
+phase-1 stub against a live PX4 (250 Hz, `speed_factor = 1.0`):
 
 | `MAX_LEAD_FRAMES` | brake timeout | sim/wall ratio |
 |---|---|---|
@@ -324,65 +319,35 @@ exactly as §7 predicts. Measured with the phase-1 stub against a live PX4 (250 
 | 32 | 50 ms | 1.000 |
 | 64 | 100 ms | 1.000 |
 
-**These four rows are observations and stand. The explanation below them was a
-hypothesis, and it was wrong — read the two apart.** The distinction is the point:
-everything in §3 up to here is either cited to a PX4 source line or measured, and a
-causal story about *why* a number came out that way is neither. Written in the same
-voice as the rest, it gets inherited as established fact, and then it decides where
-the next person looks.
+The lead sensitivity these rows show is the broken invariant's, not PX4's: with
+the invariant held, a PX4 answering every frame does not brake at *any* lead —
+measured `brake=0` at leads of 8, 32 and 64, and `brake=0 timeouts=0` against a
+live PX4. **A tunable that relieves a symptom shows interaction, not mechanism**;
+do not write a causal claim here without stating the observation that would
+refute it.
 
-> **Superseded hypothesis.** *"Two independent causes, both present in the first
-> row. The lead must be well above the actuator/sensor ratio's jitter — PX4
-> publishes at ~86 % of the IMU rate while disarmed and ~98 % once warm, and its
-> sender thread batches, so a lead of 8 brakes constantly."*
->
-> The rates are real as rates of messages *received* while the loop runs ahead;
-> PX4 itself computes an output for every frame (below, "What an answer proves").
-> The conclusion drawn from them was not: the table was
-> measured against an implementation that violated the invariant above, so the lead
-> sensitivity it shows is that defect, not PX4's jitter. With the invariant held, a
-> PX4 answering every frame does not brake at *any* lead — measured `brake=0` at
-> leads of 8, 32 and 64, and `brake=0 timeouts=0` against a live PX4.
->
-> This hypothesis survived because raising `MAX_LEAD_FRAMES` did improve the ratio,
-> which is consistent with it — and also consistent with the defect. **A tunable
-> that relieves a symptom shows interaction, not mechanism.** The check that would
-> have separated them is one line and costs nothing: does braking happen when PX4
-> answers every frame? Do not write a causal claim here without stating the
-> observation that would refute it.
+The timeout must be *short*, because a deadlock is diagnosed by *repeated* cheap
+timeouts, not by one expensive one. Nothing is lost by retrying, since the pacer
+absorbs the slack and the held setpoint is still correct.
 
-What still holds from that paragraph, on its own merits: the timeout must be
-*short*, because a deadlock is diagnosed by *repeated* cheap timeouts, not by one
-expensive one. Nothing is lost by retrying, since the pacer absorbs the slack and
-the held setpoint is still correct.
-
-**Defaults: `MAX_LEAD_FRAMES = 32`, brake timeout 50 ms.** The lead is now known to
-be more conservative than needed, since the sensitivity that motivated 32 was the
-defect; it is kept because a generous lead costs nothing and still bounds the
-FIFO-drop hazard. Re-measure the whole table after any change to the IMU rate or to
-PX4's publish behaviour; the ratio counter is what makes this visible, which is why
-§7 leads with it.
+**Defaults: `MAX_LEAD_FRAMES = 32`, brake timeout 50 ms.** The lead is more
+conservative than needed; it is kept because a generous lead costs nothing and
+still bounds the FIFO-drop hazard. Re-measure the whole table after any change to
+the IMU rate or to PX4's publish behaviour; the ratio counter is what makes this
+visible, which is why §7 checks it right after separating a hang from a
+divergence.
 
 Reusing the previous frame's controls on a quiet frame is correct: they are a held
 setpoint.
 
-**What jMAVSim actually does**, since it is the reference implementation and the
-detail is easy to misread: its main loop runs on a **wall-clock** fixed-rate
-executor, `scheduleAtFixedRate(this, 0, sleepInterval / speedFactor / checkFactor)`
-with `sleepInterval = 1e6 / 250` (`jMAVSim/src/me/drton/jmavsim/Simulator.java:114,390-391`).
-That timer is present in both phases. `gotHilActuatorControls` is a one-way latch
-set on the first actuator message and cleared only in `reset()`
-(`MAVLinkHILSystem.java:26,54,292`), and the
-`if (!hilSystem.gotHilActuatorControls()) advanceTime()` in `run()`
-(`Simulator.java:515-524`) removes the *need to wait* for an actuator message
-during startup — it does not remove the timer. So bootstrap is 250 Hz real-time
-paced, not free-running. In steady state time advances on actuator receipt inside
-`handleMessage()` (`MAVLinkHILSystem.java:73`), but physics and sending still
-happen on the timer tick, skipped via `needsToPause = (lastTimeRan == now)` when
-time has not moved. Neither phase is "free-run", and neither is "block until
-actuator": wall-clock pacing is the constant, and the actuator stream only gates
-whether time advances. The loop above keeps that constant and makes the gate a
-bounded lead instead of a per-frame wait.
+**What jMAVSim does**, since it is the reference implementation and the detail is
+easy to misread: its main loop runs on a **wall-clock** fixed-rate executor
+(`jMAVSim/src/me/drton/jmavsim/Simulator.java:114,390-391`) in both phases.
+`gotHilActuatorControls` is a one-way latch set on the first actuator message
+(`MAVLinkHILSystem.java:26,54,292`), and it removes the *need to wait* for an
+actuator message during startup (`Simulator.java:515-524`) — it does not remove
+the timer, so bootstrap is 250 Hz real-time paced, not free-running. The fallback
+keeps that constant, with a bounded lead as its gate.
 
 Beyond the two unsolicited startup messages in §3.1, there is no handshake and no
 `SYSTEM_TIME` exchange to implement.
@@ -435,7 +400,7 @@ which ran a loop that sends frame k+1 only once PX4's answer to frame k is in:
 
 #### Strict lockstep: the regime once PX4 answers
 
-Decided 2026-09-26 and built the same day (`loop.py`); `AGENTS.md` §3 has why.
+Decided 2026-09-26 on the facts just above, and built the same day (`loop.py`).
 Measured through the real loop in phase 7, "The PX4 legs".
 
 - **From PX4's first answer, frame k+1's `HIL_SENSOR` waits for the answer stamped
@@ -445,9 +410,9 @@ Measured through the real loop in phase 7, "The PX4 legs".
   once, loaded).
 - **IMU → actuator is exactly one frame from the frame after the first answer
   arrives.** The frame `[t_k, t_{k+1})` is driven by the newest answer stamped at or before `t_{k−1}`, which is the answer to
-  `t_{k−1}` whenever PX4 answered in time. The fallback applies the same rule
-  rather than the pseudo-code's newest answer, so an answer never drives its own
-  frame. One frame rather than zero: the fallback as it was gave one frame on
+  `t_{k−1}` whenever PX4 answered in time. The fallback applies the same rule, so
+  an answer never drives its own frame. One frame rather than zero: the fallback
+  as it was, on the newest answer, gave one frame on
   64–90 % of frames, and the Phase 5 baselines and the derived attitude gains were
   flown on that.
   **The frame the first answer arrives in is the exception.** Its predecessor
@@ -539,8 +504,8 @@ three modules — a configuration change. The mag field must agree with PX4's ow
 world magnetic model at the GPS position, or preflight checks object: evaluate
 `geo_magnetic_tables.hpp` with PX4's bilinear lookup
 (`geo_mag_declination.cpp:69-101`). The probe's sampling was mag 50 Hz, baro
-25 Hz, GPS 10 Hz, PX4's amplitudes by default, one seeded stream per sensor. The
-IMU noise gap (`AGENTS.md` §2) belongs in the same module when it lands. Phase 3
+25 Hz, GPS 10 Hz, PX4's amplitudes by default, one seeded stream per sensor. They
+would join `sensors.py`, which already carries the IMU errors. Phase 3
 and Phase 5 would then need re-flying, since their baselines were measured under
 strategy A.
 
@@ -584,9 +549,10 @@ against the exact value we sent needs a tolerance, not equality.
 (`sensors.py`, `--imu`; `AGENTS.md` §2). They go on `HIL_SENSOR` only:
 `HIL_STATE_QUATERNION` and the side channel stay ground truth.
 
-This bitmask is the migration seam toward strategy B: to take over one sensor
-later, set its bit and stop starting the corresponding `sensor_*_sim` module.
-Nothing else changes.
+This bitmask is the migration seam toward strategy B: to take over mag or baro,
+set its bit (a mag field that disagrees with PX4's world magnetic model fails
+preflight, §3.3) and stop starting the corresponding `sensor_*_sim` module. GPS
+has no bit; it needs `HIL_GPS` instead.
 
 ### 3.5 `HIL_ACTUATOR_CONTROLS` scaling
 
@@ -678,9 +644,11 @@ its local-tangent reference from the **first `HIL_STATE_QUATERNION` we send**:
 `_global_local_proj_ref.initReference(lat, lon, timestamp)` runs once, on first
 receipt, and `_global_local_alt0` is latched from the same message
 (`SimulatorMavlink.cpp:604-609`). So neither the airframe file nor the `.post`
-script can influence it; our config owns it outright. We should still accept
-`PX4_HOME_*`-shaped env vars for familiarity, but that is our convention, not
-PX4's. Match PX4's `MapProjection` maths so our local frame and PX4's agree.
+script can influence it; our config owns it outright. We accept
+`PX4_HOME_LAT` / `_LON` / `_ALT` as defaults for `--home-lat` / `--home-lon` /
+`--home-alt` for familiarity, but that is our convention, not PX4's.
+`frames.GeodeticProjection` matches PX4's `MapProjection` maths, so our local
+frame and PX4's agree.
 
 #### Verified attitude mapping
 
@@ -750,8 +718,13 @@ consequences for bring-up:
 
 ### 3.9 The API link under lockstep
 
-An in-process controller (`control.py`) talks to PX4 over its API/offboard MAVLink
-link: UDP 14540 + instance, onboard mode, 4 MB/s (`px4-rc.mavlink`). What it can
+The research controller runs in process (`control.py`) because the research needs
+data ages tested at a *chosen* value, counterfactuals under identical timing,
+stalls by design and batches faster than real time; out of process all four could
+only be measured. A slow controller costs nothing in correctness: under lockstep a
+stall only freezes PX4's clock. It talks to PX4 over its API/offboard MAVLink
+link: UDP 14540 + instance (14549 for every instance above 9), onboard mode,
+4 MB/s (`px4-rc.mavlink`). What it can
 rely on, read from source and measured with the Phase 2 probes (phase 7, "The PX4
 legs"):
 
@@ -831,8 +804,8 @@ legs"):
   returns at `t_k` is sent behind a barrier before the `HIL_SENSOR` of
   `t_k + d_sp`, `d_sp` ≥ 1 frame, so PX4 processes that frame with it. A body-rate
   setpoint is then used by that frame's rate loop exactly, and moves the rotors
-  one frame later (§3.2); an attitude setpoint one frame later again on most
-  frames (§3.2). Arming, mode and takeoff commands take the same path, so a run
+  one frame later (§3.2); an attitude setpoint one frame later again when idle,
+  and under load often in the same frame (§3.2, phase 7). Arming, mode and takeoff commands take the same path, so a run
   is armed at a simulated time; commander's 10 ms loop picks the frame, and two X8
   runs armed on the same one.
 - **The silencing request goes between two `PING`s.** PX4 sends a `COMMAND_ACK`
@@ -869,15 +842,18 @@ mujoco_px4_sitl/
 │                               parametrization, platform config
 ├── AGENTS.md                   handoff: current state, what is unimplemented,
 │                               next steps, which document wins
-├── README.md                   quickstart for users, kept short
-├── pyproject.toml              deps: mujoco>=3.13, numpy, pymavlink
+├── README.md                   user-facing usage: install, run, health check,
+│                               side channel, in-process controller, ROS 2
+├── pyproject.toml              deps pinned at phase 0: mujoco==3.13.0,
+│                               pymavlink==2.4.49, numpy>=2.0
 ├── src/mujoco_px4_sitl/
 │   ├── __init__.py
 │   ├── main.py                 CLI entry point (script-launchable), and
 │   │                           run() for an in-process caller
 │   ├── __main__.py             python -m mujoco_px4_sitl
-│   ├── config.py               dataclass config, CLI + file override
-│   ├── transport.py            TCP server, MAVLink framing, reconnect
+│   ├── config.py               dataclass config: defaults, env vars, CLI flags
+│   ├── transport.py            TCP server, MAVLink framing, back-pressure-safe
+│   │                           send
 │   ├── hil.py                  HIL_SENSOR / HIL_STATE_QUATERNION encode,
 │   │                           HIL_ACTUATOR_CONTROLS decode
 │   ├── frames.py               MuJoCo <-> PX4 frame + geodetic conversion
@@ -984,11 +960,14 @@ of `0` (`gz_bridge/parameters.c:41`), every branch of the `if` chain fails and t
 airframe file. Contents:
 
 - `. ${R}etc/init.d/rc.mc_defaults`
-- `CA_*` rotor geometry matching `models/quad_x.xml` exactly — same arm length,
+- `CA_AIRFRAME 0`, `CA_ROTOR_COUNT 4`, and `CA_ROTOR*` geometry matching
+  `models/quad_x.xml` exactly — same arm length,
   same rotor order, same spin directions. A mismatch here shows up as a slow
   yaw drift or a roll/pitch cross-coupling that is easy to misread as an EKF
   problem.
 - `PWM_MAIN_FUNC1..4 = 101..104`
+- `THR_MDL_FAC 1.0`, `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144` — one setting
+  in the allocator's `u²` domain, not three (`MODELING_CONVENTIONS.md` §2.6)
 - `param set-default SENS_EN_BAROSIM 1`, `SENS_EN_MAGSIM 1`, `SENS_EN_GPSSIM 1`
   (declarative only — see §3.3; the `.post` starts the modules unconditionally)
 - `IMU_INTEG_RATE` needs no entry: `px4-rc.simulator:5` already does
@@ -1050,8 +1029,7 @@ source .venv/bin/activate            # before every PX4 build
 make -C PX4-Autopilot px4_sitl_default
 ```
 
-Repeat this in `README.md`. It is the one environment fact that neither
-repository records.
+`README.md` repeats this.
 
 Verified present: venv Python 3.12.3 with `mujoco 3.13.0`, `numpy 2.5.3`,
 `pymavlink 2.4.49`, `pytest 9.1.1` and PX4's requirements (`kconfiglib 14.1.0`,
@@ -1074,7 +1052,7 @@ contract holds; booting `PX4_SYS_AUTOSTART=10016` stops at `Waiting for simulato
 to accept connection on TCP port 4560` and blocks there, which is §3.2's boot
 behaviour observed directly.
 
-Remaining:
+Then, all done:
 
 - `pyproject.toml` with pinned deps (`mujoco==3.13.0`, `pymavlink==2.4.49`).
 - Install the two PX4 files from §5: copy them and register both in
@@ -1117,9 +1095,12 @@ below are already expressed in PX4 frames.
   this loop's first frames (§3.2) — omitting it looks fine in phase 1 and leaves
   the boot window unbounded. The brake is what keeps us from outrunning PX4 in
   phase 5. Neither half is optional, and neither is a "steady state only" concern.
-- Log the first actuator message and assert `flags & 1` (lockstep) when it
-  arrives — but treat its absence during the first seconds as normal, not as an
-  error.
+  **Superseded in steady state**: once PX4 answers, strict lockstep bounds the
+  loop, and the pacer and brake remain the fallback's, before the first answer and
+  after an unproven frame (§3.2).
+- Log the first actuator message and check `flags & 1` (lockstep) when it
+  arrives, warning loudly if it is clear — but treat the message's absence during
+  the first seconds as normal, not as an error.
 - Assert IMU timestamp monotonicity in code.
 - Instrument the ratio of simulated time to wall-clock time and log it
   periodically. It should sit near `speed_factor`. A ratio that climbs without
@@ -1246,8 +1227,9 @@ any new work. The exit criterion recorded here stands as the quad baseline.
   to the `CA_ROTOR*` indices in the airframe file.
 - Calibrate so that hover sits near mid-stick: total thrust at command 0.5
   should be close to vehicle weight. **Superseded.** §2.5's idle offset has since
-  moved hover to command 0.450 and `MPC_THR_HOVER` to 0.45. The exit criterion
-  below still holds; the 0.5 figure does not.
+  moved hover to command 0.450, which is `MPC_THR_HOVER 0.2025` at
+  `THR_MDL_FAC 1` (`MODELING_CONVENTIONS.md` §2.6). The exit criterion below still
+  holds; the 0.5 figure does not.
 
 **Exit**: `tests/test_vehicle.py` confirms hover thrust equals weight within
 tolerance and that yaw torque sums to zero with all four rotors at equal
@@ -1418,9 +1400,10 @@ reaches zero within the first sample, and yaw acceleration tops out near
 vehicle can brake. Capping the rate removes it. Both yaw fixes were set at
 runtime only, to confirm the diagnosis.
 
-**The derived gains**, which `--emit-airframe` now writes (the airframe template
-has the rule). For this X8 they are `MC_ROLLRATE_K 1.00`, `MC_PITCHRATE_K 2.18`,
-`MC_YAWRATE_K 5.00` and `MC_YAWRATE_MAX 29.6`. Measured 2026-09-25 with the same
+**The derived gains**, which `--emit-airframe` writes (the airframe template
+has the rule). For this X8 on isolated rotors they were `MC_ROLLRATE_K 1.00`,
+`MC_PITCHRATE_K 2.18`, `MC_YAWRATE_K 5.00` and `MC_YAWRATE_MAX 29.6` (2.45 and
+29.8 since the coaxial `c_t` discount, below). Measured 2026-09-25 with the same
 step procedures:
 
 | step | X8, stock | X8, derived |
@@ -1718,8 +1701,8 @@ What is worth keeping from it:
   inside sagged until the capsule's axis crossed it. That one was reported at
   its start and its end, 7.3 s later, and nothing stopped it.
 - **Command age is measurable out of process, not reproducible.** `arm.cmd_age`
-  read 20 ms, one publish period, on every sample at 1×: wall-clock latency
-  (`AGENTS.md` §3).
+  read 20 ms, one publish period, on every sample at 1×: wall-clock latency. It
+  is one reason the research controller runs in process (§3.9).
 
 #### The in-process controller
 
@@ -1752,7 +1735,8 @@ What is worth keeping from it:
   (re-flown below). Across the two flights the sample instants and the drop pattern are identical, and the arm's
   joint trajectory is bit-identical until arming, which a wall-clocked GCS
   script timed differently. The median estimate age halved between the flights
-  under the same schedule: that is the leg wall clock decides (`AGENTS.md` §3).
+  under the same schedule: that is the leg wall clock decided before phase 2
+  (§3.9).
 - **Without the datum rebase the estimate reads 0.42 m / 0.99 m off**, horizontal
   and vertical: EKF2's origin against the simulator's home, the trap
   `scripts/hover_error.py` describes. `Truth.pos_ned_ekf` removes it.
@@ -1793,8 +1777,8 @@ from 40 s to 70 s, Land at 75 s. Both flights `unproven=0 brake=0 timeouts=0`,
 
 #### The PX4 legs (Phase 2 probes)
 
-**Measured 2026-09-26**, to decide phase 2 of the controller topology
-(`AGENTS.md` §3); the facts drawn from them are in §3.2, §3.3 and §3.9. A probe
+**Measured 2026-09-26**, to decide phase 2 of the controller topology; the facts
+drawn from them are in §3.2, §3.3 and §3.9. A probe
 outside this repository (local, unversioned) started a fresh PX4 per run in a
 throw-away rootfs, ran a lockstep loop built from this package's physics and HIL
 transport, owned PX4's API link, and flew a mission on simulated time: Offboard
@@ -1826,7 +1810,7 @@ fresh PX4 each:
 
 | Loop | Baro, mag, GPS | Pairs | First difference | Hover 22–30 s, max | Whole flight, max |
 |---|---|---|---|---|---|
-| bounded lead (today) | PX4's `sensor_*_sim` | 1 | the arming frame | 61 cm | 83 cm |
+| bounded lead (the loop then) | PX4's `sensor_*_sim` | 1 | the arming frame | 61 cm | 83 cm |
 | strict, and variants | PX4's `sensor_*_sim` | 10 | the arming frame | 0.9–101 cm | 1.4–124 cm |
 | bounded lead | simulator, seeded | 1 | the arming frame | 19 cm | 21 cm |
 | strict | simulator, seeded | 1 quad, 1 X8 | the arming frame | 3.6 cm, X8 0.9 cm | 3.6 cm, X8 2.1 cm |
@@ -1907,8 +1891,10 @@ inside `px4-rc.simulator` — the cause is the same but earlier: PX4's boot itse
 blocks on our first `HIL_SENSOR` (§3.2). A watchdog on *wall clock* should detect
 and report both automatically.
 
-**Second, check the sim-to-wall time ratio in both directions.** Two distinct loop
-faults, neither of which any frame check below will find:
+**Second, check the sim-to-wall time ratio in both directions.** It has a target
+only in a paced run and in the fallback: `speed_factor` is a ceiling, and an
+unpaced strict run sits wherever PX4's answers let it. Two distinct loop faults,
+neither of which any frame check below will find:
 
 - *Ratio grows without bound* — we outran PX4. Under lockstep PX4 cannot get ahead
   of us, but nothing stops us getting ahead of PX4 (§3.2), and when we do, IMU FIFO
@@ -1936,7 +1922,9 @@ And one fault of the strict regime, which the ratio does not show:
   crashing does this; a live PX4 did not, in any run measured. On the status line
   `answered` + `unproven` is every frame from the one PX4's first answer arrived
   in, and `brake` and `timeouts` count the fallback only: a couple during a loaded
-  boot are normal, but they stay flat once PX4 answers.
+  boot are normal, but they stay flat once PX4 answers. With a controller the line
+  carries a second `unproven=`, after `ctrl`: the controller's samples not yet
+  proven, which counts the boot and only has to stay flat after it.
 
 Fix the loop before reading further. Also note PX4's benign wall-clock
 `poll timeout` error (§3.1) is not evidence of either.
@@ -1948,10 +1936,11 @@ step asks a different question, which nothing else here asks: does the code do w
 exclude and each has a mechanical check:
 
 - **The lead counter is reset on every receive path**, drain and brake alike (§3.2's
-  invariant). Check: with a PX4 answering every frame, `brake` must be 0. If it
-  tracks `frames / MAX_LEAD_FRAMES`, one path is missing its reset — and note the
-  ratio still reads 1.000 at `speed_factor = 1.0`, so this counter is the only
-  witness.
+  invariant). Check: with a PX4 answering every frame, the fallback must not
+  brake. If `brake` tracks `frames / MAX_LEAD_FRAMES`, one path is missing its
+  reset — and note the ratio still reads 1.000 at `speed_factor = 1.0`. Once PX4
+  answers, strict lockstep never reaches the brake, so a flight shows this only in
+  the boot; `tests/test_loop.py` is the witness.
 - **The brake's timeout is wall clock**, and so is the strict wait's, never
   simulated time (§3.2). A timeout in simulated time never fires, which is the
   deadlock above.
@@ -2038,8 +2027,10 @@ deliberate benefit of strategy A.
   boundary in `hil.py` — and there, follow **PX4's actual decode**, not the
   `common.xml` prose, where the two disagree (§3.7). Document each such case
   inline.
-- One module owns each concern. Frame conversion happens only in `frames.py`;
-  if a rotation appears elsewhere, that is a bug.
+- One module owns each concern. Frame conversion in `src/` happens only in
+  `frames.py`; if a rotation appears elsewhere, that is a bug. The one exception
+  is outside `src/`: `urdf_to_mjcf.py` flips rotor positions to FRD for the
+  airframe and the attitude gains it writes.
 - Tests run headless and without PX4 where possible. Protocol and frame tests
   must not require a PX4 build.
 

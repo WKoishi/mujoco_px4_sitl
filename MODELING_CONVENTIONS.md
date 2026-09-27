@@ -18,9 +18,9 @@ requires:
 
 | Missing | Purpose | Code that depends on it |
 |---|---|---|
-| `<site>` | rotor thrust application points `rotor0..7`, IMU mount `imu` | [vehicle.py:73-83](src/mujoco_px4_sitl/vehicle.py#L73-L83) |
-| `<sensor>` | `imu_accel` / `imu_gyro` | [sim.py:70-73](src/mujoco_px4_sitl/sim.py#L70-L73) |
-| `freejoint` | the base's 6 DoF | [sim.py:76-88](src/mujoco_px4_sitl/sim.py#L76-L88) |
+| `<site>` | rotor thrust application points `rotor0..7`, IMU mount `imu` | [vehicle.py:118-129](src/mujoco_px4_sitl/vehicle.py#L118-L129) |
+| `<sensor>` | `imu_accel` / `imu_gyro` | [sim.py:74-77](src/mujoco_px4_sitl/sim.py#L74-L77) |
+| `freejoint` | the base's 6 DoF | [sim.py:78-92](src/mujoco_px4_sitl/sim.py#L78-L92) |
 
 One more: MuJoCo's URDF parser **welds the root link to the world**, so the
 `freejoint` has to be added by hand regardless.
@@ -37,11 +37,12 @@ the simulation.
 
 Thrust and reaction torque are computed in Python and written straight into
 `base_link`'s `xfrc_applied`
-([vehicle.py:147-166](src/mujoco_px4_sitl/vehicle.py#L147-L166)). The rules:
+([vehicle.py:272-290](src/mujoco_px4_sitl/vehicle.py#L272-L290)). The rules:
 
 - Site names `rotor0`, `rotor1`, … are scanned, and **the scan stops at the first
   index that is missing**. A gap (`rotor0,rotor1,rotor3`) is read as a 2-rotor
-  vehicle, with no error.
+  vehicle; only the `spin` length check below catches it, and not if `spin`
+  was written short as well.
 - `HIL_ACTUATOR_CONTROLS.controls[i]` drives `rotor{i}`; PX4 numbers from 0.
 - Thrust model `T_i = c_t_i · ω_i²`, with ω an explicit state and a first-order
   motor lag of `time_constant = 0.02 s` on the command. §2.5 is the
@@ -55,13 +56,13 @@ geometry belongs to `base_link` as fixed geoms.
 ### 2.2 Two ways to fail silently
 
 **Rotor sites must be direct children of `base_link`.**
-[vehicle.py:115-119](src/mujoco_px4_sitl/vehicle.py#L115-L119) subtracts
+[vehicle.py:167-173](src/mujoco_px4_sitl/vehicle.py#L167-L173) subtracts
 `base_link`'s `body_ipos` from `site_pos` directly, but `site_pos` is local to
 **whichever body owns the site**. A site on a child body raises no error, gets the
 wrong lever arm, and presents as attitude cross-coupling. **No test covers this.**
 
 **`spin` must have exactly one entry per rotor.** A mismatch is a hard error at
-[vehicle.py:130-136](src/mujoco_px4_sitl/vehicle.py#L130-L136) — it is not
+[vehicle.py:130-138](src/mujoco_px4_sitl/vehicle.py#L130-L138) — it is not
 truncated, because flying an X8 on the default 4-entry quad tuple would present
 as yaw drift. `spin` is geometry and cannot be inferred, so its length is what
 declares the expected rotor count; `build_physics` takes the `RotorModel` that
@@ -75,10 +76,12 @@ carries it.
 - **Unit-gear position servos on joints** (gain `kp`, bias `[0, -kp, -kv]`), or
   the load fails: a motor would take an angle as a torque, a geared servo would
   scale it. Torque and velocity interfaces are not simulated yet (`AGENTS.md` §2).
-- **Contiguous indices from 0.** An actuator past a gap is named in a load
+- **Contiguous indices from 0.** Actuators past a gap are counted in a load
   warning and never written.
 - **Its home in `qpos0`**: the servos hold the initial pose until the first
-  command.
+  command. The conversion validates the sidecar's `home` against each joint's
+  range but does not write it into the model yet, so a generated model starts
+  at the URDF's zero.
 
 Propeller clearance runs from the rotor sites' discs (§3.3) to the arm's
 collision capsules and spheres; other shapes on the arm are named in a load
@@ -89,7 +92,7 @@ the model (`README.md`).
 
 `c_t = None` calibrates from `body_subtreemass` so that full command gives
 `thrust_to_weight` (default 4.0), and **warns every time**
-([vehicle.py:186-210](src/mujoco_px4_sitl/vehicle.py#L186-L210)), with a second
+([vehicle.py:193-217](src/mujoco_px4_sitl/vehicle.py#L193-L217)), with a second
 warning if the result is more than 3× off `CT_PLACEHOLDER`. Upside: any arm mass
 still flies, and hover stays at the same command whatever the vehicle weighs — one
 `MPC_THR_HOVER` covers quad, X8 and arm. Downside: **the motors quietly get
@@ -102,10 +105,10 @@ measured `c_t` and the calibration is bypassed.
 
 ### 2.5 ω as an explicit state
 
-**Implemented.** `k_thrust` folded `C_T` and `ω_max²` into one scalar that could
-not be taken apart again. **Rotor speed is what every aerodynamic effect in §5
+The earlier `k_thrust · u²` model folded `C_T` and `ω_max²` into one scalar that
+could not be taken apart again. **Rotor speed is what every aerodynamic effect in §5
 needs** — advance ratio, flapping, coaxial interference and gyroscopic precession
-all take ω, not a normalized command. `RotorModel` is now:
+all take ω, not a normalized command. `RotorModel` is:
 
 ```
 ω_i   = clip(ω_idle + (ω_max_i − ω_idle) · u_i,  ω_min_i, ω_max_i)
@@ -145,12 +148,6 @@ point. With `ω_idle / ω_max = 1/11` and full-command thrust-to-weight at 4.0:
 | Hover command | 0.500 | **0.450** |
 | Thrust at zero command | 0 | 3.3 % of weight |
 
-(An earlier version of this table compared local gains against a linear plant of
-the same full-command thrust, giving 4.000 against 3.636 — "0.909×". The figure is
-arithmetically right but answers nothing useful: the reference is full scale, not
-any model PX4 holds, and it invited being read as a closed-loop regression. §2.6
-has the comparison that matters.)
-
 Note this is mass-independent: the hover command depends only on `ω_idle / ω_max`
 and `thrust_to_weight`, so 0.450 covers the quad, the X8 and any arm mass on top —
 which is what makes a single `MPC_THR_HOVER` viable at all. Verified in
@@ -162,17 +159,14 @@ the allocator's domain, which section 2.6 shows is `u^2`. Measured from a ulog:
 `actuator_motors` sits at `MPC_THR_HOVER` in hover, 1:1, which is what fixes the
 relationship.
 
-`THR_MDL_FAC` is **1**, and section 2.6 owns that argument in full. Superseded
-here: earlier versions of this section argued for leaving it at 0, on the grounds
-that the plant and PX4's linear allocator shared a slope at mid-stick and the idle
-offset only spoiled that by 0.909x. Both the framing and the conclusion were
-wrong. `fac` is not a tuning knob for slope agreement -- it is what makes the
-mixer consistent with `CA_ROTOR*_CT`'s own definition, and at 0 the attitude loop
-runs at exactly twice its design gain.
+`THR_MDL_FAC` is **1**, and section 2.6 owns that argument in full. `fac` is not
+a tuning knob for slope agreement -- it is what makes the mixer consistent with
+`CA_ROTOR*_CT`'s own definition, and at 0 the attitude loop runs at exactly twice
+its design gain.
 
 ### 2.6 `THR_MDL_FAC` must be 1, and why
 
-**Fixed.** `px4/22001_mujoco_quad` sets `THR_MDL_FAC 1.0`,
+`px4/22001_mujoco_quad` sets `THR_MDL_FAC 1.0`,
 `MPC_THR_HOVER 0.2025`, `MPC_THR_MIN 0.0144`. These are one setting; changing any
 one alone leaves the vehicle flyable but mistuned.
 
@@ -215,14 +209,12 @@ default 0.12 clamps the command at `sqrt(0.12) = 0.346` — 0.66 of vehicle weig
 and the vehicle cannot descend. `0.12² = 0.0144` restores the same command floor
 and with it the identical physical range, T/W 0.160 to 4.000.
 
-**There is no cross-axis leak, at either setting.** An earlier draft of this
-section claimed a commanded pure yaw leaks roll and pitch. It does not: the
-quadratic term a command-domain split adds is identical at all four `(x, y)`
-positions, so it cancels by symmetry. That draft generalized from a test that
-drove a *single* coaxial pair, which is asymmetric by construction and not what
-the allocator emits. The error was only ever a gain scale.
-`test_no_cross_axis_leak_at_either_fac` pins this down so the wrong version does
-not come back.
+**There is no cross-axis leak, at either setting.** A commanded pure yaw does
+not leak roll or pitch: the quadratic term a command-domain split adds is
+identical at all four `(x, y)` positions, so it cancels by symmetry. A test that
+drives a *single* coaxial pair suggests otherwise, but that input is asymmetric by
+construction and not what the allocator emits. The error is only ever a gain
+scale, and `test_no_cross_axis_leak_at_either_fac` pins that down.
 
 Measured on the plant rather than in flight, deliberately: a 5 m square is far
 too gentle to excite the attitude loop enough to see a 2× gain in a ulog. Fitting
@@ -271,7 +263,7 @@ CAD mesh; collision uses hand-written primitives.
 | rotor sites | `rotor0` … `rotor7` | yes (prefix + 0-based, contiguous) |
 | IMU site | `imu`, `quat="1 0 0 0"` | yes |
 | IMU sensors | `imu_accel` / `imu_gyro` | yes |
-| arm joints | `arm_joint0` … | no |
+| arm joints | `arm_joint0` … | by the conversion only (prefix + index sets the `arm_act` order); `src/` does not read it |
 | arm links | `arm_link0` … | no |
 | arm actuators | `arm_act0` … | yes (prefix + 0-based, contiguous; `arm_cmd` indexes them) |
 
@@ -287,9 +279,10 @@ not checked, and a model with an arm and no discs says so at load.
 - All **`revolute`**, never `continuous` (a position actuator needs `ctrlrange`).
 - Decide each joint's angle limits in SolidWorks.
 - Ordered from the base outward.
-- In MJCF they become `<position kp=… ctrlrange=…>`. Joints need `damping` and
-  `armature` (gearbox friction and reflected inertia) — that is what keeps a stiff
-  position actuator numerically stable.
+- In MJCF they become `<general>` actuators written out as the PD that
+  `<position kp=… kv=…>` expands to, with `ctrlrange` equal to the joint range.
+  Joints need `damping` and `armature` (gearbox friction and reflected inertia) —
+  that is what keeps a stiff position actuator numerically stable.
 - Side-channel semantics: `arm_cmd.values[i]` is `arm_joint{i}`'s **absolute angle
   in radians**.
 
@@ -301,11 +294,11 @@ not checked, and a model with an arm and no discs says so at load.
 - Confirm the exported STL is in metres. CAD commonly exports millimetres, which
   needs `meshscale="0.001"`.
 - SolidWorks STL exports run to hundreds of thousands of faces. Decimate them.
-- Layout `models/<name>/` plus `meshes/`, with `<compiler meshdir="meshes">`.
-  MuJoCo does not understand `package://` URIs; the conversion script rewrites
-  them.
+- The conversion writes the decimated meshes to the MJCF's directory plus the
+  sidecar's `mesh_dir` (default `meshes/`), with `<compiler meshdir=…>`. MuJoCo
+  does not understand `package://` URIs; the conversion script rewrites them.
 - `timestep` in the XML is overridden by `--physics-rate`
-  ([sim.py:63](src/mujoco_px4_sitl/sim.py#L63)). Setting it has no effect.
+  ([sim.py:67](src/mujoco_px4_sitl/sim.py#L67)). Setting it has no effect.
 
 ---
 
@@ -345,18 +338,17 @@ blade plane.
 and lower rotors differentially produces pure yaw torque with no roll or pitch. An
 X8 has far more yaw authority than a quad of the same size.
 
-### PX4 airframe changes
+### PX4 airframe
 
-[px4/22001_mujoco_quad](px4/22001_mujoco_quad): set `CA_ROTOR_COUNT` to 8, fill in
-all 8 `CA_ROTOR*` blocks, `PWM_MAIN_FUNC1..8 = 101..108`, add `MAV_TYPE 14`, and
-change the filename and `@type` to `Octorotor Coaxial`.
-
-`urdf_to_mjcf.py --emit-airframe` now generates all of this from
-[px4/mujoco_x8.airframe.template](px4/mujoco_x8.airframe.template), and adds
-what the quad's file never needed: attitude gains derived from the model's
-inertia. PX4's rate gains act on a normalized torque, so stock values do not
-transfer to a vehicle with far less authority per unit inertia; the template
-says how they are derived.
+`urdf_to_mjcf.py --emit-airframe` fills
+[px4/mujoco_x8.airframe.template](px4/mujoco_x8.airframe.template) from the
+sidecar: `CA_ROTOR_COUNT` and every rotor's `CA_ROTOR*_PX` / `_PY` / `_KM` / `_CT`,
+`PWM_MAIN_FUNC1..N = 101..`, `MPC_THR_HOVER`, and what the quad's file never
+needed: attitude gains derived from the model's inertia. PX4's rate gains act on a
+normalized torque, so stock values do not transfer to a vehicle with far less
+authority per unit inertia; the template says how they are derived. It sets no
+`MAV_TYPE`, so the vehicle reports `rc.mc_defaults`' quadrotor (2) where PX4's
+`12001_octo_cox` sets 14.
 
 No MAVLink-side change: `HIL_ACTUATOR_CONTROLS` carries 16 channels
 ([hil.py:32](src/mujoco_px4_sitl/hil.py#L32)), and `effective(count)` takes the
@@ -384,12 +376,12 @@ thrust. That is bluff-body drag, not blade lift. So even as separate links, the
 thrust still has to be computed analytically, and the extra degrees of freedom are
 pure overhead.
 
-**The timestep cost settles it.** `quad_x.xml` measures 74k steps/s
-(13.5 µs/step), so a 250 Hz IMU frame has a 296-step budget at real time.
-Resolving a 5700 RPM blade to 5°/step needs roughly **36 kHz** — 36× the current
-1 kHz, which consumes the entire real-time margin single-threaded, before the arm's
-contact solve and 8 hinges. Under lockstep that is not "somewhat slower": it is the
-ratio collapsing to 0.03 and PX4's clock stalling.
+**The timestep cost adds to it.** `quad_x.xml` measures 74k steps/s
+(13.5 µs/step), so a 250 Hz IMU frame has a 296-step budget at real time. A
+5700 RPM blade turns 34 200 °/s: resolving it to 5°/step needs about **7 kHz**,
+and to 1°/step about **34 kHz**, 34× the current 1 kHz and half the measured
+single-threaded throughput, before the arm's contact solve and 8 hinges. All of it
+buys nothing, since the thrust has to be computed analytically anyway.
 
 ### What aerodynamics actually needs: rotor-disc inflow
 
@@ -435,10 +427,10 @@ c_t per rotor   [N/(rad/s)²]  ← thrust coefficient, from the measured thrust 
 ω_idle          [rad/s]       ← armed-but-idle speed
 ```
 
-A free option worth taking: **write an explicit `zaxis` on each `rotor*` site**.
-The code currently hardcodes thrust along body +z and ignores site orientation, but
-with `zaxis` in place, supporting tilt-rotors or a tilted disc is a few lines
-later. It costs nothing now.
+The conversion writes an **explicit `zaxis` on each `rotor*` site** (the
+sidecar's `zaxis`, default +z). `vehicle.py` still applies thrust along body +z
+and ignores site orientation, but with `zaxis` in place, supporting tilt-rotors or
+a tilted disc is a few lines.
 
 ### Known fidelity gaps (recorded deliberately, not oversights)
 
@@ -504,14 +496,21 @@ The script uses MuJoCo 3.13's `MjSpec` to inject programmatically, then self-che
 and prints:
 
 - `freejoint` exists and is `base_link`'s first joint
-- `rotor*` sites are on `base_link`, contiguously numbered, count matching `spin`
-- `imu_accel` / `imu_gyro` exist and are 3-axis
+- `rotor*` sites are on `base_link`, contiguously numbered, count matching `spin`;
+  coaxial pairs spin opposite ways
+- the `imu` site is identity-oriented; `imu_accel` / `imu_gyro` exist and are
+  3-axis
 - CAD meshes survived, and the vehicle has colliding geometry and a floor
-- arm joints are limited, with non-zero `damping` / `armature`
+- arm joints are limited (non-zero `damping` / `armature` only warns)
+- every rotor has a propeller disc or none does, discs in one plane do not
+  overlap, and the arm's clearance to them is surveyed over its envelope (§7)
+- thrust/weight, hover command and `MPC_THR_HOVER`
 - total mass / CoM / inertia matrix, to cross-check against SolidWorks
 
-`--check-only` runs all of it without writing. A failed check is a non-zero exit
-and no MJCF, so a bad conversion cannot be flown by accident.
+`--check-only` runs all of it without writing the MJCF or the airframe; the
+decimated meshes are still staged into the mesh directory, since compiling needs
+them. A failed check is a non-zero exit and no MJCF, so a bad conversion cannot be
+flown by accident.
 
 FLU orientation cannot be checked automatically — that rests on §3.1 and a manual
 review.
@@ -584,12 +583,10 @@ flown is 3.41. The sidecar's `ω_idle` is `ω_max / 11`, chosen to match the qua
 operating point, and `MPC_THR_HOVER` moves with it: 0.200 to 0.293 across the
 plausible range.
 
-**Measuring the propeller discs corrected two inputs.** Each rotor's `radius` is
-the blade tip off the base mesh, where an earlier hand survey had used a smaller
-radius of no recorded origin; and the rotor sites now sit on the blade planes,
-which the upper deck's did not (z carries no torque and no `PZ`, but it places
-the disc). The airframe regenerated byte-identical, and the conversion's
-self-check now reruns the envelope survey with the simulator's own check.
+**The propeller discs are measured off the base mesh**: each rotor's `radius` is
+the blade tip, and the rotor sites sit on the blade planes (z carries no torque
+and no `PZ`, but it places the disc). The conversion's self-check reruns the
+envelope survey with the simulator's own check.
 
 **The arm's envelope and the discs intersect inside the mechanical limits**: a
 small fraction of the poses the mechanism permits put a collision capsule inside
@@ -605,8 +602,7 @@ Still needed from CAD:
 rotor i spin               = CCW / CW   ×8   confirm against §4's order and ESC wiring
 per-joint zero and sign convention           arm_cmd is an absolute angle
 per-joint gear ratio + stall torque → forcerange and armature
-rotor radius / blade count / I_prop
-end-effector reference point = optional, see §8
+blade count / I_prop
 ```
 
 Hub positions, deck spacing and prop radius were **measured off the exported
@@ -652,16 +648,17 @@ computes it through the same `Vehicle` the simulator builds, which is the only w
 to be sure the airframe's value and the plant's hover point are the same number.
 
 `vehicle.py`'s `OMEGA_MAX_PLACEHOLDER` / `OMEGA_IDLE_PLACEHOLDER` /
-`CT_PLACEHOLDER` remain the fallback for any model that supplies none of this, and
-still warn on every load (§2.4). A new platform whose motors are not yet chosen can
+`CT_PLACEHOLDER` remain the fallback for any model that supplies none of this. The
+auto-calibrated `c_t` warns on every load (§2.4); a missing `omega_idle` falls back
+without a warning. A new platform whose motors are not yet chosen can
 therefore be modelled and flown before they are, with the real numbers landing
 later and reworking nothing.
 
 ---
 
-## 8. Open questions
+## 8. Decisions and open questions
 
-**~~The lower-deck `c_t` discount.~~ Chosen 2026-09-26: `ct_factor` 0.80 on the
+**The lower-deck `c_t` discount: chosen 2026-09-26, `ct_factor` 0.80 on the
 lower deck, not measured.** The middle of §5's 0.75–0.85, and nothing argues for
 either end: the X8's blade planes sit about 0.22 D apart, past the spacing where
 small-scale coaxial tests stop improving, and those tests put the lower rotor near
@@ -679,9 +676,9 @@ replace the number, not the mechanism. Flown at plan phase 5.
 pose in `ground_truth` makes visual servoing or impedance control on the ROS 2 side
 much easier. The site itself now exists in the model (the sidecar places it), so
 only the schema side is open — and later it costs a version bump
-(`SCHEMA_VERSION`, [sidechannel.py:28](src/mujoco_px4_sitl/sidechannel.py#L28)).
+(`SCHEMA_VERSION`, [sidechannel.py:34](src/mujoco_px4_sitl/sidechannel.py#L34)).
 
-**~~How the sidecar's rotor parameters reach `RotorModel`.~~ Decided: `--rotors`.**
+**How the sidecar's rotor parameters reach `RotorModel`: decided, `--rotors`.**
 The simulator reads the sidecar's `rotors` block at startup, via `--rotors` or
 `MUJOCO_SITL_ROTORS` (§6). The alternative was emitting them into the MJCF as
 `<custom><numeric>`, which would keep `src/` free of a YAML dependency and could
@@ -693,14 +690,11 @@ run that does not use the flag. Left open by this choice: nothing binds a sideca
 to the MJCF it generated, so a mismatched pair with the same rotor count loads and
 flies with the wrong thrust (`AGENTS.md` §2).
 
-**Whether the arm needs a control rate distinct from the physics rate.** Listed as
-open in Phase 7 of `IMPLEMENTATION_PLAN.md`.
-
 ---
 
 ## 9. Current state and next steps
 
 See `AGENTS.md`. It owns the state of the work, the list of what is unimplemented,
-and the ordered next steps — several of which are the code changes §2.5 calls for.
-Keeping them in one place avoids two task lists drifting apart.
+and the ordered next steps. Keeping them in one place avoids two task lists
+drifting apart.
 

@@ -51,13 +51,13 @@ them when the platform changes.**
 | Arm joint state reaches only an in-process controller | `ground_truth.arm` has no `qpos` | an out-of-process consumer sees no joints; add it to the side channel when a monitoring consumer needs it |
 | Arm encoders are ideal | `JointReading` | no quantisation, noise or latency; model them once the servo is chosen |
 | Arm has position servos only | one position actuator per joint; `arm.py` refuses others and `mode: "torque"` | no torque or velocity interface. The servo gains are provisional, and their droop decides intrusions as well as tracking |
-| Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set at boot; PX4's attitude/rate thread race (plan §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs. An attitude setpoint is one frame later than a body-rate one on most frames, the same frame on 0–98 %, by load. Accepted; `EKF2_PREDICT_US 4000` would remove the first, not tried |
+| Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set at boot; PX4's attitude/rate thread race (plan §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs. An attitude setpoint is one frame later than a body-rate one when idle, and the same frame on up to 98 % under load. Accepted; `EKF2_PREDICT_US 4000` would remove the first, not tried |
 | Two runs of one schedule drift apart | PX4's `sensor_*_sim` share one `rand()` whose position boot decides (plan §3.3) | identical until arming, then up to about a metre apart (0.34 m for the strict X8 pair). Compare over repeated runs. Seeded simulator-side sensors (strategy B, §3) brought a pair to 2–4 cm |
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the home-pose inertia | the gains do not follow an arm that moves in flight |
 | IMU errors are one datasheet's, and partial | `sensors.py`: ICM-42688-P noise, turn-on bias, chosen drift, on `HIL_SENSOR` only (plan phase 5, "With IMU errors") | the vehicle's flight controller is not chosen, and its IMU is assumed. No vibration, scale factor, misalignment or temperature: a flying multirotor's IMU reads mostly vibration, so estimates still look better than they will be. The drift is not from the datasheet |
 | No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
 | Coaxial interference is a chosen constant | `ct_factor` 0.80 on the lower deck, unmeasured (`MODELING_CONVENTIONS.md` §8) | hover and plant gain rest on a chosen number; the upper deck's own loss and any speed dependence are not modelled. A bench test of a coaxial pair replaces the number |
-| The frame PX4's first answer arrives in can run 2–3 frames old | strict lockstep starts on arrival (`loop.py`, plan §3.2) | one boot frame, disarmed, when that answer comes ≥ 2 frames late (about 1 run in 20 at load 16–32). Accepted: `acceptance` reports its lag apart and checks one frame from the next frame |
+| The frame PX4's first answer arrives in can run 2–3 frames old | strict lockstep starts on arrival (`loop.py`, plan §3.2) | one boot frame, disarmed, when that answer comes ≥ 2 frames late (about 1 run in 20 at load 16, 1 in 8 at load 32). Accepted: `acceptance` reports its lag apart and checks one frame from the next frame |
 | No uXRCE-DDS agent or `px4_msgs` here | PX4 starts `uxrce_dds_client` on UDP 8888; nothing answers | thrust/torque setpoints cannot be flown; their timing is open (plan §9) |
 
 Two authoring hazards nothing in `src/` catches: rotor sites that are not direct
@@ -76,16 +76,9 @@ controlled variable. Plan §3.3 has the evidence and what it takes; `sensors.py`
 is where it goes.
 **Aerodynamics** come after that, deliberately.
 
-**The controller topology is decided and built.** In process, because the
-research needs data ages tested at a *chosen* value, counterfactuals under
-identical timing, stalls by design and batches faster than real time; out of
-process all four could only be measured. The earlier reason for out of process,
-"a slow solver cannot stall lockstep", was wrong: under lockstep a stall only
-freezes PX4's clock. Phase 2's decisions, all built: strict lockstep as the only
-regime; IMU → actuator one frame; estimates fetched after each answer at an age
-of at least one frame, no `/proc`, no age 0; setpoints and commands behind a PING
-barrier at least one frame ahead; strategy B later; EKF2's cadence phase left
-unchosen. `sim/run_x8.py` in the private repo exposes the two PX4 delays.
+**The controller topology is decided and built** (plan §3.9 has why in process,
+§3.2 and §3.9 the legs). `sim/run_x8.py` in the private repo exposes the two PX4
+delays.
 
 Traps worth knowing before touching the loop or the API link (plan §3.2, §3.9
 have the sources):
@@ -98,8 +91,9 @@ have the sources):
   `COM_OBC_LOSS_T` of PX4's clock raises "mission computer lost".
 - **An answer does not prove the frame's estimate**, and **the barrier looks
   unnecessary when idle**: both only show under load, so test loaded.
-- **PX4 starts answering 4–95 frames after it connects** (95 at load 32); the fallback
-  is needed, and a late first answer drives its arrival frame stale (plan §3.2).
+- **PX4 starts answering 4–95 frames after it connects** (95 at load 32, plan
+  phase 5); the fallback is needed, and a late first answer drives its arrival
+  frame stale (plan §3.2).
 - **`SET_ATTITUDE_TARGET` publishes its setpoint only in Offboard.**
 - **PX4 cannot exit once simulated time stops** (plan §7): stop it first, or kill
   it, as `run_sitl.sh` and `fly_in_process.py` do.
@@ -127,9 +121,10 @@ its mechanical limits. Intrusion is **reported, never blocked**, decided
 2026-09-25: blocking belongs to the real vehicle's arm driver or companion
 computer.
 
-`vehicle.py`'s placeholder motors still warn on every load; that is now only the
-quad. **The X8 loads with no warning**, and that silence is the check that the
-sidecar's values reached `RotorModel`.
+`vehicle.py`'s auto-calibrated `c_t` still warns on every load; that is now only
+the quad. **The X8 loads with no warning**, and that silence is the check that the
+sidecar's `c_t` reached `RotorModel`. It does not cover `omega_idle`: a sidecar
+without one falls back to the placeholder silently.
 
 ---
 
@@ -166,9 +161,12 @@ files: edit the template, regenerate, never hand-edit a product.
 - **`source ../.venv/bin/activate` before any PX4 build**; PX4's cmake resolves its
   interpreter via `PATH`.
 - **No `rclpy` / `ament` / `ros` imports in `src/`.**
-- **Frame conversions live only in `frames.py`.**
-- **Status line**: `unproven` stays 0, `brake` and `timeouts` flat after the boot;
-  `ratio` alone proves nothing. Plan §7 diagnoses each.
+- **Frame conversions in `src/` live only in `frames.py`** (plan §8 has the one
+  exception outside it).
+- **Status line**: the loop's `unproven` (the first one) stays 0, `brake` and
+  `timeouts` flat after the boot; the controller's `unproven=`, after `ctrl`,
+  counts the boot and stays flat after it. `ratio` alone proves nothing. Plan §7
+  diagnoses each.
 - **Commit messages: short.** A title and a few lines saying what changed and where
   the numbers are; the documents own derivations. Worth a sentence in the commit
   and nowhere else: what an earlier version of the reasoning got wrong.
@@ -181,8 +179,8 @@ Past sessions reached 400–500K tokens of context. Most of it was not testing b
 reading, rewriting and raw output. So:
 
 - **Read by section, not by file.** `grep -n '^#' IMPLEMENTATION_PLAN.md`, then
-  read the section that owns the question (§5). The plan is 1800 lines; nothing
-  needs all of it.
+  read the section that owns the question (§5). The plan is over 2000 lines;
+  nothing needs all of it.
 - **Delegate lookups that return a conclusion.** PX4 source spelunking ("which
   paths end in `configure_stream_threadsafe()`?") and wide searches go to a
   subagent that reports file:line and the answer, not the files.
