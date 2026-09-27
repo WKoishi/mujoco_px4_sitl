@@ -9,7 +9,7 @@ recorded with ground truth to an ``.npz``, and a report is printed.
 
 Profiles:
 
-``legs``       Phase 2's acceptance (``AGENTS.md`` section 3), and the probe's
+``legs``       Phase 2's acceptance (``IMPLEMENTATION_PLAN.md`` 3.2), and the probe's
                mission (``IMPLEMENTATION_PLAN.md`` phase 7, "The PX4 legs"):
                Offboard hold at 3 m, armed at 20 s; a 3 s body-rate window at
                30 s with a host attitude loop on the estimate, and a 3 s attitude
@@ -32,7 +32,7 @@ Profiles:
     python scripts/fly_in_process.py legs --out /tmp/quad.npz
     python scripts/fly_in_process.py legs --load 16 --out /tmp/quad_load.npz
     python scripts/fly_in_process.py legs --model x8.xml --rotors x8.yaml \\
-        --airframe 22002 --hover 0.2162 --out /tmp/x8.npz
+        --airframe 22002 --hover 0.2455 --out /tmp/x8.npz
     python scripts/fly_in_process.py --compare /tmp/a.npz /tmp/b.npz
 
 ``--load N`` keeps N processes spinning for the whole run: "with every core
@@ -623,7 +623,8 @@ def compare(a_path, b_path) -> None:
 
 
 def acceptance(args) -> int:
-    """``legs`` at each load, then the checks of AGENTS.md section 3 in one table.
+    """``legs`` at each load, then the acceptance checks in one table
+    (IMPLEMENTATION_PLAN.md 3.2, and phase 7, "The PX4 legs").
     The thresholds are the decided design: every frame answered after PX4's first
     answer, IMU -> actuator one frame from the frame after the one it arrives in,
     a body-rate setpoint on its frame (lag 2: the setpoint delay plus IMU ->

@@ -42,6 +42,11 @@
 
 . ${R}etc/init.d/rc.mc_defaults
 
+# rc.mc_defaults sets 2, a quadrotor; this is the rotor count's type as PX4's
+# own airframes give it (12001_octo_cox: 14). Commander treats every multirotor
+# type alike, so this changes what the vehicle reports, not how it flies.
+param set-default MAV_TYPE {{MAV_TYPE}}
+
 # 0 is the generic multirotor geometry: the CA_ROTOR* entries below define the
 # layout, rather than selecting a canned one that would not match the CAD.
 param set-default CA_AIRFRAME 0

@@ -25,7 +25,7 @@ Two things would break that, and are kept off the barrier path:
   has left the receive thread. The first makes PX4 register our component
   before handling the request; PX4 sends a ``COMMAND_ACK`` only to a component
   it has seen, and registers one only after handling its message
-  (``mavlink_main.cpp:2692``, ``mavlink_receiver.cpp:3244-3249``), so an ACK to
+  (``mavlink_main.cpp:2693``, ``mavlink_receiver.cpp:3244-3249``), so an ACK to
   the very first message can be dropped.
 * **The periodic stream races the estimator**: it sends whatever is newest when
   PX4's main thread wakes. Given an interval of 2e9 us it never sends on its

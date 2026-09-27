@@ -20,7 +20,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import frames
-from .arm import ArmCommand, ArmServos, ArmStatus, JointReading, PropellerMonitor
+from .arm import (
+    ArmCommand, ArmServos, ArmStatus, JointReading, PropellerMonitor, reset_to_home,
+)
 from .config import Config
 from .vehicle import RotorModel, Vehicle
 
@@ -66,6 +68,8 @@ class MujocoPhysics:
         # ratio so it stays an integer (plan phase 3).
         self.model.opt.timestep = cfg.physics_dt
         self.data = mujoco.MjData(self.model)
+        # The arm starts stowed, and its servos hold that pose (arm.hold below).
+        reset_to_home(self.model, self.data)
         self.vehicle = Vehicle(self.model, rotors)
         self.steps_per_frame = cfg.steps_per_imu_frame
         self.projection = frames.GeodeticProjection(cfg.home_lat, cfg.home_lon, cfg.home_alt)

@@ -34,9 +34,9 @@ _log = logging.getLogger(__name__)
 
 # --- placeholder motor / propeller numbers --------------------------------
 #
-# No motor has been chosen for the X8 yet (MODELING_CONVENTIONS.md section 7
-# lists what is still needed), so these stand in until the datasheet numbers
-# land. They are not measurements. OMEGA_MAX_PLACEHOLDER is section 2.5's
+# Stand-ins for a model whose sidecar gives no motor numbers -- today only the
+# quad; the X8's are fitted from its datasheet (MODELING_CONVENTIONS.md section
+# 7). They are not measurements. OMEGA_MAX_PLACEHOLDER is section 2.5's
 # reference X8 figure; OMEGA_IDLE_PLACEHOLDER is one eleventh of it, which is
 # what puts hover at command 0.450.
 OMEGA_MAX_PLACEHOLDER = 1100.0
@@ -66,8 +66,9 @@ class RotorModel:
     motors -- but it warns, since it fabricates motor capability).
 
     Note ``omega_idle > 0``: a real motor does not stop at zero command when
-    armed. It moves hover off mid-stick, which is why ``MPC_THR_HOVER`` is 0.45
-    and not 0.50 -- see px4/22001_mujoco_quad.
+    armed. It moves hover off mid-stick, to command 0.450 rather than 0.50;
+    ``MPC_THR_HOVER`` is its square, 0.2025, at ``THR_MDL_FAC 1`` -- see
+    px4/22001_mujoco_quad.
     """
 
     c_t: Scalar | None = None

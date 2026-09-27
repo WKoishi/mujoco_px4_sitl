@@ -63,17 +63,25 @@ def test_spin_accepts_cw_ccw_strings(tmp_path):
     assert load_rotors(_write(tmp_path, body)).spin == (1, -1)
 
 
-def test_omega_idle_absent_leaves_the_placeholder(tmp_path):
+def test_omega_idle_absent_leaves_the_placeholder(tmp_path, caplog):
     """Not an error: omega_idle is an ESC setting and may be unmeasured.
 
-    vehicle.py's placeholder then applies, and it warns -- which is the signal
-    the value was never supplied.
+    vehicle.py's placeholder then applies, and the load warns -- which is the
+    signal the value was never supplied, and what keeps a silent load meaning
+    every number arrived.
     """
-    rotors = load_rotors(_write(tmp_path, _x8()))
+    with caplog.at_level("WARNING", logger="mujoco_px4_sitl.rotorconfig"):
+        rotors = load_rotors(_write(tmp_path, _x8()))
     # The default is vehicle.py's, not one we invented here.
     from mujoco_px4_sitl.vehicle import OMEGA_IDLE_PLACEHOLDER
 
     assert rotors.omega_idle == OMEGA_IDLE_PLACEHOLDER
+    assert "no omega_idle" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="mujoco_px4_sitl.rotorconfig"):
+        load_rotors(_write(tmp_path, _x8(omega_idle=57.6)))
+    assert caplog.text == ""
 
 
 def test_c_t_without_omega_max_is_rejected(tmp_path):

@@ -78,10 +78,14 @@ carries it.
   scale it. Torque and velocity interfaces are not simulated yet (`AGENTS.md` §2).
 - **Contiguous indices from 0.** Actuators past a gap are counted in a load
   warning and never written.
-- **Its home in `qpos0`**: the servos hold the initial pose until the first
-  command. The conversion validates the sidecar's `home` against each joint's
-  range but does not write it into the model yet, so a generated model starts
-  at the URDF's zero.
+- **Its home in a `home` keyframe**: the simulator starts there, and the servos
+  hold that pose until the first command. The conversion writes it from the
+  sidecar's per-joint `home` (default 0). Not `qpos0`: for a hinge that is the
+  joint's `ref`, and moving it would move the zero `arm_cmd`'s absolute angles
+  are measured from. A model with no key starts at `qpos0`. The derived attitude
+  gains and `manipulability.py`'s frozen joints use the same pose; the CAD mass
+  and CoM cross-check uses the export pose, which is the one SolidWorks
+  describes.
 
 Propeller clearance runs from the rotor sites' discs (§3.3) to the arm's
 collision capsules and spheres; other shapes on the arm are named in a load
@@ -346,9 +350,9 @@ sidecar: `CA_ROTOR_COUNT` and every rotor's `CA_ROTOR*_PX` / `_PY` / `_KM` / `_C
 `PWM_MAIN_FUNC1..N = 101..`, `MPC_THR_HOVER`, and what the quad's file never
 needed: attitude gains derived from the model's inertia. PX4's rate gains act on a
 normalized torque, so stock values do not transfer to a vehicle with far less
-authority per unit inertia; the template says how they are derived. It sets no
-`MAV_TYPE`, so the vehicle reports `rc.mc_defaults`' quadrotor (2) where PX4's
-`12001_octo_cox` sets 14.
+authority per unit inertia; the template says how they are derived. `MAV_TYPE`
+follows the rotor count as in PX4's own airframes (14 for an X8, as
+`12001_octo_cox`); left to `rc.mc_defaults` it would report a quadrotor.
 
 No MAVLink-side change: `HIL_ACTUATOR_CONTROLS` carries 16 channels
 ([hil.py:32](src/mujoco_px4_sitl/hil.py#L32)), and `effective(count)` takes the
@@ -649,10 +653,10 @@ to be sure the airframe's value and the plant's hover point are the same number.
 
 `vehicle.py`'s `OMEGA_MAX_PLACEHOLDER` / `OMEGA_IDLE_PLACEHOLDER` /
 `CT_PLACEHOLDER` remain the fallback for any model that supplies none of this. The
-auto-calibrated `c_t` warns on every load (§2.4); a missing `omega_idle` falls back
-without a warning. A new platform whose motors are not yet chosen can
-therefore be modelled and flown before they are, with the real numbers landing
-later and reworking nothing.
+auto-calibrated `c_t` warns on every load (§2.4), and so does a sidecar with
+measured motors but no `omega_idle`. A new platform whose motors are not yet
+chosen can therefore be modelled and flown before they are, with the real numbers
+landing later and reworking nothing.
 
 ---
 

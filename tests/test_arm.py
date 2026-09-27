@@ -155,6 +155,22 @@ def test_before_any_command_the_arm_holds_its_initial_pose(sim: MujocoPhysics):
     assert sim.arm_status().cmd_age is None
 
 
+def test_a_model_with_a_home_keyframe_starts_and_holds_there(tmp_path):
+    """The conversion writes the sidecar's stowed pose as the ``home`` key, not
+    as qpos0 (which would move the zero arm_cmd is measured from)."""
+    xml = arm_xml().replace("</mujoco>", """  <keyframe>
+    <key name="home" qpos="0 0 1 1 0 0 0 0.4 -0.3" ctrl="0.4 -0.3"/>
+  </keyframe>
+</mujoco>""")
+    sim = physics(tmp_path, xml)
+    assert joint_angles(sim) == pytest.approx([0.4, -0.3])
+    assert sim.data.ctrl[sim.arm.ids] == pytest.approx([0.4, -0.3])
+    run(sim, 0.5)
+    assert joint_angles(sim) == pytest.approx([0.4, -0.3], abs=0.03)
+    # The zero stays where the model puts it.
+    assert sim.model.qpos0[7:] == pytest.approx([0.0, 0.0])
+
+
 def test_a_command_drives_the_first_frame_after_it_arrives(sim: MujocoPhysics):
     sim.submit_arm_command(ArmCommand(values=np.array([0.3, 0.2])))
     sim.step_frame(np.zeros(4))

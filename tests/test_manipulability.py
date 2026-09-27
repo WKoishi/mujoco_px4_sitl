@@ -495,6 +495,20 @@ def test_pose_and_tool_axis_agree_when_the_wrist_is_a_pure_spin(
     assert free.deficient_fraction == held.deficient_fraction == 0.0
 
 
+def test_frozen_joints_park_at_the_home_keyframe() -> None:
+    """The conversion writes the arm's stowed pose as the ``home`` key; frozen
+    joints sit there, and at qpos 0 only in a model without one."""
+    model = mujoco.MjModel.from_xml_string(SPIN_WRIST.replace("</mujoco>", """
+  <keyframe><key name="home" qpos="0 0 0.5 1 0 0 0 0 1.0 0"/></keyframe>
+</mujoco>"""))
+    held = mp.sample(model, "position", mp.build_movable(model, ["j0", "j1"]),
+                     50, 0.01, 0, progress=False)
+    # j1 at 1 rad swings the 0.25 m wrist-plus-tool about y.
+    expected = [0.4 + 0.25 * np.cos(1.0), 0.0, -0.25 * np.sin(1.0)]
+    np.testing.assert_allclose(held.pos, np.tile(expected, (len(held.pos), 1)),
+                               atol=0.01)
+
+
 def test_report_warns_that_w_is_not_comparable(planar: mujoco.MjModel) -> None:
     mv = mp.build_movable(planar, [mp.YAW_LABEL])
     text = mp.report(mp.sample(planar, "position", mv, 200, 0.04, 0, progress=False))

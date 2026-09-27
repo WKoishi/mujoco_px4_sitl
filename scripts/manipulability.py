@@ -62,6 +62,9 @@ _log = logging.getLogger("manipulability")
 EE_SITE = "ee"
 BASE_BODY = "base_link"
 YAW_LABEL = "base_yaw"
+# The arm's stowed pose, as urdf_to_mjcf.py writes it (mujoco_px4_sitl.arm's
+# HOME_KEY; repeated here because this script imports nothing from the repo).
+HOME_KEY = "home"
 
 # Task row sets, as indices into the stacked [jacp; jacr] 6 x nv Jacobian.
 #
@@ -114,6 +117,15 @@ class Movable:
     @property
     def n(self) -> int:
         return len(self.dofs)
+
+
+def reset_to_home(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Reset to the ``home`` keyframe, or to ``qpos0`` if the model has none."""
+    key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, HOME_KEY)
+    if key < 0:
+        mujoco.mj_resetData(model, data)
+    else:
+        mujoco.mj_resetDataKeyframe(model, data, key)
 
 
 def build_movable(model: mujoco.MjModel, freeze: list[str]) -> Movable:
@@ -307,10 +319,11 @@ def sample(
     ws = np.empty(samples)
     ok = np.empty(samples, dtype=bool)
 
-    # Frozen joints sit at qpos 0, which is the model's own reference pose. A
-    # frozen joint parked somewhere else is a different vehicle, so 0 is the
-    # only defensible choice without a second flag.
-    mujoco.mj_resetData(model, data)
+    # Frozen joints sit at the arm's home pose: the ``home`` keyframe, or qpos 0
+    # for a model without one. A frozen joint parked anywhere else is a
+    # different vehicle, so home is the only defensible choice without a second
+    # flag.
+    reset_to_home(model, data)
     home = data.qpos.copy()
     mujoco.mj_kinematics(model, data)
     # The base never moves during sampling (only arm qpos is written), so its
@@ -486,7 +499,7 @@ def view(model: mujoco.MjModel, cloud: Cloud, args: argparse.Namespace) -> None:
 
     data = mujoco.MjData(model)
     base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, BASE_BODY)
-    mujoco.mj_resetData(model, data)
+    reset_to_home(model, data)
     if args.pose:
         for name, val in args.pose:
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -545,7 +558,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--freeze", default=[], nargs="+", metavar="JOINT",
-        help=f"joints to lock at qpos 0; '{YAW_LABEL}' locks the vehicle heading",
+        help=(
+            f"joints to lock at the arm's home pose; '{YAW_LABEL}' locks the "
+            "vehicle heading"
+        ),
     )
     p.add_argument("--samples", type=int, default=40_000)
     p.add_argument("--voxel", type=float, default=0.04, help="metres (default 0.04)")

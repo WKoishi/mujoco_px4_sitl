@@ -53,7 +53,7 @@ them when the platform changes.**
 | Arm has position servos only | one position actuator per joint; `arm.py` refuses others and `mode: "torque"` | no torque or velocity interface. The servo gains are provisional, and their droop decides intrusions as well as tracking |
 | Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set at boot; PX4's attitude/rate thread race (plan §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs. An attitude setpoint is one frame later than a body-rate one when idle, and the same frame on up to 98 % under load. Accepted; `EKF2_PREDICT_US 4000` would remove the first, not tried |
 | Two runs of one schedule drift apart | PX4's `sensor_*_sim` share one `rand()` whose position boot decides (plan §3.3) | identical until arming, then up to about a metre apart (0.34 m for the strict X8 pair). Compare over repeated runs. Seeded simulator-side sensors (strategy B, §3) brought a pair to 2–4 cm |
-| Attitude gains are sized for the arm at home | `attitude_gains` uses the home-pose inertia | the gains do not follow an arm that moves in flight |
+| Attitude gains are sized for the arm at home | `attitude_gains` uses the inertia at the model's `home` keyframe | the gains do not follow an arm that moves in flight |
 | IMU errors are one datasheet's, and partial | `sensors.py`: ICM-42688-P noise, turn-on bias, chosen drift, on `HIL_SENSOR` only (plan phase 5, "With IMU errors") | the vehicle's flight controller is not chosen, and its IMU is assumed. No vibration, scale factor, misalignment or temperature: a flying multirotor's IMU reads mostly vibration, so estimates still look better than they will be. The drift is not from the datasheet |
 | No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
 | Coaxial interference is a chosen constant | `ct_factor` 0.80 on the lower deck, unmeasured (`MODELING_CONVENTIONS.md` §8) | hover and plant gain rest on a chosen number; the upper deck's own loss and any speed dependence are not modelled. A bench test of a coaxial pair replaces the number |
@@ -123,8 +123,8 @@ computer.
 
 `vehicle.py`'s auto-calibrated `c_t` still warns on every load; that is now only
 the quad. **The X8 loads with no warning**, and that silence is the check that the
-sidecar's `c_t` reached `RotorModel`. It does not cover `omega_idle`: a sidecar
-without one falls back to the placeholder silently.
+sidecar's motor numbers reached `RotorModel`: a missing `c_t` or `omega_idle`
+each warns.
 
 ---
 

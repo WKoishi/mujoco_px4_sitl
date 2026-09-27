@@ -60,7 +60,7 @@ from numpy.typing import NDArray
 # installed, which is how the tests load it and how it is documented. It is a
 # no-op once the package is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from mujoco_px4_sitl.arm import PropellerMonitor  # noqa: E402
+from mujoco_px4_sitl.arm import HOME_KEY, PropellerMonitor, reset_to_home  # noqa: E402
 from mujoco_px4_sitl.rotorconfig import (  # noqa: E402
     RotorSpec,
     parse_rotor_entry,
@@ -659,7 +659,39 @@ def build_spec(sidecar: Sidecar, mesh_dir: Path, mapping: dict[str, str]) -> muj
     _inject_collisions(spec, sidecar)
     _inject_world(spec, sidecar, base)
     _apply_option(spec, sidecar)
+    _inject_home(spec, sidecar)
     return spec
+
+
+def _inject_home(spec: mujoco.MjSpec, sidecar: Sidecar) -> None:
+    """Write the sidecar's stowed pose as the ``home`` keyframe.
+
+    Not ``qpos0``: for a hinge that is the joint's ``ref``, and moving ``ref``
+    would move the zero ``arm_cmd``'s absolute angles are measured from. The
+    simulator, ``attitude_gains`` and ``manipulability.py`` start from this key
+    (``arm.reset_to_home``); the CAD cross-check stays on the export pose, which
+    is the one SolidWorks' mass properties describe.
+    """
+    if not sidecar.joints:
+        return
+    # Compiled once here for the full qpos layout: the key must carry every
+    # coordinate, the freejoint's spawn pose included.
+    model = spec.compile()
+    qpos = np.array(model.qpos0, dtype=np.float64)
+    ctrl = np.zeros(model.nu)
+    for name, joint in sidecar.joints.items():
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        qpos[model.jnt_qposadr[joint_id]] = joint.home
+    for index in range(model.nu):
+        actuator = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{ARM_ACTUATOR_PREFIX}{index}"
+        )
+        if actuator >= 0:
+            ctrl[actuator] = qpos[model.jnt_qposadr[model.actuator_trnid[actuator, 0]]]
+    key = spec.add_key()
+    key.name = HOME_KEY
+    key.qpos = qpos.tolist()
+    key.ctrl = ctrl.tolist()
 
 
 def _inject_world(spec: mujoco.MjSpec, sidecar: Sidecar, base: Any) -> None:
@@ -1381,24 +1413,26 @@ def _check_mass(
 def _subtree_com(model: mujoco.MjModel, base_id: int) -> NDArray[np.float64]:
     """Mass-weighted CoM of ``base_id``'s subtree, in ``base_id``'s frame.
 
-    Computed at the home configuration via ``mj_forward``, then mapped back into
-    the base frame -- so a moving arm does change it, which is the point of
-    printing it next to the CAD figure.
+    Computed at the export pose, not at home: the CAD figure it is printed next
+    to describes the assembly as exported. A moving arm does change it.
     """
-    return _subtree_mass_properties(model, base_id)[0]
+    return _subtree_mass_properties(model, base_id, at_home=False)[0]
 
 
 def _subtree_mass_properties(
-    model: mujoco.MjModel, base_id: int
+    model: mujoco.MjModel, base_id: int, at_home: bool = True
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """CoM and inertia of ``base_id``'s subtree, both in ``base_id``'s frame.
 
     The inertia is about the subtree CoM: the arm rigidly locked at its home
-    pose, which is what the vehicle's rate loops see while the arm holds still.
+    pose (the ``home`` keyframe, or the export pose with ``at_home=False``),
+    which is what the vehicle's rate loops see while the arm holds still.
     Summed body by body with the parallel-axis term, so it does not depend on
     MuJoCo's mass-matrix API, which has changed signature between releases.
     """
     data = mujoco.MjData(model)
+    if at_home:
+        reset_to_home(model, data)
     mujoco.mj_forward(model, data)
     bodies: list[int] = []
     stack = [base_id]
@@ -1729,6 +1763,7 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
     text = text.replace("{{ROTOR_BLOCK}}", "\n".join(rotors) + "\n")
     text = text.replace("{{PWM_BLOCK}}", "\n".join(pwm) + "\n")
     text = text.replace("{{MPC_THR_HOVER}}", f"{hover:.4f}")
+    text = text.replace("{{MAV_TYPE}}", str(_mav_type(len(sidecar.rotors))))
     for j, axis in enumerate(_AXES):
         name = axis.upper()
         text = text.replace(f"{{{{MC_{name}RATE_K}}}}", f"{gains.rate_k[j]:.2f}")
@@ -1746,6 +1781,22 @@ def emit_airframe(sidecar: Sidecar, model: mujoco.MjModel, out: Path) -> None:
         f"  install with: scripts/install_px4_files.sh --airframe {out}\n"
         f"  then run with PX4_SYS_AUTOSTART={out.name.split('_')[0]}"
     )
+
+
+# MAV_TYPE by rotor count, as PX4's multirotor airframes set it: QUADROTOR,
+# HEXAROTOR, OCTOROTOR. Coaxial layouts take the rotor count's type too
+# (11001_hexa_cox 13, 12001_octo_cox 14), not MAV_TYPE_COAXIAL, which is a
+# coaxial helicopter.
+_MAV_TYPES = {4: 2, 6: 13, 8: 14}
+
+
+def _mav_type(rotor_count: int) -> int:
+    if rotor_count not in _MAV_TYPES:
+        raise ValueError(
+            f"no MAV_TYPE for {rotor_count} rotors; add it to _MAV_TYPES from the "
+            f"matching PX4 airframe"
+        )
+    return _MAV_TYPES[rotor_count]
 
 
 def _print_meshes(reports: list[MeshReport]) -> None:
@@ -1772,7 +1823,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("sidecar", type=Path, help="the .conversion.yaml")
     parser.add_argument(
         "--check-only", action="store_true",
-        help="validate and report without writing the MJCF or the meshes",
+        help=(
+            "validate and report without writing the MJCF or the airframe "
+            "(decimated meshes are still staged: compiling needs them)"
+        ),
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
@@ -1831,8 +1885,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if sidecar.omega_idle is None:
         print(
-            "\nomega_idle is not set, so vehicle.py's placeholder stands and "
-            "warns on every load (section 2.4)."
+            "\nomega_idle is not set, so vehicle.py's placeholder stands, and "
+            "the simulator warns about it on every load (section 7)."
         )
     if result.warnings:
         print(f"\n{len(result.warnings)} warning(s).")

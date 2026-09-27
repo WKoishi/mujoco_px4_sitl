@@ -28,6 +28,11 @@ from numpy.typing import NDArray
 _log = logging.getLogger(__name__)
 
 ACTUATOR_PREFIX = "arm_act"
+# The keyframe urdf_to_mjcf.py writes for the sidecar's stowed pose
+# (MODELING_CONVENTIONS.md section 2.3). qpos0 cannot carry it: for a hinge,
+# qpos0 is the joint's ref, and moving ref would move the zero that arm_cmd's
+# absolute angles are measured from.
+HOME_KEY = "home"
 
 # What the arm driver does once the newest command is older than the timeout.
 #   keep   -- servos hold the last target: a bus with no watchdog. Reported only.
@@ -38,6 +43,19 @@ TIMEOUT_ACTIONS = ("keep", "freeze", "limp")
 # ground_truth.time is rounded to the microsecond, so an honest echo of it can
 # sit up to half a microsecond after the frame it was taken from.
 _STATE_TIME_SLACK = 1e-6
+
+
+def reset_to_home(model: mujoco.MjModel, data: mujoco.MjData) -> bool:
+    """Reset ``data`` to the model's ``home`` keyframe; False if it has none.
+
+    A model without one keeps MuJoCo's default reset, ``qpos0``.
+    """
+    key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, HOME_KEY)
+    if key < 0:
+        mujoco.mj_resetData(model, data)
+        return False
+    mujoco.mj_resetDataKeyframe(model, data, key)
+    return True
 
 
 def _log_this_one(count: int) -> bool:

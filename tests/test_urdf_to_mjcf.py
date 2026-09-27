@@ -612,6 +612,47 @@ def test_arm_actuators_are_position_controlled_over_the_joint_range(rig):
     assert model.dof_damping[dof] > 0.0
 
 
+def test_home_is_written_as_a_keyframe_and_leaves_the_zero_alone(rig):
+    """``home`` used to be range-checked and then dropped. It becomes the
+    ``home`` key, which the simulator starts from; qpos0 cannot carry it, since
+    for a hinge that is ``ref`` and would shift the zero of ``arm_cmd``."""
+    path, data = rig
+    data["joints"]["arm_joint0"]["home"] = {"deg": 30}
+    model, result = _convert(_write(path, data))
+    assert not result.failures, result.lines
+
+    key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    assert key >= 0
+    joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "arm_joint0")
+    address = int(model.jnt_qposadr[joint])
+    assert model.key_qpos[key, address] == pytest.approx(np.radians(30))
+    assert model.key_ctrl[key, 0] == pytest.approx(np.radians(30))
+    assert model.qpos0[address] == 0.0
+    # Every other coordinate is the model's own: the base spawns where it did.
+    others = np.delete(np.arange(model.nq), address)
+    np.testing.assert_array_equal(model.key_qpos[key, others], model.qpos0[others])
+
+
+def test_gains_see_the_arm_at_home_and_the_cad_check_at_the_export_pose(rig):
+    """Two poses, on purpose: the rate loops turn the vehicle with the arm stowed,
+    while SolidWorks' mass properties describe the assembly as exported.
+
+    Arm axis along y and home at +90 deg swings the link's CoM (0, 0, 0.05) to
+    (0.05, 0, 0): the arm link sits at (0.15, 0, 0.02) instead of (0.1, 0, 0.07).
+    """
+    path, data = rig
+    urdf = Path(data["urdf"])
+    urdf.write_text(_URDF.replace('<axis xyz="0 0 1"/>', '<axis xyz="0 1 0"/>'))
+    data["joints"]["arm_joint0"]["home"] = {"deg": 90}
+    model, _ = _convert(_write(path, data))
+    base = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+
+    com_home, _ = u2m._subtree_mass_properties(model, base)
+    np.testing.assert_allclose(com_home, [0.03, 0.0, 0.004], atol=1e-9)
+    np.testing.assert_allclose(u2m._subtree_com(model, base), [0.02, 0.0, 0.014],
+                               atol=1e-9)
+
+
 def test_the_arm_actually_tracks_a_commanded_angle(rig):
     """A position actuator that does not move is the point of the gains."""
     path, _ = rig
@@ -678,6 +719,19 @@ def test_airframe_km_sign_follows_spin(rig, tmp_path):
     text = out.read_text()
     assert "CA_ROTOR0_KM +0.05000" in text  # CCW
     assert "CA_ROTOR2_KM -0.05000" in text  # CW
+
+
+def test_airframe_mav_type_follows_the_rotor_count(rig, tmp_path):
+    """rc.mc_defaults says quadrotor; without its own MAV_TYPE the X8 reported
+    itself as one. PX4's coaxial airframes use the rotor count's type."""
+    path, _ = rig
+    model, _ = _convert(path)
+    out = tmp_path / "22009_test_rig"
+    u2m.emit_airframe(u2m.load_sidecar(path), model, out)
+    assert "param set-default MAV_TYPE 2\n" in out.read_text()
+    assert u2m._mav_type(8) == 14
+    with pytest.raises(ValueError, match="no MAV_TYPE for 5 rotors"):
+        u2m._mav_type(5)
 
 
 def test_airframe_rotor_count_and_pwm_match_the_sidecar(rig, tmp_path):

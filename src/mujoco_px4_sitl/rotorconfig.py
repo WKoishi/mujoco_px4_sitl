@@ -16,11 +16,14 @@ STLs are 7 MB of private geometry; the eight numbers needed to fly are not.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .vehicle import RotorModel
+from .vehicle import OMEGA_IDLE_PLACEHOLDER, RotorModel
+
+_log = logging.getLogger(__name__)
 
 # Sidecar keys this module understands. The full schema is larger -- the script
 # owns the rest -- so an unknown key here is not an error, unlike inside the
@@ -190,6 +193,16 @@ def rotors_from_specs(
         kwargs["omega_min"] = tuple(float(s.omega_min) for s in specs)  # type: ignore[arg-type]
     if omega_idle is not None:
         kwargs["omega_idle"] = float(omega_idle)
+    elif all(measured):
+        # Not an error, since idle is an ESC setting and may be unmeasured. But
+        # the placeholder is sized against the placeholder omega_max, and the
+        # hover point rests on omega_idle / omega_max: said on every load, so a
+        # silent load keeps meaning the sidecar's numbers all arrived.
+        _log.warning(
+            "sidecar gives measured c_t and omega_max but no omega_idle: the "
+            "placeholder %.0f rad/s stands, and MPC_THR_HOVER rests on it",
+            OMEGA_IDLE_PLACEHOLDER,
+        )
     return RotorModel(**kwargs)
 
 

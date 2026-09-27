@@ -154,8 +154,9 @@ joints:
     damping: 0.5           # joint viscous damping, N m s / rad
     armature: 0.01         # reflected inertia, kg m^2
     # force_range: [-REPLACE_TORQUE, REPLACE_TORQUE]   # stall torque, N m
-    # gear_ratio: REPLACE_RATIO                        # recorded, sets armature
-    # home: 0.0            # stowed angle; must lie inside [lower, upper]
+    # gear_ratio: REPLACE_RATIO                        # recorded only, not used yet
+    # home: 0.0            # stowed angle, inside [lower, upper]; written as the
+    #                      # model's `home` keyframe, where the simulator starts
   arm_joint1:
     lower: REPLACE_LOWER
     upper: REPLACE_UPPER

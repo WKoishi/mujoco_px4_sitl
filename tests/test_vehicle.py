@@ -67,9 +67,10 @@ def test_hover_thrust_equals_weight(vehicle: Vehicle):
 
 def test_hover_sits_where_mpc_thr_hover_says_it_does(vehicle: Vehicle):
     """The idle offset moves hover off mid-stick, to 0.450 for the reference
-    omega_idle / omega_max = 1/11 (MODELING_CONVENTIONS.md 2.5). That number is
-    ``MPC_THR_HOVER`` in px4/22001_mujoco_quad; if this test moves, so must the
-    airframe file, or hover is quietly mistuned.
+    omega_idle / omega_max = 1/11 (MODELING_CONVENTIONS.md 2.5). Its square,
+    0.2025, is ``MPC_THR_HOVER`` in px4/22001_mujoco_quad (``THR_MDL_FAC 1``,
+    section 2.6); if this test moves, so must the airframe file, or hover is
+    quietly mistuned.
     """
     assert vehicle.hover_command() == pytest.approx(0.450, abs=0.002)
 
