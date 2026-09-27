@@ -29,6 +29,10 @@ them when the platform changes.**
   MAVLink ([px4link.py](src/mujoco_px4_sitl/px4link.py)) as a companion computer
   would, and sending PX4 setpoints and commands the same way. Ground truth goes
   only to a recorder.
+- **The IMU has errors** since 2026-09-27 (`--imu icm42688p`, the default):
+  datasheet noise, a seeded turn-on bias and drift, on `HIL_SENSOR` only. EKF2
+  learns the gyro bias before arming. `--imu ideal` reproduces the baselines
+  flown before (plan phase 5, "With IMU errors").
 - **Every leg to the vehicle has a chosen delay** since phase 2 of the topology
   (2026-09-26): strict lockstep with IMU → actuator exactly one frame (from the
   frame after the first answer's), estimates at a chosen age, setpoints and commands behind a PING barrier before a chosen
@@ -50,7 +54,7 @@ them when the platform changes.**
 | Two things in PX4's legs are measured, not chosen | EKF2's cadence phase, set at boot; PX4's attitude/rate thread race (plan §3.2, §3.9) | the estimate's age is `estimate_delay` or one frame more, and which samples get the shorter one can swap between runs. An attitude setpoint is one frame later than a body-rate one on most frames, the same frame on 0–98 %, by load. Accepted; `EKF2_PREDICT_US 4000` would remove the first, not tried |
 | Two runs of one schedule drift apart | PX4's `sensor_*_sim` share one `rand()` whose position boot decides (plan §3.3) | identical until arming, then up to about a metre apart (0.34 m for the strict X8 pair). Compare over repeated runs. Seeded simulator-side sensors (strategy B, §3) brought a pair to 2–4 cm |
 | Attitude gains are sized for the arm at home | `attitude_gains` uses the home-pose inertia | the gains do not follow an arm that moves in flight |
-| IMU has no noise or bias | `sim.py` sends ideal accel/gyro; under MAVLink HIL the simulator owns IMU noise | EKF2's bias estimation is never exercised, and estimates look better than they will be. Add noise on the `HIL_SENSOR` path only (ground truth must stay clean), sized from the IMU's datasheet, then re-fly the step tests |
+| IMU errors are one datasheet's, and partial | `sensors.py`: ICM-42688-P noise, turn-on bias, chosen drift, on `HIL_SENSOR` only (plan phase 5, "With IMU errors") | the vehicle's flight controller is not chosen, and its IMU is assumed. No vibration, scale factor, misalignment or temperature: a flying multirotor's IMU reads mostly vibration, so estimates still look better than they will be. The drift is not from the datasheet |
 | No aerodynamics | ω is available, nothing reads it | `MODELING_CONVENTIONS.md` §5 lists the effects |
 | Coaxial interference is a chosen constant | `ct_factor` 0.80 on the lower deck, unmeasured (`MODELING_CONVENTIONS.md` §8) | hover and plant gain rest on a chosen number; the upper deck's own loss and any speed dependence are not modelled. A bench test of a coaxial pair replaces the number |
 | The frame PX4's first answer arrives in can run 2–3 frames old | strict lockstep starts on arrival (`loop.py`, plan §3.2) | one boot frame, disarmed, when that answer comes ≥ 2 frames late (about 1 run in 20 at load 16–32). Accepted: `acceptance` reports its lag apart and checks one frame from the next frame |
@@ -67,8 +71,9 @@ next to the MJCF it generated.
 ## 3. Next steps
 
 **Strategy B** — baro, mag and GPS synthesized by the simulator, seeded — waits
-until a use needs it: single-pair counterfactuals, sensor noise as a controlled
-variable, or the IMU noise gap. Plan §3.3 has the evidence and what it takes.
+until a use needs it: single-pair counterfactuals, or sensor noise as a
+controlled variable. Plan §3.3 has the evidence and what it takes; `sensors.py`
+is where it goes.
 **Aerodynamics** come after that, deliberately.
 
 **The controller topology is decided and built.** In process, because the

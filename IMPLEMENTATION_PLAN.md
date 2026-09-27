@@ -568,10 +568,21 @@ message decodes to `id == 0`, which is what we want anyway, so this is safe eith
 way — but be explicit about it rather than relying on the accident.
 
 **Sensor id 0 goes through PX4's simulated FIFO path**, not the plain update path
-(`SimulatorMavlink.cpp:246-270`). Values are quantised: gyro by
-`radians(2000/32768)` ≈ 0.001 °/s per LSB, accel similarly. Irrelevant for flight,
-but any test that compares a PX4-side `listener sensor_gyro` reading against the
-exact value we sent needs a tolerance, not equality.
+(`SimulatorMavlink.cpp:205-226, 248-270`): one `HIL_SENSOR` is one FIFO sample,
+its `dt` the stamp delta. Values are quantised: gyro by `radians(2000/32768)` =
+0.061 °/s per LSB, accel by `g/2048` = 0.49 mg. The float → int16 conversion
+**truncates toward zero and does not saturate**, so everything within ±1 LSB of
+zero reads 0, every value reads half an LSB small, and a value past ±2000 °/s or
+±16 g wraps. With an ideal IMU that is irrelevant for flight; with the IMU's own
+noise it is not, since the ICM-42688-P's gyro noise per frame is half an LSB and
+would mostly vanish at rest. `sensors.py` therefore sends the rounded count plus
+half an LSB away from zero, saturated, which the truncation decodes to the
+rounded count. Any test that compares a PX4-side `listener sensor_gyro` reading
+against the exact value we sent needs a tolerance, not equality.
+
+**PX4 adds no IMU noise of its own on this path**, so the IMU errors are ours
+(`sensors.py`, `--imu`; `AGENTS.md` §2). They go on `HIL_SENSOR` only:
+`HIL_STATE_QUATERNION` and the side channel stay ground truth.
 
 This bitmask is the migration seam toward strategy B: to take over one sensor
 later, set its bit and stop starting the corresponding `sensor_*_sim` module.
@@ -871,6 +882,8 @@ mujoco_px4_sitl/
 │   │                           HIL_ACTUATOR_CONTROLS decode
 │   ├── frames.py               MuJoCo <-> PX4 frame + geodetic conversion
 │   ├── sim.py                  MjModel/MjData ownership, step, sensor read
+│   ├── sensors.py              IMU errors on HIL_SENSOR only (--imu): bias,
+│   │                           drift, noise, PX4's quantisation; seeded
 │   ├── vehicle.py              rotor thrust/torque model, actuator mapping
 │   ├── loop.py                 lockstep orchestration: strict, and the
 │   │                           bounded-lead fallback
@@ -925,6 +938,7 @@ mujoco_px4_sitl/
     ├── test_control.py         controller schedule, drops, command-age bound;
     │                           PX4's legs and the API link against fake peers
     ├── test_manipulability.py  Jacobian metric on analytic fixtures
+    ├── test_sensors.py         IMU error statistics, PX4's decode, truth clean
     └── test_loop.py            lockstep loop against a fake PX4
 ```
 
@@ -1541,6 +1555,70 @@ runs agree: 0.9–2.4° past it on the 20° steps, 0.4–1.0° on the 90° steps
 the offset is attributed by that pattern, not measured. Roll and pitch are
 unchanged within run-to-run spread, as the 11 % plant loss against unchanged or
 raised K predicts. Read the whole as no regression.
+
+#### With IMU errors
+
+**Flown 2026-09-27 with the ICM-42688-P's errors on `HIL_SENSOR`** (`sensors.py`,
+`--imu icm42688p`, now the default; everything above was flown `ideal`). Seed 0
+draws a turn-on bias of FRD gyro [+0.003, +0.427, +0.080] °/s and accel
+[+4.33, −2.69, +2.21] mg; its norm, 0.43 °/s, is under `gyro_calibration`'s
+0.01 rad/s gate, so PX4 flies it uncalibrated and EKF2 carries it.
+
+`fly_in_process.py acceptance` passed every row on both vehicles, idle and at
+load 16, arrival frame at lag 1 in all four columns. Phase 5 on the X8,
+`fly_regression.py` against `run_sitl.sh` then `hover_error.py` (164 s of settled
+hover): `ratio=1.000 unproven=0 brake=0 timeouts=0`, `Disarmed by landing`, no
+failsafe.
+
+| | X8, `ct_factor` 0.80, ideal | with IMU errors |
+|---|---|---|
+| altitude error | 0.136 max / 0.033 median | 0.354 / 0.076 |
+| horizontal error | 0.150 / 0.054 | 0.124 / 0.053 |
+| square corner error | 0.03–0.10 m | 0.03–0.12 m |
+
+Altitude doubled, and stays inside `sensor_gps_sim`'s 0.5 m vertical σ: with an
+IMU that no longer agrees exactly with baro and GPS, EKF2 weighs them as it would
+on the vehicle. Horizontal is unchanged.
+
+`fly_in_process.py steps`, seed 0:
+
+| step | `ct_factor` 0.80, run 2 | with IMU errors |
+|---|---|---|
+| yaw 20° | 1.90–2.08° / 0.70–0.76 s | 1.57–1.71° past settled / 0.73–0.74 s |
+| yaw 90° | 0.32–0.72° / 3.04–3.09 s | 0.69–0.91° past settled / 3.04–3.05 s |
+| pitch 5° | 0.5–1.2 % / 0.42–0.43 s | 0.1–1.8 % / 0.42–0.43 s |
+| roll 5° | 1.0–1.4 % / 0.43 s | 0.0–2.6 % / 0.41–0.46 s |
+
+Yaw sits inside the band the two ideal runs agree on, measured past the settled
+value: 0.9–2.4° on the 20° steps and 0.4–1.0° on the 90° steps. Settling is
+unchanged. **The +5° roll step overshoots 2.6 %** in seed 0, and 1.9 % in seed 1,
+against 1.2–1.4 % ideal. That is 0.03–0.07° more, and it is the one figure the
+IMU errors moved.
+
+**EKF2 learns the gyro bias on the ground; the accel's x and y wait for
+manoeuvres.**
+In the steps flight, EKF2's `estimator_sensor_bias` against the injected bias
+(turn-on plus drift):
+
+| t | gyro, injected / EKF2, °/s | accel, injected / EKF2, mg |
+|---|---|---|
+| 20 s, before arming | [+0.01, +0.44, +0.07] / [−0.01, +0.44, +0.04] | [+4.3, −2.6, +2.5] / [−0.9, +0.6, +1.9] |
+| 135 s, after the steps | [−0.07, +0.43, +0.03] / [−0.06, +0.44, +0.06] | [+5.2, −2.7, +1.4] / [+4.0, −1.8, +1.6] |
+
+Gyro bias is found within 0.03 °/s before arming. The accel's z bias is found on
+the ground too. Its x and y are not observable at rest, where they are
+indistinguishable from tilt, so they converge only once the vehicle has
+manoeuvred. Seed 1 draws a gyro turn-on norm of 1.55 °/s: `gyro_calibration`
+saved `CAL_GYRO0_*OFF` of [+0.56, −1.34, −0.55] °/s 11.4 s into the run, and
+EKF2 held the remainder within 0.02 °/s by arming. Nothing reached `CAL_*`
+through `SENS_IMU_AUTOCAL`, and nothing refused arming. The land detector kept
+`at_rest` before arming, since the gyro vibration metric peaked at 0.0005 rad/s
+against a 0.02 threshold.
+
+**The quad's in-flight gyro vibration metric is about 0.35 rad/s with or without
+the IMU errors**, against the X8's 0.0006. It is the quad's own, unrelated to
+this change. It may be the placeholder motors or the 250 Hz rate loop on its
+gains, and was not chased.
 
 ### Phase 6 — External API and launch story
 

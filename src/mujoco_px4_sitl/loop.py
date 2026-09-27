@@ -42,6 +42,7 @@ from pymavlink.dialects.v20 import common as mavlink
 from . import hil
 from .config import Config
 from .control import ControllerHost
+from .sensors import build_imu
 from .sim import Physics
 from .sidechannel import SideChannel
 from .transport import HilServer
@@ -113,6 +114,9 @@ class LockstepLoop:
         # writers would take turns on the servos by arrival order.
         self.controller = controller
         self._refused_arm_cmds = 0
+        # IMU errors, on HIL_SENSOR only: everything else that leaves the loop is
+        # ground truth. Read once per frame, so the errors follow the frame count.
+        self.imu = build_imu(cfg.imu_model, cfg.imu_dt, cfg.imu_seed)
         self.stats = LoopStats()
         # The newest answer received, whatever its stamp; for the flags.
         self.controls = hil.ActuatorControls()
@@ -250,9 +254,10 @@ class LockstepLoop:
         self._last_imu_time_us = self._imu_time_us
 
         mav = self.server.mav
-        if not self.server.send(
-            hil.encode_hil_sensor(mav, self._imu_time_us, state.accel_frd, state.gyro_frd)
-        ):
+        accel, gyro = state.accel_frd, state.gyro_frd
+        if self.imu is not None:
+            accel, gyro = self.imu.read(accel, gyro)
+        if not self.server.send(hil.encode_hil_sensor(mav, self._imu_time_us, accel, gyro)):
             return False
         # Every IMU frame: 250 Hz, above the 200 Hz PX4 asks for, which is not an
         # integer divisor of the IMU rate. Nothing in PX4 checks the interval.
@@ -288,6 +293,8 @@ class LockstepLoop:
         t_status_next = t_wall_start + cfg.status_interval_s
         controls = np.zeros(self.physics.num_actuators)
 
+        _log.info("%s", "IMU errors: none, HIL_SENSOR carries the truth"
+                  if self.imu is None else self.imu.describe())
         _log.info(
             "loop start: IMU %.0f Hz, speed %s, answer timeout %.0f ms; fallback "
             "max_lead=%d frames, brake timeout %.0f ms",

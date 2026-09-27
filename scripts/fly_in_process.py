@@ -41,6 +41,9 @@ busy" is where the probes found the barrier and the estimate delay necessary.
 Output is the report only, plus the simulator's warnings: an unproven frame or
 a barrier timeout still shows. ``--verbose`` brings back the simulator's log.
 
+The IMU errors are the simulator's default, ICM-42688-P at ``--imu-seed 0``.
+``--imu ideal`` flies the truth, as every baseline before 2026-09-27 was flown.
+
 PX4 cannot finish exiting once simulated time has stopped (plan section 7), so
 this kills it after the run; the rootfs is discarded, and the newest ulog is
 copied next to the ``.npz`` first. Needs a built ``px4_sitl_default`` with the
@@ -379,6 +382,7 @@ def fly(args) -> Path | None:
                 "--instance", str(args.instance), "--status-interval", "10"]
     if args.rotors is not None:
         sim_args += ["--rotors", str(args.rotors)]
+    sim_args += ["--imu", args.imu, "--imu-seed", str(args.imu_seed)]
     cfg = config_from_args(sim_args)
     n_rotors = 4 if args.rotors is None else len(load_rotors(args.rotors).spin)
     dt = cfg.imu_dt
@@ -698,6 +702,9 @@ def main() -> int:
                    help="acceptance: the loads to run, comma-separated (default: %(default)s)")
     p.add_argument("-v", "--verbose", action="store_true", help="the simulator's full log")
     p.add_argument("--seed", type=int, default=1, help="thrust PRBS seed")
+    p.add_argument("--imu", default="icm42688p",
+                   help="the simulator's --imu; ideal for the baselines before 2026-09-27")
+    p.add_argument("--imu-seed", type=int, default=0, help="the simulator's --imu-seed")
     p.add_argument("--out", default="/tmp/fly_in_process.npz")
     p.add_argument("--compare", nargs=2, metavar="NPZ")
     p.add_argument("--report", metavar="NPZ")

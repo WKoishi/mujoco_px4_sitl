@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .arm import TIMEOUT_ACTIONS
+from .sensors import IMU_MODELS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = _REPO_ROOT / "models" / "quad_x.xml"
@@ -68,6 +69,10 @@ class Config:
     # placeholder motors. The filled sidecar for the X8 lives in the private
     # repo alongside its MJCF (AGENTS.md section 4).
     rotors_path: Path | None = None
+    # IMU errors added to HIL_SENSOR only (sensors.py); "ideal" sends the truth.
+    # The seed fixes the turn-on bias and every frame's draw, so a run repeats.
+    imu_model: str = "icm42688p"
+    imu_seed: int = 0
 
     # --- Arm command watchdog ----------------------------------------------
     # How old the arm command in force may get, in *simulated* seconds, before
@@ -158,6 +163,8 @@ class Config:
             raise ValueError("api_barrier_timeout_s must be > 0 (wall clock)")
         if self.arm_timeout_s < 0.0:
             raise ValueError("arm_timeout_s must be >= 0 (0 disables the watchdog)")
+        if self.imu_model not in IMU_MODELS:
+            raise ValueError(f"imu_model {self.imu_model!r} not in {sorted(IMU_MODELS)}")
         if self.arm_on_timeout not in TIMEOUT_ACTIONS:
             raise ValueError(
                 f"arm_on_timeout {self.arm_on_timeout!r} not in {TIMEOUT_ACTIONS}"
@@ -230,6 +237,13 @@ def build_parser() -> argparse.ArgumentParser:
             "else vehicle.py's quad placeholders)"
         ),
     )
+    p.add_argument(
+        "--imu", dest="imu_model", choices=sorted(IMU_MODELS), default="icm42688p",
+        help=("IMU errors added to HIL_SENSOR, never to ground truth; ideal sends "
+              "the truth (default: %(default)s)"),
+    )
+    p.add_argument("--imu-seed", type=int, default=0,
+                   help="seed of the IMU's turn-on bias and noise (default: %(default)s)")
     p.add_argument("--imu-rate", dest="imu_rate_hz", type=float, default=250.0,
                    help="must match IMU_INTEG_RATE (default: %(default)s)")
     p.add_argument("--physics-rate", dest="physics_rate_hz", type=float, default=1000.0,

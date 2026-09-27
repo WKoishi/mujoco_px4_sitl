@@ -7,6 +7,9 @@ The simulator is a standalone Python process. It owns physics and speaks PX4's
 `simulator_mavlink` protocol; PX4 takes its clock from our IMU timestamps under
 lockstep. Sensor strategy A: we supply IMU + ground truth, and PX4's own
 `sensor_baro_sim` / `sensor_mag_sim` / `sensor_gps_sim` synthesize the rest.
+The IMU carries an ICM-42688-P's noise and a seeded bias, on `HIL_SENSOR` only
+(`--imu`, `--imu-seed`; `--imu ideal` sends the truth). Everything else stays
+ground truth.
 
 No ROS 2 dependency here. See [ROS 2 integration](#ros-2-integration).
 
@@ -433,7 +436,8 @@ directory, install it — `pip install -e ".[dev]"` — or set
 `PYTHONPATH=src`, which is what `scripts/run_sitl.sh` does.
 
 `test_frames.py` covers the attitude table and the geodetic projection,
-`test_hil.py` the MAVLink encode boundary, `test_vehicle.py` the rotor model and
+`test_hil.py` the MAVLink encode boundary, `test_sensors.py` the IMU errors
+against their spec and PX4's truncating decode, `test_vehicle.py` the rotor model and
 the model-authoring preconditions, `test_config.py` the flag combinations that
 would otherwise fail silently, and `test_loop.py` runs the lockstep loop against a
 fake PX4 — including the strict regime's one-frame delay, and the deadlock,
