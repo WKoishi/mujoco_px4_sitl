@@ -249,6 +249,32 @@ def test_joints_are_read_at_the_sample_instant_and_truth_goes_to_the_recorder(si
     assert q == pytest.approx([0.5, -0.3], abs=0.1)
 
 
+def test_truth_carries_the_effort_that_drove_the_frame(sim):
+    samples: list[Sample] = []
+    controller = Scripted(target=(0.5, -0.3))
+    host = ControllerHost(controller, Schedule(period=IMU_DT), IMU_DT, recorder=samples.append)
+    drive(host, sim, 60)
+
+    kp, kv = 20.0, 1.0
+    for s in samples[1:]:
+        # The servo law on the target in force over the frame just finished,
+        # read at the joint state that ends it: actuator_force, nothing else.
+        joints, effort = s.truth.joints, s.truth.effort
+        assert effort.joint_force == pytest.approx(
+            kp * (np.array([0.5, -0.3]) - joints.q) - kv * joints.qd, abs=1e-9)
+        assert effort.rotor_torque_frd.shape == (3,)
+    # qacc agrees with the rates' difference across a frame, to the change of
+    # qacc within it.
+    qd = np.array([s.truth.joints.qd for s in samples])
+    qacc = np.array([s.truth.effort.joint_qacc for s in samples])
+    diff = (qd[31:] - qd[30:-1]) / IMU_DT
+    assert diff == pytest.approx(0.5 * (qacc[31:] + qacc[30:-1]), rel=0.05, abs=0.05)
+
+
+def test_the_stub_has_no_effort():
+    assert StubPhysics(Config(stub_physics=True)).effort() is None
+
+
 # --- PX4's legs, against a stand-in link ---------------------------------
 
 

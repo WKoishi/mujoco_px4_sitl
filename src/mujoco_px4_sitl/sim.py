@@ -44,6 +44,26 @@ class SimState:
     alt_m: float = 0.0
 
 
+@dataclass(frozen=True)
+class Effort:
+    """What drove the frame just finished. Truth, for a recorder only.
+
+    Read after the frame's closing ``mj_forward``, so every entry belongs to the
+    servo targets and rotor commands that drove that frame: a target applied at
+    this instant shows from the next frame on. Arm entries are one per
+    ``arm_act*`` servo, in that order.
+    """
+
+    # MuJoCo's qacc at each servo's joint, rad/s^2.
+    joint_qacc: NDArray[np.float64]
+    # Each servo's actuator_force, N m: the motor's own torque. Joint damping,
+    # armature and limit forces are not in it, and the model sets no forcerange.
+    joint_force: NDArray[np.float64]
+    # The rotors' torque on the base in body FRD, N m, about the base origin, as
+    # applied on the frame's last physics step.
+    rotor_torque_frd: NDArray[np.float64]
+
+
 class Physics(Protocol):
     """What :mod:`loop` requires of a physics backend."""
 
@@ -54,6 +74,7 @@ class Physics(Protocol):
     def submit_arm_command(self, command: ArmCommand) -> None: ...
     def arm_status(self) -> ArmStatus | None: ...
     def arm_joints(self) -> JointReading: ...
+    def effort(self) -> Effort | None: ...
     @property
     def time(self) -> float: ...
 
@@ -114,6 +135,10 @@ class MujocoPhysics:
         mujoco.mj_forward(self.model, self.data)
         self.arm = ArmServos(self.model, cfg.arm_timeout_s, cfg.arm_on_timeout)
         self.arm.hold(self.data)
+        # The dof each servo drives: a position servo is on a 1-dof joint.
+        self._arm_dofs = np.asarray(
+            self.model.jnt_dofadr[self.model.actuator_trnid[self.arm.ids, 0]], dtype=np.intp
+        )
         self.propellers = PropellerMonitor(self.model, self._body_id, self.vehicle.site_ids)
         self.propellers.check(self.data)
         _log.info(
@@ -200,6 +225,15 @@ class MujocoPhysics:
     def arm_joints(self) -> JointReading:
         """The arm's joints now; empty arrays for a model with no arm servos."""
         return self.arm.joints(self.data)
+
+    def effort(self) -> Effort:
+        """The arm's and rotors' effort over the frame just finished."""
+        _, torque_flu = self.vehicle.wrench_body()
+        return Effort(
+            joint_qacc=np.array(self.data.qacc[self._arm_dofs], dtype=np.float64),
+            joint_force=np.array(self.data.actuator_force[self.arm.ids], dtype=np.float64),
+            rotor_torque_frd=frames.vec_flu_to_frd(torque_flu),
+        )
 
     def state(self) -> SimState:
         qpos = self.data.qpos[self.qpos_adr:self.qpos_adr + 7]
@@ -289,6 +323,9 @@ class StubPhysics:
 
     def arm_joints(self) -> JointReading:
         return JointReading(q=np.zeros(0), qd=np.zeros(0))
+
+    def effort(self) -> Effort | None:
+        return None
 
     def state(self) -> SimState:
         return SimState(

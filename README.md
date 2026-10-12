@@ -398,8 +398,11 @@ controller's wall time, `estimate_late`, and `truth`. `estimate_late` says an
 output the estimate should have been arrived only after `t_k`; a sample reaches
 the recorder once that is decided, normally a frame or two later. `truth` carries
 the side channel's state, the true joints, the arm status (`cmd_age`,
-`prop_clearance`), PX4's answer driving the rotors over the frame, and
-`pos_ned_ekf`, the true position in EKF2's frame. Compare the estimate with that,
+`prop_clearance`), PX4's answer driving the rotors over the frame,
+`effort` (the frame just finished: each servo joint's `qacc`, its
+`actuator_force` -- the motor torque, no damping, armature or limit force -- and
+the rotors' torque in body FRD), and `pos_ned_ekf`, the true position in EKF2's
+frame. Compare the estimate with that,
 not with `pos_ned`: the two frames latch different origins, which reads as
 decimetres of bias.
 

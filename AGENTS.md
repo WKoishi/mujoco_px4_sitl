@@ -28,7 +28,8 @@ them when the platform changes.**
   on simulated time, reading the arm's encoders and PX4's EKF2 estimate over
   MAVLink ([px4link.py](src/mujoco_px4_sitl/px4link.py)) as a companion computer
   would, and sending PX4 setpoints and commands the same way. Ground truth goes
-  only to a recorder.
+  only to a recorder, with each frame's effort since 2026-10-12 (`Truth.effort`:
+  joint `qacc`, servo `actuator_force`, rotor torque; README has the fields).
 - **The IMU has errors** since 2026-09-27 (`--imu icm42688p`, the default):
   datasheet noise, a seeded turn-on bias and drift, on `HIL_SENSOR` only. EKF2
   learns the gyro bias before arming. `--imu ideal` reproduces the baselines

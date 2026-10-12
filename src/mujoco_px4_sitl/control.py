@@ -54,7 +54,7 @@ from .arm import ArmCommand, ArmStatus, JointReading
 from .frames import GeodeticProjection, rebase_ned
 from .hil import ActuatorControls
 from .px4link import ApiLink, CommandAck, Px4Estimate, check_barrier_safe
-from .sim import Physics, SimState
+from .sim import Effort, Physics, SimState
 
 _log = logging.getLogger(__name__)
 
@@ -97,6 +97,9 @@ class Truth:
     # PX4's answer that drives the rotors over [t_k, t_k+1); its time_usec is
     # the frame it answers, t_k-1 when PX4 answered in time.
     actuators: ActuatorControls | None = None
+    # What drove the frame ending at t_k: joint qacc, servo torque, rotor
+    # torque (:class:`sim.Effort`). None for a backend without dynamics.
+    effort: Effort | None = None
 
 
 @dataclass(frozen=True)
@@ -470,7 +473,7 @@ class ControllerHost:
             else rebase_ned(state.pos_ned, self.home, origin)
         )
         return Truth(state=state, joints=joints, arm=physics.arm_status(),
-                     pos_ned_ekf=pos_ekf, actuators=actuators)
+                     pos_ned_ekf=pos_ekf, actuators=actuators, effort=physics.effort())
 
     def summary(self) -> str:
         mean = self.compute_total / self.samples if self.samples else 0.0
