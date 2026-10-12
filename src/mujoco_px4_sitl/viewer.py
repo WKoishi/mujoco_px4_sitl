@@ -9,6 +9,7 @@ decimated rate from the physics loop's own thread.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -25,9 +26,15 @@ class Viewer:
     def __init__(self, model: Any, data: Any, refresh_hz: float = 30.0) -> None:
         import mujoco.viewer  # imported lazily: needs GL
 
+        before = set(threading.enumerate())
         self._handle = mujoco.viewer.launch_passive(
             model, data, show_left_ui=False, show_right_ui=False
         )
+        # launch_passive runs the GUI on a daemon thread it keeps no reference
+        # to. Left running into interpreter shutdown, that thread is killed
+        # mid-unwind inside _simulate and the process segfaults on exit
+        # (mujoco 3.13.0, every Ctrl-C); close() joins it instead.
+        self._threads = [t for t in threading.enumerate() if t not in before]
         self._period = 1.0 / refresh_hz if refresh_hz > 0.0 else 0.0
         self._next = 0.0
         _log.info("viewer open (passive, %.0f Hz refresh)", refresh_hz)
@@ -47,5 +54,7 @@ class Viewer:
     def close(self) -> None:
         try:
             self._handle.close()
+            for thread in self._threads:
+                thread.join(timeout=5.0)
         except Exception as exc:  # noqa: BLE001 - closing must never propagate
             _log.debug("viewer close raised: %s", exc)
